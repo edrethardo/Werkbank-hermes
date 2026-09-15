@@ -554,6 +554,11 @@ async def pty_ws(ws: WebSocket) -> None:
         attach_token = f"{attach_token}\0{program}\0{project or ''}"
 
     def _spawn():
+        if program:
+            from hermes_cli.werkbank_programs import spawn_size
+            cols, rows = spawn_size(ws.query_params.get("cols"),
+                                    ws.query_params.get("rows"))
+            return PtyBridge.spawn(argv, cwd=cwd, env=env, cols=cols, rows=rows)
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
 
     if attach_token is None:

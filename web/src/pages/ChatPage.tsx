@@ -1260,7 +1260,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
       Object.assign(params, ptyAboOauthParams(searchParams));
-      Object.assign(params, ptyWerkbankParams(searchParams));
+      Object.assign(params, ptyWerkbankParams(searchParams, term.cols, term.rows));
 
       ticketTimer = setTimeout(() => {
         ticketTimer = null;

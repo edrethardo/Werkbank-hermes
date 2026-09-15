@@ -26,7 +26,8 @@ import os
 import sys
 from typing import Optional
 
-__all__ = ["PROGRAMS", "UnknownProgramError", "is_external", "resolve_external_program"]
+__all__ = ["PROGRAMS", "UnknownProgramError", "is_external", "resolve_external_program",
+           "spawn_size"]
 
 # Overridable so a differently installed Werkbank does not need a patch.
 _LAUNCHER_ENV = "WERKBANK_TUI_LAUNCHER"
@@ -95,3 +96,22 @@ def resolve_external_program(program: Optional[str], project: Optional[str] = No
     # cwd stays None on purpose: the launcher chooses it from its own project
     # register, so a request can never point the child at a directory.
     return [sys.executable, launcher], None, env
+
+
+# The browser knows its terminal size before it connects. Spawning at 80x24 and
+# resizing a moment later makes a foreign TUI redraw its whole intro and append
+# the redraw, so the banner ends up stacked two or three times. Starting at the
+# real size removes the resize entirely.
+_DEFAULT_COLS, _DEFAULT_ROWS = 80, 24
+_MAX_COLS, _MAX_ROWS = 2000, 1000
+
+
+def spawn_size(cols, rows):
+    """Clamp a requested terminal size, falling back to 80x24 on nonsense."""
+    def one(value, default, maximum):
+        try:
+            n = int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+        return n if 1 <= n <= maximum else default
+    return one(cols, _DEFAULT_COLS, _MAX_COLS), one(rows, _DEFAULT_ROWS, _MAX_ROWS)

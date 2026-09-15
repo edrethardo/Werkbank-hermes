@@ -87,3 +87,13 @@ def test_the_launcher_is_run_with_the_serving_interpreter(monkeypatch, launcher)
     argv, _cwd, _env = _resolve(
         monkeypatch, program="claude-code", project="/tmp/p")
     assert os.path.basename(argv[0]).startswith("python")
+
+
+def test_the_spawn_size_comes_from_the_browser_and_is_clamped():
+    # A foreign TUI redraws its whole intro on SIGWINCH and appends the redraw,
+    # so spawning at 80x24 and resizing a moment later stacks the banner.
+    assert werkbank_programs.spawn_size("120", "40") == (120, 40)
+    assert werkbank_programs.spawn_size(None, None) == (80, 24)
+    for bad in ("0", "-5", "abc", "", "99999"):
+        assert werkbank_programs.spawn_size(bad, "40") == (80, 40)
+        assert werkbank_programs.spawn_size("120", bad) == (120, 24)
