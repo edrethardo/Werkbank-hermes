@@ -75,7 +75,7 @@ import {
 } from "@/lib/pty-scroll";
 import { advanceTouchAnchor, isTouchPan, touchLineTravel, touchScrollLines, wheelScrollLines } from "@/lib/pty-touch-scroll";
 import { ptyAboOauthChannelKey, ptyAboOauthParams } from "@/lib/pty-abo-oauth";
-import { ptyWerkbankChannelKey, ptyWerkbankParams } from "@/lib/pty-werkbank";
+import { applyWerkbankTerminalProfile, ptyWerkbankChannelKey, ptyWerkbankParams } from "@/lib/pty-werkbank";
 import {
   imageFilesFromTransfer,
   transferMayContainImage,
@@ -1320,6 +1320,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
       ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      applyWerkbankTerminalProfile(term, ws, searchParams);
       // Resumed sessions replay scrollback over the socket. Start pinned to
       // the bottom so the latest output is in view; released once the user
       // scrolls up (#59591).
