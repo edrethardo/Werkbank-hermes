@@ -75,6 +75,7 @@ import {
 } from "@/lib/pty-scroll";
 import { advanceTouchAnchor, isTouchPan, touchLineTravel, touchScrollLines, wheelScrollLines } from "@/lib/pty-touch-scroll";
 import { ptyAboOauthChannelKey, ptyAboOauthParams } from "@/lib/pty-abo-oauth";
+import { ptyWerkbankChannelKey, ptyWerkbankParams } from "@/lib/pty-werkbank";
 import {
   imageFilesFromTransfer,
   transferMayContainImage,
@@ -355,9 +356,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // effect dep) so the user explicitly starts a fresh scoped session.
   const { profile: scopedProfile } = useProfileScope();
   const aboOauthKey = ptyAboOauthChannelKey(searchParams);
+  const werkbankKey = ptyWerkbankChannelKey(searchParams);
   const channel = useMemo(
-    () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}\0${aboOauthKey}`),
-    [resumeParam, scopedProfile, aboOauthKey],
+    () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}\0${aboOauthKey}\0${werkbankKey}`),
+    [resumeParam, scopedProfile, aboOauthKey, werkbankKey],
   );
   const titleScope = `${channel}\0${reconnectNonce}`;
   const sessionTitle =
@@ -1258,6 +1260,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
       Object.assign(params, ptyAboOauthParams(searchParams));
+      Object.assign(params, ptyWerkbankParams(searchParams));
 
       ticketTimer = setTimeout(() => {
         ticketTimer = null;

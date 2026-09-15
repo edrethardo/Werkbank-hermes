@@ -323,6 +323,7 @@ def _resolve_chat_argv(
     resume: Optional[str] = None, sidecar_url: Optional[str] = None, profile: Optional[str] = None,
     active_session_file: Optional[str] = None, provider: Optional[str] = None,
     model: Optional[str] = None, chatgpt_mode: Optional[str] = None,
+    program: Optional[str] = None, project: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY (what ``hermes --tui`` runs).
 
@@ -334,6 +335,13 @@ def _resolve_chat_argv(
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
     dir, the same propagation ``hermes -p <name>`` performs.
     """
+    # An allowlisted foreign program (Werkbank's Claude Code) hosts in the same
+    # PTY and the same /chat surface, but shares none of Hermes' TUI plumbing —
+    # no profile home, no session DB, no gateway. See werkbank_programs.
+    from hermes_cli.werkbank_programs import is_external, resolve_external_program
+    if is_external(program):
+        return resolve_external_program(program, project)
+
     from hermes_cli.web_server_profiles import _config_profile_scope, _resolve_profile_dir
     from hermes_cli.web_server_sessions import _open_session_db_for_profile, _session_latest_descendant
     from hermes_cli.main import PROJECT_ROOT
@@ -461,12 +469,14 @@ async def _resolve_chat_argv_async(
     resume: Optional[str] = None, sidecar_url: Optional[str] = None, profile: Optional[str] = None,
     active_session_file: Optional[str] = None, provider: Optional[str] = None,
     model: Optional[str] = None, chatgpt_mode: Optional[str] = None,
+    program: Optional[str] = None, project: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv off the event loop (it may run ``npm run build``); the
     async lock keeps one-build-at-a-time without parking worker threads."""
     from hermes_cli.web_server import _get_chat_argv_lock, app
     kwargs = {"resume": resume, "sidecar_url": sidecar_url, "profile": profile,
-              "provider": provider, "model": model, "chatgpt_mode": chatgpt_mode}
+              "provider": provider, "model": model, "chatgpt_mode": chatgpt_mode,
+              "program": program, "project": project}
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
 

@@ -492,12 +492,18 @@ async def pty_ws(ws: WebSocket) -> None:
     provider = ws.query_params.get("provider") or None
     model = ws.query_params.get("model") or None
     chatgpt_mode = ws.query_params.get("chatgpt_mode") or None
+    # Werkbank's Claude Code rides this PTY and this /chat surface; it has no
+    # Hermes session DB, so resume and the active-session file do not apply.
+    program = ws.query_params.get("program") or None
+    project = ws.query_params.get("project") or None
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {"1", "true", "yes", "on"}
     active_session_file: Optional[Path] = None
 
-    if channel:
+    if program:
+        resume = None
+    elif channel:
         active_session_file = _active_session_file_for_channel(ws.app, channel)
         if force_fresh:
             resume = None
@@ -515,7 +521,8 @@ async def pty_ws(ws: WebSocket) -> None:
                 await ws.send_json({"type": "resume", "id": resume})
 
     resolve_kwargs = {"resume": resume, "sidecar_url": sidecar_url, "profile": profile,
-                      "provider": provider, "model": model, "chatgpt_mode": chatgpt_mode}
+                      "provider": provider, "model": model, "chatgpt_mode": chatgpt_mode,
+                      "program": program, "project": project}
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
 
@@ -525,6 +532,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, f"Chat unavailable: {exc.detail}")
         return
     except SystemExit as exc:  # _make_tui_argv sys.exit(1)s when node/npm is missing
+        await _pty_fail(ws, f"Chat unavailable: {exc}")
+        return
+    except ValueError as exc:  # unknown program / malformed project reference
         await _pty_fail(ws, f"Chat unavailable: {exc}")
         return
 
@@ -537,6 +547,11 @@ async def pty_ws(ws: WebSocket) -> None:
         attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
     if attach_token is not None and (provider or model or chatgpt_mode):
         attach_token = f"{attach_token}\0{provider or ''}\0{model or ''}\0{chatgpt_mode or ''}"
+    if attach_token is not None and program:
+        # Keep Claude Code's keep-alive PTY apart from Hermes': the browser
+        # token alone is per-tab, so without this a Claude Code tab could
+        # reattach to a living Hermes TUI and vice versa.
+        attach_token = f"{attach_token}\0{program}\0{project or ''}"
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
