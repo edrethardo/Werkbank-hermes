@@ -5,6 +5,7 @@ import {
   clearDashboardTokenReloadAttempt,
   maybeReloadForLoopbackWsAuthFailure,
 } from "./dashboard-auth-reload";
+import { readChatBreadcrumbs } from "./chat-reload-breadcrumb";
 
 function makeStorage() {
   const values = new Map<string, string>();
@@ -66,5 +67,20 @@ describe("maybeReloadForLoopbackWsAuthFailure", () => {
       maybeReloadForLoopbackWsAuthFailure(4403, false, storage, reload),
     ).toBe(false);
     expect(reload).not.toHaveBeenCalled();
+  });
+
+  // Without this the reload is indistinguishable from a Safari tab discard.
+  it("leaves a breadcrumb naming the reload cause", () => {
+    const storage = makeStorage();
+    maybeReloadForLoopbackWsAuthFailure(4401, false, storage, vi.fn());
+    expect(readChatBreadcrumbs(storage)).toEqual([
+      expect.objectContaining({ kind: "ws-auth-reload", detail: "code=4401" }),
+    ]);
+  });
+
+  it("leaves no breadcrumb when it does not reload", () => {
+    const storage = makeStorage();
+    maybeReloadForLoopbackWsAuthFailure(4403, false, storage, vi.fn());
+    expect(readChatBreadcrumbs(storage)).toEqual([]);
   });
 });

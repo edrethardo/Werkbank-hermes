@@ -82,6 +82,11 @@ import {
   uploadChatImage,
 } from "@/lib/chatImagePaste";
 import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
+import {
+  formatChatBreadcrumbBanner,
+  readChatBreadcrumbs,
+  recordChatBreadcrumb,
+} from "@/lib/chat-reload-breadcrumb";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -215,13 +220,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // In gated (OAuth) mode the server intentionally omits the session token —
   // the dashboard API layer authenticates the WS via a single-use ticket,
   // so a missing token there is expected, not an error.
-  const [banner, setBanner] = useState<string | null>(() =>
-    typeof window !== "undefined" &&
-    !window.__HERMES_SESSION_TOKEN__ &&
-    !window.__HERMES_AUTH_REQUIRED__
-      ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
-      : null,
-  );
+  const [banner, setBanner] = useState<string | null>(() => {
+    if (
+      typeof window !== "undefined" &&
+      !window.__HERMES_SESSION_TOKEN__ &&
+      !window.__HERMES_AUTH_REQUIRED__
+    ) {
+      return "Session token unavailable. Open this page through `hermes dashboard`, not directly.";
+    }
+    // The page may have just reloaded itself. Say why, so a phone user can
+    // report the actual cause instead of "die Seite lädt kaputt neu".
+    return formatChatBreadcrumbBanner(readChatBreadcrumbs());
+  });
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1436,6 +1446,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // pty_ws in web_server.py); echo it verbatim alongside the close code.
       const why = ev.reason ? ` reason=${ev.reason}` : "";
       console.warn(`[chat] PTY WebSocket closed code=${ev.code}${why}`);
+      // Every close is a candidate cause for "the page came back broken".
+      // Recorded here so the NEXT load can name it, even on a phone with no
+      // console: a reload keeps sessionStorage, a Safari tab discard does not.
+      recordChatBreadcrumb("ws-close", `code=${ev.code}${why}`);
       setLastCloseCode(ev.code);
       if (ev.code === 4401) {
         if (maybeReloadForLoopbackWsAuthFailure(ev.code)) {

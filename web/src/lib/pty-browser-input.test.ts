@@ -272,4 +272,111 @@ describe("pty browser input", () => {
     adapter.dispose();
     host.remove();
   });
+
+  // Reported as "wenn ich zu viele Zeichen mit Backspace lösche, lädt die
+  // Seite kaputt neu". A long delete run must stay one DEL per grapheme with
+  // no caret bytes and no reset — anything else desynchronises the mirror and
+  // makes the user reach for a reload.
+  it("erases exactly one grapheme per Backspace over a long delete run", () => {
+    const { textarea, host, inputs, adapter } = fakeTerm();
+    const seed = "abcdefghij".repeat(12); // 120 chars
+    textarea.value = seed;
+    textarea.setSelectionRange(seed.length, seed.length);
+    textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: seed }));
+    const seedBytes = inputs.join("").length;
+
+    let value = seed;
+    for (let i = 0; i < seed.length; i++) {
+      const init = { key: "Backspace", code: "Backspace", bubbles: true, cancelable: true };
+      textarea.dispatchEvent(new KeyboardEvent("keydown", init));
+      textarea.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "deleteContentBackward",
+        data: null,
+      }));
+      value = value.slice(0, -1);
+      textarea.value = value;
+      textarea.setSelectionRange(value.length, value.length);
+      document.dispatchEvent(new Event("selectionchange"));
+      textarea.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "deleteContentBackward",
+        data: null,
+      }));
+      textarea.dispatchEvent(new KeyboardEvent("keyup", init));
+    }
+
+    const deleted = inputs.join("").slice(seedBytes);
+    expect(deleted).toBe("\x7f".repeat(seed.length));
+    expect(replayPtyLine(inputs.join(""))).toBe("");
+    expect(textarea.value).toBe("");
+    adapter.dispose();
+    host.remove();
+  });
+
+  // Auto-repeat: iOS delivers many keydowns before a single keyup. The FIFO
+  // must not turn a held Backspace into a burst of duplicate deletes.
+  it("does not over-delete when Backspace auto-repeats before its keyup", () => {
+    const { textarea, host, inputs, adapter } = fakeTerm();
+    const seed = "Hallo Welt";
+    textarea.value = seed;
+    textarea.setSelectionRange(seed.length, seed.length);
+    textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: seed }));
+    const seedBytes = inputs.join("").length;
+
+    const init = { key: "Backspace", code: "Backspace", bubbles: true, cancelable: true };
+    let value = seed;
+    for (let i = 0; i < 4; i++) {
+      textarea.dispatchEvent(new KeyboardEvent("keydown", init));
+      textarea.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true, cancelable: true, inputType: "deleteContentBackward", data: null,
+      }));
+      value = value.slice(0, -1);
+      textarea.value = value;
+      textarea.setSelectionRange(value.length, value.length);
+      textarea.dispatchEvent(new InputEvent("input", {
+        bubbles: true, inputType: "deleteContentBackward", data: null,
+      }));
+    }
+    textarea.dispatchEvent(new KeyboardEvent("keyup", init));
+
+    expect(inputs.join("").slice(seedBytes)).toBe("\x7f".repeat(4));
+    expect(replayPtyLine(inputs.join(""))).toBe("Hallo ");
+    adapter.dispose();
+    host.remove();
+  });
+
+  // Deleting past the start must not send DEL the PTY would apply to text the
+  // adapter no longer owns (that is how a composer gets torn up and the user
+  // reloads).
+  it("stops sending deletes once the mirror is empty", () => {
+    const { textarea, host, inputs, adapter } = fakeTerm();
+    textarea.value = "ab";
+    textarea.setSelectionRange(2, 2);
+    textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "ab" }));
+    const seedBytes = inputs.join("").length;
+
+    let value = "ab";
+    for (let i = 0; i < 6; i++) {
+      const init = { key: "Backspace", code: "Backspace", bubbles: true, cancelable: true };
+      textarea.dispatchEvent(new KeyboardEvent("keydown", init));
+      if (value) {
+        textarea.dispatchEvent(new InputEvent("beforeinput", {
+          bubbles: true, cancelable: true, inputType: "deleteContentBackward", data: null,
+        }));
+        value = value.slice(0, -1);
+        textarea.value = value;
+        textarea.setSelectionRange(value.length, value.length);
+        textarea.dispatchEvent(new InputEvent("input", {
+          bubbles: true, inputType: "deleteContentBackward", data: null,
+        }));
+      }
+      textarea.dispatchEvent(new KeyboardEvent("keyup", init));
+    }
+
+    expect(inputs.join("").slice(seedBytes)).toBe("\x7f\x7f");
+    adapter.dispose();
+    host.remove();
+  });
 });

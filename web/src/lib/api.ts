@@ -28,6 +28,7 @@ import {
   attemptDashboardTokenReloadOnce,
   clearDashboardTokenReloadAttempt,
 } from "@/lib/dashboard-auth-reload";
+import { recordChatBreadcrumb } from "@/lib/chat-reload-breadcrumb";
 
 // Ephemeral session token for protected endpoints.
 // Injected into index.html by the server — never fetched via API.
@@ -172,6 +173,7 @@ export async function fetchJSON<T>(
     // handled above, so reaching here in gated mode means a real
     // middleware failure that should not reload-loop.
     if (!window.__HERMES_AUTH_REQUIRED__ && !options?.allowUnauthorized) {
+      recordChatBreadcrumb("api-auth-reload", `${res.status} ${url}`);
       if (attemptDashboardTokenReloadOnce()) {
         return new Promise<T>(() => {});
       }

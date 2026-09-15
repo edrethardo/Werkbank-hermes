@@ -1,3 +1,5 @@
+import { recordChatBreadcrumb } from "./chat-reload-breadcrumb";
+
 type StorageLike = Pick<Storage, "getItem" | "removeItem" | "setItem">;
 
 const TOKEN_RELOAD_STORAGE_KEY = "hermes.tokenReloadAttempted";
@@ -65,5 +67,8 @@ export function maybeReloadForLoopbackWsAuthFailure(
   if (authRequired || code !== 4401) {
     return false;
   }
+  // Leave a note BEFORE the reload: on a phone this is the only way to tell a
+  // stale-token reload apart from a reconnect replay or a Safari tab discard.
+  recordChatBreadcrumb("ws-auth-reload", `code=${code}`, storage);
   return attemptDashboardTokenReloadOnce(storage, reload);
 }
