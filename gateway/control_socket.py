@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 CONTROL_PROTOCOL_VERSION = 1
 _SOCKET_FILENAME = "gateway.sock"
-_POINTER_FILENAME = "gateway.sock.path"
 _IS_WINDOWS = sys.platform == "win32"
 _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin for the NUL
 # Single-line JSON in/out; bounded so a misbehaving peer can't balloon memory.
@@ -48,32 +47,49 @@ def _fits_sun_path(path: Path) -> bool:
     return len(str(path).encode("utf-8")) <= _MAX_UNIX_PATH
 
 
-def _fallback_socket_path(home: Path) -> Path:
+def _fallback_socket_path(home: Path, stem: str = "hermes-gw") -> Path:
     """Short temp-dir path for homes whose direct socket path exceeds sun_path: ``tempfile.gettempdir()``
     then ``/tmp`` (POSIX); if nothing fits the tempdir candidate is returned anyway — bind fails
     non-fatally and consumers use the scan layer."""
-    name = f"hermes-gw-{_home_hash(home)}.sock"
+    name = f"{stem}-{_home_hash(home)}.sock"
     candidates = [Path(tempfile.gettempdir()) / name] + ([] if _IS_WINDOWS else [Path("/tmp") / name])
     return next((c for c in candidates if _fits_sun_path(c)), candidates[0])
 
 
-def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
-    """Return ``(bind_path, pointer_file)``; pointer_file is set only for the temp-dir fallback."""
-    direct = Path(home) / _SOCKET_FILENAME
-    return (direct, None) if _fits_sun_path(direct) else (_fallback_socket_path(home), Path(home) / _POINTER_FILENAME)
+def resolve_local_socket_path(home: Path, socket_name: str, *, fallback_stem: str) -> tuple[Path, Optional[Path]]:
+    """``(bind_path, pointer_file)`` for ANY home-anchored Unix socket, with the same sun_path
+    fallback the gateway socket uses: bind in ``home`` when the path fits, otherwise bind a short
+    temp-dir path and leave ``<home>/<socket_name>.path`` pointing at it. ``pointer_file`` is None
+    for the direct case. Shared so a second socket (the TUI delivery socket) inherits the fallback
+    instead of re-deriving it."""
+    direct = Path(home) / socket_name
+    if _fits_sun_path(direct):
+        return direct, None
+    return _fallback_socket_path(Path(home), fallback_stem), Path(home) / f"{socket_name}.path"
 
 
-def resolve_client_socket_path(home: Path) -> Optional[Path]:
-    """Where a client should connect for ``home``, or None when nothing exists."""
-    direct = Path(home) / _SOCKET_FILENAME
+def resolve_client_socket_path_for(home: Path, socket_name: str) -> Optional[Path]:
+    """Where a client should connect for ``home``/``socket_name``: the direct socket, else the
+    pointer file's target, else None."""
+    direct = Path(home) / socket_name
     if direct.exists():
         return direct
     with contextlib.suppress(OSError):
-        pointer = Path(home) / _POINTER_FILENAME
+        pointer = Path(home) / f"{socket_name}.path"
         target = pointer.read_text(encoding="utf-8").strip() if pointer.is_file() else ""
         if target and Path(target).exists():
             return Path(target)
     return None
+
+
+def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
+    """Return ``(bind_path, pointer_file)``; pointer_file is set only for the temp-dir fallback."""
+    return resolve_local_socket_path(home, _SOCKET_FILENAME, fallback_stem="hermes-gw")
+
+
+def resolve_client_socket_path(home: Path) -> Optional[Path]:
+    """Where a client should connect for ``home``, or None when nothing exists."""
+    return resolve_client_socket_path_for(home, _SOCKET_FILENAME)
 
 
 def _detect_supervisor() -> str:

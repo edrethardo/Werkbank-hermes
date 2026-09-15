@@ -195,6 +195,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # agent tab rather than spawning a one-field orphan category.
     "runtime": "agent",
     "session": "general",
+    # `tui.delivery_socket` is the only schema-surfaced tui field — fold it into the display tab
+    # (where `dashboard` and `display` already live) rather than spawning a one-field orphan.
+    "tui": "display",
     "nous": "agent",
 }
 

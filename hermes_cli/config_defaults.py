@@ -922,6 +922,15 @@ DEFAULT_CONFIG = {
         },
     },
 
+    "tui": {
+        # Local delivery socket ($HERMES_HOME/tui-delivery.sock): a ticket board or other local
+        # process may hand a prompt to THIS process's live session via the `ticket.deliver` verb.
+        # Off by default and opt-in on purpose: file permissions (0600) are the only auth
+        # boundary, and a verb that types for the agent is a bigger grant than a status read.
+        # See tui_gateway/delivery_socket.py.
+        "delivery_socket": False,
+    },
+
     "dashboard": {
         # Visual theme: "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
         "theme": "default",

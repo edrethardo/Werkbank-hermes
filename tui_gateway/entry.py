@@ -236,8 +236,31 @@ def _write_or_exit(payload: dict, reason: str) -> None:
         sys.exit(0)
 
 
+# Held so the socket outlives main()'s frame; the server itself runs on its own daemon thread.
+_delivery_socket = None
+
+
+def _start_delivery_socket() -> None:
+    """Open the local delivery socket when ``tui.delivery_socket`` is on (off by default).
+
+    This is the stdio TUI's own door: the process that HOLDS the live sessions is the one that can
+    deliver into them. Never fatal — a gateway that cannot bind still serves its client.
+    """
+    global _delivery_socket
+    try:
+        from tui_gateway.delivery_socket import start_delivery_socket
+        _delivery_socket = start_delivery_socket()
+        if _delivery_socket is not None:
+            import atexit
+            atexit.register(_delivery_socket.cleanup_files)
+    except Exception:
+        logger.debug("TUI delivery socket startup failed (non-fatal)", exc_info=True)
+        _delivery_socket = None
+
+
 def main():
     _install_sidecar_publisher()
+    _start_delivery_socket()
 
     # The heartbeat row lets the orphan sweep tell "live but idle" from "truly orphaned",
     # so it must start BEFORE the sweep.
