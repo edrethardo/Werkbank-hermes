@@ -376,9 +376,13 @@ export function installPtyBrowserInput(
           Array.from(graphemes.segment(data)).length === 1 &&
           (data === first.key || data.normalize('NFD').includes(first.key.normalize('NFD')));
         if (keyedText) keys.shift();
-        acknowledged = '';
+        // Append the payload WITHOUT forgetting the text the PTY already holds.
+        // Zeroing the mirror here still sent the right bytes, but every later
+        // correction then diffed against a mirror missing that prefix, erased
+        // too little and wrote the opening phrase a second time - the shape
+        // iOS dictation produces on every self-correction (WB-520).
         helperOwned = false;
-        commit(data);
+        commit(acknowledged + data);
         mirror(acknowledged);
       } else { acknowledged = ''; mirror(''); }
       flushKeys();

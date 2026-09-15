@@ -45,6 +45,22 @@ function fakeTerm(sendBytes?: (data: string) => boolean, syncInkCaret = true) {
   return { term, textarea, host, inputs, pastes, adapter };
 }
 
+/** Apply the byte stream the adapter sent the way an Ink/readline input line
+ * would, so a test can assert what the remote line actually contains. */
+function replayPtyLine(stream: string): string {
+  let line = "";
+  let caret = 0;
+  for (let i = 0; i < stream.length; i++) {
+    const ch = stream[i];
+    if (ch === "\x1b" && stream.slice(i, i + 3) === "\x1b[C") { caret = Math.min(line.length, caret + 1); i += 2; continue; }
+    if (ch === "\x1b" && stream.slice(i, i + 3) === "\x1b[D") { caret = Math.max(0, caret - 1); i += 2; continue; }
+    if (ch === "\x7f") { if (caret > 0) { line = line.slice(0, caret - 1) + line.slice(caret); caret--; } continue; }
+    line = line.slice(0, caret) + ch + line.slice(caret);
+    caret++;
+  }
+  return line;
+}
+
 describe("pty browser input", () => {
   it("sends keyless dictation insertText to the PTY without a keydown", () => {
     const { textarea, host, inputs, adapter } = fakeTerm();
@@ -56,6 +72,37 @@ describe("pty browser input", () => {
       data: "Hallo Welt",
     }));
     expect(inputs.join("")).toBe("Hallo Welt");
+    adapter.dispose();
+    host.remove();
+  });
+
+  // iOS dictation inserts keyless, then corrects the whole phrase. The adapter
+  // must keep believing what the PTY actually holds, or the correction erases
+  // too little and writes the opening fragment a second time (WB-520).
+  it("does not repeat an earlier phrase when dictation corrects itself", () => {
+    const { textarea, host, inputs, adapter } = fakeTerm();
+    const dictate = (value: string, data: string) => {
+      textarea.value = value;
+      textarea.setSelectionRange(value.length, value.length);
+      textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data }));
+    };
+    dictate("Satz eins.", "Satz eins.");
+    dictate("Satz eins. Satz zwei.", " Satz zwei.");
+
+    // Safari now replaces the whole dictated phrase, this time with a
+    // beforeinput range (the ordinary correction path).
+    const before = textarea.value;
+    const grown = "Satz eins. Satz zwei. Satz drei.";
+    textarea.dispatchEvent(new InputEvent("beforeinput", {
+      bubbles: true, cancelable: true, inputType: "insertReplacementText", data: grown,
+    }));
+    textarea.value = grown;
+    textarea.setSelectionRange(grown.length, grown.length);
+    textarea.dispatchEvent(new InputEvent("input", {
+      bubbles: true, inputType: "insertReplacementText", data: grown,
+    }));
+    expect(before).toBe("Satz eins. Satz zwei.");
+    expect(replayPtyLine(inputs.join(""))).toBe(grown);
     adapter.dispose();
     host.remove();
   });
