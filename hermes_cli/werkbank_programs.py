@@ -34,11 +34,24 @@ _LAUNCHER_ENV = "WERKBANK_TUI_LAUNCHER"
 _DEFAULT_LAUNCHER = "/data/projects/agent_ticket/scripts/werkbank-claude-tui.py"
 
 PROGRAMS = {
+    # Starts its own Claude Code, inline, so the chat page's wheel and
+    # one-finger pan work exactly as they do for Hermes' TUI.
     "claude-code": {
         "launcher_env": _LAUNCHER_ENV,
         "launcher_default": _DEFAULT_LAUNCHER,
         "project_env": "WERKBANK_PROJECT",
+        "mode": "",
         "title": "Claude Code",
+    },
+    # Attaches to the terminal already running for that project. Reaches the
+    # session the owner is actually in — and, because tmux repaints in place,
+    # scrolls only through tmux' own copy-mode.
+    "claude-code-live": {
+        "launcher_env": _LAUNCHER_ENV,
+        "launcher_default": _DEFAULT_LAUNCHER,
+        "project_env": "WERKBANK_PROJECT",
+        "mode": "live",
+        "title": "Claude Code (laufende Sitzung)",
     },
 }
 
@@ -92,6 +105,8 @@ def resolve_external_program(program: Optional[str], project: Optional[str] = No
     cleaned = _clean_project(project)
     if cleaned:
         env[spec["project_env"]] = cleaned
+    if spec.get("mode"):
+        env["WERKBANK_MODE"] = spec["mode"]
     env.setdefault("COLORTERM", "truecolor")
     # cwd stays None on purpose: the launcher chooses it from its own project
     # register, so a request can never point the child at a directory.

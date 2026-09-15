@@ -5,7 +5,7 @@
 //
 // Kept in a file of its own so an upstream rebase of ChatPage never conflicts.
 
-const PROGRAMS = new Set(["claude-code"]);
+const PROGRAMS = new Set(["claude-code", "claude-code-live"]);
 
 export function ptyWerkbankParams(
   search: URLSearchParams, cols?: number, rows?: number,

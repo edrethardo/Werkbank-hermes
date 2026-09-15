@@ -78,7 +78,7 @@ def test_a_missing_launcher_says_so_instead_of_spawning(monkeypatch, tmp_path):
 
 
 def test_the_program_table_is_a_fixed_allowlist():
-    assert set(werkbank_programs.PROGRAMS) == {"claude-code"}
+    assert set(werkbank_programs.PROGRAMS) == {"claude-code", "claude-code-live"}
     assert werkbank_programs.is_external("") is False
     assert werkbank_programs.is_external("claude-code") is True
 
@@ -97,3 +97,14 @@ def test_the_spawn_size_comes_from_the_browser_and_is_clamped():
     for bad in ("0", "-5", "abc", "", "99999"):
         assert werkbank_programs.spawn_size(bad, "40") == (80, 40)
         assert werkbank_programs.spawn_size("120", bad) == (120, 24)
+
+
+def test_the_live_surface_asks_the_launcher_for_the_running_terminal(monkeypatch, launcher):
+    _argv, _cwd, env = _resolve(
+        monkeypatch, program="claude-code-live", project="/tmp/p")
+    assert env["WERKBANK_MODE"] == "live"
+
+
+def test_the_ordinary_surface_does_not_ask_for_it(monkeypatch, launcher):
+    _argv, _cwd, env = _resolve(monkeypatch, program="claude-code", project="/tmp/p")
+    assert "WERKBANK_MODE" not in env
