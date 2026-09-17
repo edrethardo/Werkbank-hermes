@@ -1,3 +1,13 @@
+/**
+ * Tests for the reveal/pin behaviour this fork added on top of
+ * `keyboard-inset.ts`.
+ *
+ * Deliberately NOT named `keyboard-inset.test.ts`: upstream owns a file by
+ * that name, and a same-named file is a hand-merged conflict on every pull.
+ * A differently named file beside it costs nothing. The `computeKeyboardInset`
+ * block is kept here so this fork never loses that coverage between pulls;
+ * upstream's own file covers it too, which is harmless duplication.
+ */
 import { describe, expect, it } from "vitest";
 import {
   computeKeyboardInset,
