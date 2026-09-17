@@ -104,3 +104,25 @@ export function formatChatBreadcrumbBanner(
   if (now - last.at > CHAT_BREADCRUMB_RECENT_MS) return null;
   return `Chat reloaded: ${last.kind} (${last.detail}).`;
 }
+
+/**
+ * The banner the chat page starts with.
+ *
+ * Two unrelated things want that slot on first paint: a missing session token
+ * (the page was opened outside `hermes dashboard`), and the reason the page
+ * just reloaded itself. The token complaint wins — without it nothing works.
+ * In gated (OAuth) mode the server intentionally omits the token, so a missing
+ * token there is expected, not an error.
+ */
+export function initialChatBanner(): string | null {
+  if (
+    typeof window !== "undefined" &&
+    !window.__HERMES_SESSION_TOKEN__ &&
+    !window.__HERMES_AUTH_REQUIRED__
+  ) {
+    return "Session token unavailable. Open this page through `hermes dashboard`, not directly.";
+  }
+  // The page may have just reloaded itself. Say why, so a phone user can
+  // report the actual cause instead of "die Seite lädt kaputt neu".
+  return formatChatBreadcrumbBanner(readChatBreadcrumbs());
+}
