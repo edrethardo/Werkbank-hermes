@@ -107,6 +107,41 @@ describe("pty browser input", () => {
     host.remove();
   });
 
+  // The same self-correction, but the way iOS dictation actually delivers it:
+  // a replacement with NO `beforeinput` range. The `!edit` branch refuses the
+  // payload (correctly — the DOM does not reveal which range was replaced), but
+  // then cleared its model of the PTY and BLANKED the textarea. The terminal
+  // keeps showing the old line while the mirror says empty: the user sees the
+  // dictated text turn into an unreadable block, and the next correction diffs
+  // against nothing and writes the phrase again (WB-520 for the keyless path).
+  it("keeps the line intact when keyless dictation replaces without beforeinput", () => {
+    const { textarea, host, inputs, adapter } = fakeTerm();
+    const dictate = (value: string, data: string) => {
+      textarea.value = value;
+      textarea.setSelectionRange(value.length, value.length);
+      textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data }));
+    };
+    dictate("Satz eins.", "Satz eins.");
+    dictate("Satz eins. Satz zwei.", " Satz zwei.");
+    expect(replayPtyLine(inputs.join(""))).toBe("Satz eins. Satz zwei.");
+
+    const corrected = "Satz eins. Satz drei.";
+    textarea.value = corrected;
+    textarea.setSelectionRange(corrected.length, corrected.length);
+    textarea.dispatchEvent(new InputEvent("input", {
+      bubbles: true, inputType: "insertReplacementText", data: corrected,
+    }));
+
+    // The mirror must still describe the remote line: neither blanked nor
+    // desynced. Whatever the adapter chose to send, replaying it has to leave
+    // the PTY holding exactly one copy of the text.
+    const line = replayPtyLine(inputs.join(""));
+    expect(line).not.toContain("Satz eins. Satz eins.");
+    expect(textarea.value).toBe(line);
+    adapter.dispose();
+    host.remove();
+  });
+
   it("pastes clipboard text once through the public paste API", () => {
     const { textarea, host, pastes, inputs, adapter } = fakeTerm();
     const event = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;

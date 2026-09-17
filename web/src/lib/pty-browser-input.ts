@@ -384,7 +384,18 @@ export function installPtyBrowserInput(
         helperOwned = false;
         commit(acknowledged + data);
         mirror(acknowledged);
-      } else { acknowledged = ''; mirror(''); }
+      } else {
+        // An unusable payload (a replacement whose replaced range the DOM does
+        // not reveal) changes NOTHING about what the PTY holds. Dropping
+        // `acknowledged` here desynced the mirror from a line that was still
+        // there: the terminal kept the old text while the mirror said empty, so
+        // the dictated line rendered as an unreadable block and the NEXT
+        // correction diffed against nothing and repeated the phrase. Keep the
+        // model, and restate it in the textarea so the DOM stops claiming an
+        // edit that was never applied.
+        rebaseHelper();
+        mirror(acknowledged);
+      }
       flushKeys();
       return;
     }
