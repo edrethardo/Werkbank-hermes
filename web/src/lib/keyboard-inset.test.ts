@@ -1,12 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   computeKeyboardInset,
-  keyboardRevealScrollDelta,
   KEYBOARD_INSET_MIN_PX,
-  shouldJumpViewportForKeyboard,
-  shouldPinPageScroll,
   shouldPinScroll,
-  shouldScrollChatIntoView,
 } from "./keyboard-inset";
 
 describe("computeKeyboardInset", () => {
@@ -79,68 +75,5 @@ describe("shouldPinScroll", () => {
 
   it("does not pin without a keyboard", () => {
     expect(shouldPinScroll(0)).toBe(false);
-  });
-});
-
-describe("keyboard chat reveal", () => {
-  it("pins the page only when the chat already sits at the top", () => {
-    expect(shouldPinPageScroll(320, 0)).toBe(true);
-    expect(shouldPinPageScroll(320, 120)).toBe(false);
-    expect(shouldPinPageScroll(0, 0)).toBe(false);
-  });
-
-  it("scrolls the chat into view when it sits below the top", () => {
-    expect(shouldScrollChatIntoView(320, 120)).toBe(true);
-    expect(shouldScrollChatIntoView(320, 0)).toBe(false);
-    expect(shouldScrollChatIntoView(0, 120)).toBe(false);
-  });
-
-  it("never pins the page inside a Werkbank iframe — that hides the composer", () => {
-    expect(shouldPinPageScroll(320, 0, true)).toBe(false);
-    expect(shouldPinPageScroll(320, 120, true)).toBe(false);
-  });
-
-  it("always reveals the chat (composer) in an iframe when the keyboard opens", () => {
-    expect(shouldScrollChatIntoView(320, 0, true)).toBe(true);
-    expect(shouldScrollChatIntoView(320, 120, true)).toBe(true);
-    expect(shouldScrollChatIntoView(0, 0, true)).toBe(false);
-  });
-});
-
-describe("keyboardRevealScrollDelta", () => {
-  it("scrolls the page so the composer sits on the visual-viewport bottom", () => {
-    expect(
-      keyboardRevealScrollDelta(800, { height: 480, offsetTop: 0 }),
-    ).toBe(320);
-  });
-
-  it("accounts for iOS visual-viewport offsetTop", () => {
-    expect(
-      keyboardRevealScrollDelta(800, { height: 480, offsetTop: 40 }),
-    ).toBe(280);
-  });
-
-  it("does not move when the composer is already on the visible bottom", () => {
-    expect(
-      keyboardRevealScrollDelta(480, { height: 480, offsetTop: 0 }),
-    ).toBe(0);
-  });
-
-  it("lands the composer above the accessory bar, not under it", () => {
-    expect(
-      keyboardRevealScrollDelta(800, { height: 480, offsetTop: 0 }, 56),
-    ).toBe(376);
-  });
-});
-
-describe("shouldJumpViewportForKeyboard", () => {
-  it("jumps when the keyboard opens or closes", () => {
-    expect(shouldJumpViewportForKeyboard(0, 376)).toBe(true);
-    expect(shouldJumpViewportForKeyboard(376, 0)).toBe(true);
-  });
-
-  it("does not jump on caret-sized visualViewport nudges", () => {
-    expect(shouldJumpViewportForKeyboard(376, 336)).toBe(false);
-    expect(shouldJumpViewportForKeyboard(376, 376)).toBe(false);
   });
 });

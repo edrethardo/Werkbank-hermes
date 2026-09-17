@@ -96,7 +96,6 @@ const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
-const StructuredChatPage = lazy(() => import("@/pages/StructuredChatPage"));
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -106,10 +105,6 @@ import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
-import {
-  chatLocationFromStructured,
-  shouldRedirectStructuredToChat,
-} from "@/lib/phone-structured-chat";
 import { sharedGatewayProfiles, sharedGatewayRestartDescription } from "@/lib/shared-gateway";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
@@ -179,7 +174,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
-  "/chat/structured": StructuredChatPage,
 };
 
 // Route placeholder for /chat.  The persistent ChatPage host (rendered
@@ -378,7 +372,7 @@ const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
 export default function App() {
   const { t } = useI18n();
-  const { pathname, search } = useLocation();
+  const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -407,15 +401,11 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
-  const isChatSurface = isChatRoute || normalizedPath === "/chat/structured";
-  const structuredToChat = shouldRedirectStructuredToChat(pathname);
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
   // PTY survives later tab switches.
-  const [chatHostMounted, setChatHostMounted] = useState(
-    () => normalizedPath === "/chat",
-  );
+  const [chatHostMounted, setChatHostMounted] = useState(isChatRoute);
   useEffect(() => {
     setChatHostMounted((prev) => latchChatActivation(prev, isChatRoute));
   }, [isChatRoute]);
@@ -769,7 +759,7 @@ export default function App() {
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
                 "px-3 sm:px-6",
-                isChatSurface
+                isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
@@ -779,9 +769,9 @@ export default function App() {
               <div
                 className={cn(
                   "w-full min-w-0",
-                  !isChatSurface &&
+                  !isChatRoute &&
                     "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
-                  (isDocsRoute || isChatSurface) &&
+                  (isDocsRoute || isChatRoute) &&
                     "min-h-0 flex flex-1 flex-col",
                 )}
               >
@@ -801,9 +791,7 @@ export default function App() {
                   </Suspense>
                 </ProfileKeyedRoutes>
 
-                {structuredToChat ? (
-                  <Navigate to={chatLocationFromStructured(pathname, search)} replace />
-                ) : embeddedChat &&
+                {embeddedChat &&
                   !chatOverriddenByPlugin &&
                   (pluginsLoading ? (
                     isChatRoute ? (

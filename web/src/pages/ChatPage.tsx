@@ -32,15 +32,16 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { ChatSessionHeader } from "@/components/ChatSessionHeader";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
-import { installPtyBrowserInput } from "@/lib/pty-browser-input";
-import { composerTextareaBox, preparePtyTextareaForDictation, watchPtyTextareaLayout } from "@/lib/pty-ios-textarea";
-import { ACCESSORY_BAR_HEIGHT_PX, PTY_ETX, mountPtyMobileAccessory, shouldShowMobileAccessory, terminalBottomReservePx } from "@/lib/pty-mobile-accessory";
+import { installPtyComposer, type PtyComposerHandle } from "@/lib/pty-composer";
+import { installPtyKeyboardReveal } from "@/lib/pty-keyboard-reveal";
+import { installPtyTouchPan, lockPtyViewportScrolling } from "@/lib/pty-touch-pan";
 import { shouldDropPtyMouseReport } from "@/lib/pty-mouse";
 import { shouldRestoreTerminalFocus } from "@/lib/pty-focus";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
@@ -62,7 +63,6 @@ import {
   shouldFinishResumeHydrationOnChunk,
   shouldShowResumeLoadingOverlay,
 } from "@/lib/pty-resume-loading";
-import { computeKeyboardInset, keyboardRevealScrollDelta, shouldJumpViewportForKeyboard, shouldScrollChatIntoView } from "@/lib/keyboard-inset";
 import {
   resolvePtyKeyboardShortcut,
   sendPtyShortcutSequence,
@@ -71,9 +71,7 @@ import {
   isViewportPinnedToBottom,
   parseResumeControlMessage,
   shouldFollowPtyOutput,
-  shouldRejectViewportJumpToTop,
 } from "@/lib/pty-scroll";
-import { advanceTouchAnchor, isTouchPan, touchLineTravel, touchScrollLines, wheelScrollLines } from "@/lib/pty-touch-scroll";
 import { ptyAboOauthChannelKey, ptyAboOauthParams } from "@/lib/pty-abo-oauth";
 import { ptyWerkbankChannelKey, ptyWerkbankParams } from "@/lib/pty-werkbank";
 import {
@@ -83,8 +81,7 @@ import {
 } from "@/lib/chatImagePaste";
 import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
 import {
-  formatChatBreadcrumbBanner,
-  readChatBreadcrumbs,
+  initialChatBanner,
   recordChatBreadcrumb,
 } from "@/lib/chat-reload-breadcrumb";
 import { PluginSlot } from "@/plugins";
@@ -220,18 +217,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // In gated (OAuth) mode the server intentionally omits the session token —
   // the dashboard API layer authenticates the WS via a single-use ticket,
   // so a missing token there is expected, not an error.
-  const [banner, setBanner] = useState<string | null>(() => {
-    if (
-      typeof window !== "undefined" &&
-      !window.__HERMES_SESSION_TOKEN__ &&
-      !window.__HERMES_AUTH_REQUIRED__
-    ) {
-      return "Session token unavailable. Open this page through `hermes dashboard`, not directly.";
-    }
-    // The page may have just reloaded itself. Say why, so a phone user can
-    // report the actual cause instead of "die Seite lädt kaputt neu".
-    return formatChatBreadcrumbBanner(readChatBreadcrumbs());
-  });
+  const [banner, setBanner] = useState<string | null>(initialChatBanner);
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -527,7 +513,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // Captured once so the effect cleanup doesn't re-read the ref (which
     // may point elsewhere by then — react-hooks/exhaustive-deps).
     const termWrap = termWrapRef.current;
-    let browserInput: ReturnType<typeof installPtyBrowserInput> | undefined;
+    let browserInput: PtyComposerHandle["browserInput"] | undefined;
 
     const token = window.__HERMES_SESSION_TOKEN__;
     const gated = !!window.__HERMES_AUTH_REQUIRED__;
@@ -802,106 +788,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     fitRef.current = fit;
     term.loadAddon(fit);
 
-    let lastTouchScrollAt = 0;
     const coarsePointer =
       typeof window !== "undefined" &&
       window.matchMedia("(pointer: coarse)").matches;
-
-    // Dashboard chat should scroll the browser-side transcript, not send
-    // mouse-wheel protocol bytes through the PTY. iPhone Safari synthesizes
-    // wheel from the same finger as touchmove — ignore wheel on coarse
-    // pointers so the caret and the viewport are not both yanked.
-    term.attachCustomWheelEventHandler((ev) => {
-      if (coarsePointer || Date.now() - lastTouchScrollAt < 450) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        return false;
-      }
-      const lines = wheelScrollLines(ev.deltaY);
-      if (!lines) {
-        return false;
-      }
-
-      term.scrollLines(lines);
-
-      ev.preventDefault();
-      ev.stopPropagation();
-      return false;
-    });
-
-    // xterm's custom wheel hook does not receive touch drags. On a phone this
-    // otherwise leaves the browser trying to scroll its fixed dashboard chrome
-    // while the terminal history remains stuck. Keep one active finger and
-    // translate each movement into whole terminal rows.
-    let touchId: number | null = null;
-    let touchY: number | null = null;
-    let touchOriginY: number | null = null;
-    let touchPanning = false;
-    let suppressClickAfterPan = false;
-    let lastViewportY = 0;
-    let restoringViewport = false;
     const touchRoot = termWrap ?? host;
-    touchRoot.style.touchAction = "none";
-    const activeTouch = (list: TouchList) => {
-      for (let i = 0; i < list.length; i += 1) {
-        if (list[i].identifier === touchId) return list[i];
-      }
-      return null;
-    };
-    const onTouchStart = (ev: TouchEvent) => {
-      if (ev.touches.length !== 1) {
-        touchId = null;
-        touchY = null;
-        touchOriginY = null;
-        touchPanning = false;
-        return;
-      }
-      touchId = ev.touches[0].identifier;
-      touchY = ev.touches[0].clientY;
-      touchOriginY = ev.touches[0].clientY;
-      touchPanning = false;
-    };
-    const onTouchMove = (ev: TouchEvent) => {
-      if (ev.touches.length !== 1 || touchId === null || touchY === null || touchOriginY === null) return;
-      const touch = activeTouch(ev.touches);
-      if (!touch) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (!touchPanning && !isTouchPan(touchOriginY, touch.clientY)) {
-        return;
-      }
-      touchPanning = true;
-      browserInput?.setCaretSuspended(true);
-      const rowHeight = Math.min(36, Math.max(1, host.clientHeight / Math.max(1, term.rows)));
-      const lines = touchScrollLines(touchY, touch.clientY, rowHeight);
-      if (lines) {
-        touchY = advanceTouchAnchor(touchY, lines, touchLineTravel(rowHeight));
-        term.scrollLines(lines);
-        lastTouchScrollAt = Date.now();
-      }
-    };
-    const onTouchEnd = (ev: TouchEvent) => {
-      if (!activeTouch(ev.touches)) {
-        if (touchPanning) suppressClickAfterPan = true;
-        browserInput?.setCaretSuspended(false);
-        touchId = null;
-        touchY = null;
-        touchOriginY = null;
-        touchPanning = false;
-      }
-    };
-    const onSuppressedClick = (ev: Event) => {
-      if (!suppressClickAfterPan) return;
-      suppressClickAfterPan = false;
-      ev.preventDefault();
-      ev.stopPropagation();
-    };
-    touchRoot.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
-    touchRoot.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
-    touchRoot.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
-    touchRoot.addEventListener("touchcancel", onTouchEnd, { passive: true, capture: true });
-    host.addEventListener("mousedown", onSuppressedClick, true);
-    host.addEventListener("click", onSuppressedClick, true);
+    const touchPan = installPtyTouchPan(term, host, touchRoot, {
+      coarsePointer,
+      setCaretSuspended: (suspended: boolean) => browserInput?.setCaretSuspended(suspended),
+    });
 
     const unicode11 = new Unicode11Addon();
     term.loadAddon(unicode11);
@@ -910,50 +804,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.loadAddon(new WebLinksAddon());
 
     term.open(host);
-    if (coarsePointer) {
-      const viewport = host.querySelector<HTMLElement>(".xterm-viewport");
-      if (viewport) {
-        viewport.style.overflowY = "hidden";
-        viewport.style.overscrollBehavior = "none";
-      }
-    }
-    browserInput = installPtyBrowserInput(
-      term,
-      () =>
+    if (coarsePointer) lockPtyViewportScrolling(host);
+    const composer = installPtyComposer(term, host, termWrap ?? host, {
+      canSend: () =>
         wsRef.current?.readyState === WebSocket.OPEN &&
         !shouldBlockPtyInput(ptyStateRef.current),
-      (data) => sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, data),
-    );
-    const textarea = term.textarea;
-    if (textarea) preparePtyTextareaForDictation(textarea);
-    const stopWatchingTextarea = textarea
-      ? watchPtyTextareaLayout(textarea, () => {
-          const screen = term.element?.querySelector<HTMLElement>(".xterm-screen");
-          return composerTextareaBox(term.rows, screen?.clientHeight ?? host.clientHeight);
-        })
-      : () => {};
-    const accessory = mountPtyMobileAccessory(termWrap ?? host, {
-      paste: () => {
-        void navigator.clipboard.readText().then((text) => {
-          if (text) browserInput?.paste(text);
-        }).catch(() => { /* Safari may deny clipboard without a gesture */ });
-      },
-      interrupt: () => {
-        term.input(PTY_ETX);
-      },
-      caretLeft: () => {
-        browserInput?.nudge("ArrowLeft");
-      },
-      caretRight: () => {
-        browserInput?.nudge("ArrowRight");
-      },
-      historyUp: () => {
-        term.input("\x1b[A", true);
-      },
-      historyDown: () => {
-        term.input("\x1b[B", true);
-      },
+      sendSequence: (data) => sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, data),
     });
+    browserInput = composer.browserInput;
+    const accessory = composer.accessory;
 
     // WebGL draws from a texture atlas sized with device pixels. On phones and
     // in DevTools device mode that often produces *visually* much larger cells
@@ -1057,85 +916,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // in the viewport meta, but can't rely on it). The host's bounding
     // box therefore doesn't change when the keyboard opens, fit() computes
     // identical (cols, rows), and Ink keeps drawing the input line under
-    // the keyboard. Measure the obscured region via visualViewport and
-    // apply it as bottom padding on the terminal wrapper — that *does*
+    // the keyboard. `pty-keyboard-reveal` measures the obscured region and
+    // applies it as bottom padding on the terminal wrapper — that *does*
     // shrink the host, so the ResizeObserver refit path kicks in and the
     // PTY re-lays-out above the keyboard.
-    let appliedKeyboardInset = 0;
-    const syncKeyboardInset = () => {
-      const wrap = termWrap;
-      if (!wrap) return;
-      const vv = window.visualViewport;
-      const inset = computeKeyboardInset(
-        vv ? { height: vv.height, offsetTop: vv.offsetTop } : null,
-        window.innerHeight,
-      );
-      const chatTop = wrap.getBoundingClientRect().top;
-      const inIframe = window.self !== window.top;
-      const phoneChrome = coarsePointer || navigator.maxTouchPoints > 0;
-      const focused = term.textarea === document.activeElement;
-      const showBar = shouldShowMobileAccessory(inset, phoneChrome, focused);
-      const barPx = showBar ? ACCESSORY_BAR_HEIGHT_PX : 0;
-      const reserve = terminalBottomReservePx(inset, showBar);
-      const jumpViewport = shouldJumpViewportForKeyboard(appliedKeyboardInset, reserve);
-      if (jumpViewport) {
-        appliedKeyboardInset = reserve;
-        wrap.style.paddingBottom = reserve > 0 ? `${reserve}px` : "";
-        scheduleHostSync();
-      }
-      accessory.setInset(inset, phoneChrome, focused);
-      if (!jumpViewport) return;
-      if (shouldScrollChatIntoView(inset, chatTop, inIframe)) {
-        wrap.scrollIntoView({ block: "end", inline: "nearest" });
-      }
-      const revealComposer = () => {
-        if (inset <= 0 || !vv) return;
-        try {
-          term.scrollToBottom();
-        } catch {
-          /* ignore */
-        }
-        const delta = keyboardRevealScrollDelta(host.getBoundingClientRect().bottom, {
-          height: vv.height,
-          offsetTop: vv.offsetTop,
-        }, barPx);
-        if (delta) window.scrollBy(0, delta);
-      };
-      if (inset > 0) {
-        revealComposer();
-        requestAnimationFrame(() => {
-          revealComposer();
-          requestAnimationFrame(revealComposer);
-        });
-      }
-    };
-    const onViewportChange = () => {
-      syncKeyboardInset();
-      scheduleSyncTerminalMetrics();
-    };
+    const keyboardReveal = installPtyKeyboardReveal({
+      term,
+      host,
+      wrap: termWrap,
+      accessory,
+      onHostResize: () => scheduleHostSync(),
+      onViewportSettled: () => scheduleSyncTerminalMetrics(),
+    });
 
     window.addEventListener("resize", scheduleSyncTerminalMetrics);
-    // The visualViewport listeners that drive `onViewportChange` are NOT
+    // The visualViewport listeners that drive the reveal sync are NOT
     // attached here: ChatPage is persistently mounted (hidden) on every
     // dashboard route, so they are attached/detached by the isActive-gated
     // effect below via these refs. Attaching them unconditionally made the
     // scroll pin fire when a soft keyboard opened on any page.
-    keyboardInsetSyncRef.current = onViewportChange;
-    keyboardInsetResetRef.current = () => {
-      appliedKeyboardInset = 0;
-      if (termWrap) termWrap.style.paddingBottom = "";
-    };
-    let keyboardRevealTimer = 0;
-    const onTerminalFocus = () => {
-      onViewportChange();
-      window.clearTimeout(keyboardRevealTimer);
-      keyboardRevealTimer = window.setTimeout(onViewportChange, 350);
-    };
-    const onTerminalBlur = () => {
-      window.setTimeout(onViewportChange, 0);
-    };
-    term.textarea?.addEventListener("focus", onTerminalFocus);
-    term.textarea?.addEventListener("blur", onTerminalBlur);
+    keyboardInsetSyncRef.current = keyboardReveal.sync;
+    keyboardInsetResetRef.current = keyboardReveal.reset;
     scheduleHostSync();
     requestAnimationFrame(() => scheduleHostSync());
 
@@ -1571,19 +1372,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // we only auto-follow during the resume replay — not their manual
       // review of the backlog (#59591).
       onScrollDisposable = term.onScroll(() => {
-        const nextY = term.buffer.active.viewportY;
-        if (!restoringViewport && shouldRejectViewportJumpToTop(lastViewportY, nextY, touchPanning)) {
-          restoringViewport = true;
-          try {
-            term.scrollToLine(lastViewportY);
-          } catch {
-            /* ignore */
-          } finally {
-            restoringViewport = false;
-          }
-        } else {
-          lastViewportY = nextY;
-        }
+        touchPan.noteScroll();
         stickToBottomRef.current = isViewportPinnedToBottom(term.buffer.active);
       });
     })();
@@ -1600,23 +1389,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       onScrollDisposable?.dispose();
-      browserInput?.dispose();
-      stopWatchingTextarea();
-      accessory.dispose();
+      browserInput = undefined;
+      composer.dispose();
       host.removeEventListener("paste", handleBrowserPaste, true);
       host.removeEventListener("dragover", handleBrowserDragOver, true);
       host.removeEventListener("drop", handleBrowserDrop, true);
-      touchRoot.removeEventListener("touchstart", onTouchStart, true);
-      touchRoot.removeEventListener("touchmove", onTouchMove, true);
-      touchRoot.removeEventListener("touchend", onTouchEnd, true);
-      touchRoot.removeEventListener("touchcancel", onTouchEnd, true);
-      host.removeEventListener("mousedown", onSuppressedClick, true);
-      host.removeEventListener("click", onSuppressedClick, true);
+      touchPan.dispose();
       if (metricsDebounce) clearTimeout(metricsDebounce);
       window.removeEventListener("resize", scheduleSyncTerminalMetrics);
-      window.clearTimeout(keyboardRevealTimer);
-      term.textarea?.removeEventListener("focus", onTerminalFocus);
-      term.textarea?.removeEventListener("blur", onTerminalBlur);
+      keyboardReveal.dispose();
       keyboardInsetSyncRef.current = null;
       keyboardInsetResetRef.current = null;
       const wrap = termWrap;
@@ -1938,14 +1719,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
           }}
         >
-          {(sessionTitle || resumeParam) && (
-            <div className="mb-1 flex min-w-0 items-center gap-2 px-1 text-xs text-text-secondary">
-              <span className="truncate">{sessionTitle || "Chat"}</span>
-              {resumeParam && (
-                <code className="shrink-0 select-all">{resumeParam}</code>
-              )}
-            </div>
-          )}
+          <ChatSessionHeader resumeId={resumeParam} title={sessionTitle} />
           <div
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"

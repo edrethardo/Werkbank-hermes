@@ -1,4 +1,7 @@
-import { recordChatBreadcrumb } from "./chat-reload-breadcrumb";
+import {
+  recordChatBreadcrumb,
+  type ChatBreadcrumbKind,
+} from "./chat-reload-breadcrumb";
 
 type StorageLike = Pick<Storage, "getItem" | "removeItem" | "setItem">;
 
@@ -33,9 +36,22 @@ export function clearDashboardTokenReloadAttempt(
   }
 }
 
+/**
+ * Reload the dashboard once to pick up a fresh session token.
+ *
+ * `breadcrumb` names the cause: a note is left BEFORE the reload, because on a
+ * phone that is the only way to tell a stale-token reload apart from a
+ * reconnect replay or a Safari tab discard. Recorded here rather than at each
+ * call site so `api.ts` — a file upstream edits often — stays byte-identical
+ * to upstream.
+ */
 export function attemptDashboardTokenReloadOnce(
   storage: StorageLike | null = dashboardSessionStorage(),
   reload: () => void = reloadDashboardWindow,
+  breadcrumb: { kind: ChatBreadcrumbKind; detail: string } = {
+    kind: "api-auth-reload",
+    detail: "",
+  },
 ): boolean {
   let alreadyReloaded = false;
   try {
@@ -54,6 +70,8 @@ export function attemptDashboardTokenReloadOnce(
     /* privacy mode / blocked storage — best effort */
   }
 
+  recordChatBreadcrumb(breadcrumb.kind, breadcrumb.detail, storage);
+
   reload();
   return true;
 }
@@ -67,8 +85,8 @@ export function maybeReloadForLoopbackWsAuthFailure(
   if (authRequired || code !== 4401) {
     return false;
   }
-  // Leave a note BEFORE the reload: on a phone this is the only way to tell a
-  // stale-token reload apart from a reconnect replay or a Safari tab discard.
-  recordChatBreadcrumb("ws-auth-reload", `code=${code}`, storage);
-  return attemptDashboardTokenReloadOnce(storage, reload);
+  return attemptDashboardTokenReloadOnce(storage, reload, {
+    kind: "ws-auth-reload",
+    detail: `code=${code}`,
+  });
 }
