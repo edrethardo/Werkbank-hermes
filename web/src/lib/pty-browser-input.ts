@@ -65,17 +65,49 @@ export function installPtyBrowserInput(
   const textarea = term.textarea!;
   const host = term.element!;
   const preedit = host.querySelector<HTMLElement>('.composition-view');
+  /* Preedit text is the ONLY thing the user can see while dictating: composition sends no
+   * bytes, so the terminal itself still shows the pre-dictation line. Painting it transparent
+   * (to stop it double-printing over the row) made iPhone dictation look like it swallowed
+   * the words until Enter. So paint it legibly AND keep it on the cursor cell. */
+  const placePreedit = () => {
+    if (!preedit || !preedit.classList.contains('active')) return;
+    /* Measure at paint time, every frame: xterm replaces the row elements on each render,
+     * so a position computed once at compositionupdate ends up on a stale line. Prefer the
+     * cursor xterm actually painted; fall back to the buffer cell. NEVER fall back to the
+     * helper textarea's coordinates — on the phone those point at the docked composer.
+     * Offsets are relative to `.xterm-helpers`, a zero-sized box at the screen's top-left. */
+    const screenEl = host.querySelector<HTMLElement>('.xterm-screen');
+    const rect = screenEl?.getBoundingClientRect();
+    const cellWidth = rect && rect.width > 0 && term.cols > 0 ? rect.width / term.cols : 0;
+    const cellHeight = rect && rect.height > 0 && term.rows > 0 ? rect.height / term.rows : 0;
+    const buffer = term.buffer.active;
+    const painted = host.querySelector<HTMLElement>('.xterm-cursor')?.getBoundingClientRect();
+    const usable = painted && painted.width > 0 && rect;
+    const left = usable ? painted!.left - rect!.left
+      : Math.min(buffer.cursorX, Math.max(0, term.cols - 1)) * cellWidth;
+    const top = usable ? painted!.top - rect!.top
+      : Math.min(buffer.cursorY, Math.max(0, term.rows - 1)) * cellHeight;
+    preedit.style.left = `${Math.round(left)}px`;
+    preedit.style.top = `${Math.round(top)}px`;
+    if (cellHeight > 0) preedit.style.lineHeight = `${cellHeight}px`;
+  };
   const showPreedit = (data: string) => {
     if (!preedit) return;
     preedit.textContent = data;
     preedit.classList.toggle('active', Boolean(data));
-    preedit.style.color = "transparent";
-    preedit.style.setProperty("-webkit-text-fill-color", "transparent", "important");
-    preedit.style.background = 'transparent';
-    preedit.style.left = textarea.style.left;
-    preedit.style.top = textarea.style.top;
+    const theme = term.options.theme ?? {};
+    preedit.style.setProperty('color', theme.foreground ?? '#e6e6e6', 'important');
+    preedit.style.setProperty('-webkit-text-fill-color', theme.foreground ?? '#e6e6e6', 'important');
+    // Opaque: the row underneath still holds the un-dictated text and would show through.
+    preedit.style.setProperty('background', theme.background ?? '#000', 'important');
+    preedit.style.setProperty('opacity', '1', 'important');
+    preedit.style.position = 'absolute';
+    preedit.style.zIndex = '3';
+    preedit.style.whiteSpace = 'pre';
+    preedit.style.pointerEvents = 'none';
     preedit.style.fontFamily = term.options.fontFamily!;
     preedit.style.fontSize = `${term.options.fontSize}px`;
+    placePreedit();
   };
   let acknowledged = '';
   let ptyOffset = 0;
@@ -428,6 +460,8 @@ export function installPtyBrowserInput(
     if (sending) return;
     if (data === "\r" || data === "\n" || data === "\x03") boundary();
   });
+  // Re-place on every paint: an open composition survives redraws, and the row it sits on moves.
+  const renderListener = term.onRender(() => placePreedit());
   return {
     paste: pasteText,
     nudge(key: "ArrowLeft" | "ArrowRight" | "Home" | "End") {
@@ -448,6 +482,6 @@ export function installPtyBrowserInput(
       caretSuspended = value;
     },
     reset() { overtaken = undefined; finalizedComposition = undefined; reset(); },
-    dispose() { nativeCaret.dispose(); listeners.forEach(dispose => dispose()); dataListener.dispose(); selectionListener.dispose(); reset(); },
+    dispose() { nativeCaret.dispose(); listeners.forEach(dispose => dispose()); dataListener.dispose(); renderListener.dispose(); selectionListener.dispose(); reset(); },
   };
 }

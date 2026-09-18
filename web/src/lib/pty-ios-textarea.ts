@@ -23,10 +23,10 @@ export function ensurePtyHelperInkCss(doc: Document): void {
     "text-shadow:none!important;",
     "z-index:2!important;",
     "}",
+    /* The preedit must stay READABLE: it is the only rendering of dictated text while a
+     * composition is open (no bytes reach the PTY yet). Only kill Safari's own shading;
+     * colour and position are set inline by the input owner, at the cursor cell. */
     ".xterm .composition-view,.xterm .composition-view.active{",
-    "color:transparent!important;",
-    "-webkit-text-fill-color:transparent!important;",
-    "background:transparent!important;",
     "text-shadow:none!important;",
     "}",
   ].join("");

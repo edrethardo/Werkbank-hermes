@@ -94,6 +94,23 @@ describe("preparePtyTextareaForDictation", () => {
     host.remove();
   });
 
+  it("leaves the preedit legible: it is the only rendering of dictated text", () => {
+    const host = document.createElement("div");
+    host.className = "xterm";
+    const view = document.createElement("div");
+    view.className = "composition-view active";
+    host.append(view);
+    document.body.append(host);
+    ensurePtyHelperInkCss(document);
+    const sheet = document.getElementById("pty-helper-ink");
+    const rule = sheet?.textContent?.slice(sheet.textContent.indexOf(".xterm .composition-view")) ?? "";
+    // No composition bytes reach the PTY, so a transparent preedit means the user
+    // literally cannot see what they dictated until Enter.
+    expect(rule).not.toContain("color:transparent");
+    expect(rule).not.toContain("background:transparent");
+    host.remove();
+  });
+
   it("docks a visible native composer on the phone so caret and scroll are separate surfaces", () => {
     const textarea = document.createElement("textarea");
     preparePtyTextareaForDictation(textarea);

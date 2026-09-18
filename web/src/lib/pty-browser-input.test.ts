@@ -13,12 +13,13 @@ function fakeTerm(sendBytes?: (data: string) => boolean, syncInkCaret = true) {
   const inputs: string[] = [];
   const pastes: string[] = [];
   const dataListeners: Array<(data: string) => void> = [];
+  const renderListeners: Array<() => void> = [];
   const term = {
     textarea,
     element: host,
     cols: 80,
     rows: 24,
-    options: { fontFamily: "monospace", fontSize: 14, theme: { cursor: "#fff", foreground: "#fff" } },
+    options: { fontFamily: "monospace", fontSize: 14, theme: { cursor: "#fff", foreground: "#fff", background: "#000" } },
     buffer: {
       active: {
         baseY: 0,
@@ -36,7 +37,11 @@ function fakeTerm(sendBytes?: (data: string) => boolean, syncInkCaret = true) {
     },
     emitData(data: string) { dataListeners.forEach((cb) => cb(data)); },
     onSelectionChange() { return { dispose() {} }; },
-    onRender() { return { dispose() {} }; },
+    onRender(cb?: () => void) {
+      if (cb) renderListeners.push(cb);
+      return { dispose() {} };
+    },
+    emitRender() { renderListeners.forEach((cb) => cb()); },
     onResize() { return { dispose() {} }; },
     onScroll() { return { dispose() {} }; },
     hasSelection() { return false; },
@@ -139,6 +144,42 @@ describe("pty browser input", () => {
     expect(line).not.toContain("Satz eins. Satz eins.");
     expect(textarea.value).toBe(line);
     adapter.dispose();
+    host.remove();
+  });
+
+  it("paints the preedit legibly at the cursor cell, not transparently at the helper origin", () => {
+    const { term, textarea, host, adapter } = fakeTerm();
+    const view = document.createElement("div");
+    view.className = "composition-view";
+    host.append(view);
+    // jsdom has no layout: give the screen a real box so the cell math is exercised.
+    const screen = host.querySelector(".xterm-screen")!;
+    screen.getBoundingClientRect = () => ({ x: 0, y: 0, width: 800, height: 480, top: 0, left: 0, right: 800, bottom: 480, toJSON: () => ({}) });
+    term.buffer.active.cursorX = 10; // 10 * (800/80) = 100px
+    term.buffer.active.cursorY = 5; //  5 * (480/24) = 100px
+    // Rebuild the adapter now that the preedit element exists.
+    adapter.dispose();
+    const live = installPtyBrowserInput(term as never, () => true);
+    term.options.theme = { cursor: "#fff", foreground: "#e6e6e6", background: "#000000" };
+    textarea.style.left = "0px";
+    textarea.style.top = "999px"; // where the docked phone composer sits
+    textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
+    textarea.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true, data: "diktat" }));
+    expect(view.textContent).toBe("diktat");
+    expect(view.classList.contains("active")).toBe(true);
+    // Readable and opaque: composition sends no bytes, so this IS the dictated text.
+    expect(view.style.getPropertyValue("color")).not.toBe("transparent");
+    expect(view.style.getPropertyValue("-webkit-text-fill-color")).not.toBe("transparent");
+    expect(view.style.getPropertyValue("background")).not.toBe("transparent");
+    // On the cursor cell, never on the docked composer's coordinates.
+    expect(view.style.left).toBe("100px");
+    expect(view.style.top).toBe("100px");
+    // A redraw moves the composer row (the TUI repaints constantly while dictating). The
+    // preedit must follow it, or the dictated words render on some unrelated older line.
+    term.buffer.active.cursorY = 20;
+    term.emitRender();
+    expect(view.style.top).toBe("400px"); // 20 * (480/24)
+    live.dispose();
     host.remove();
   });
 
