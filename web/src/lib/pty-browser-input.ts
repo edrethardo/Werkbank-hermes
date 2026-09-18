@@ -1,5 +1,6 @@
 import type { Terminal } from '@xterm/xterm';
 import { installPtyNativeCaret, moveNativeCaret, caretDeltaSequence } from './pty-native-caret';
+import { PTY_HELPER_EDITING_CLASS } from './pty-ios-textarea';
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const modifiers = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph']);
@@ -111,7 +112,17 @@ export function installPtyBrowserInput(
   };
   let acknowledged = '';
   let ptyOffset = 0;
-  let helperOwned = false;
+  let helperOwnedFlag = false;
+  /* The helper's ink follows ownership: hidden sink -> transparent, visible edit
+   * surface -> legible. Routed through one setter because five call sites flip this
+   * and a missed one leaves the user typing into invisible text. */
+  const setHelperOwned = (owned: boolean) => {
+    helperOwnedFlag = owned;
+    const list = textarea.classList;
+    if (!list) return;
+    if (owned) list.add(PTY_HELPER_EDITING_CLASS);
+    else list.remove(PTY_HELPER_EDITING_CLASS);
+  };
   let sending = false;
   let transaction: EditTransaction | undefined;
   let overtaken: EditTransaction | undefined;
@@ -122,7 +133,7 @@ export function installPtyBrowserInput(
   const listeners: Array<() => void> = [];
   const nativeCaret = installPtyNativeCaret(term, () => ({
     value: acknowledged,
-    editable: canInput() && !helperOwned && !composition && !transaction,
+    editable: canInput() && !helperOwnedFlag && !composition && !transaction,
   }));
 
   let caretSuspended = false;
@@ -133,7 +144,7 @@ export function installPtyBrowserInput(
     try { term.input(data, true); } finally { sending = false; }
   };
   const syncVisibleCaret = () => {
-    if (!syncInkCaret || caretSuspended || helperOwned || composition || transaction || !canInput()) return;
+    if (!syncInkCaret || caretSuspended || helperOwnedFlag || composition || transaction || !canInput()) return;
     const value = acknowledged || textarea.value;
     if (!value) return;
     const to = Math.max(0, Math.min(value.length, textarea.selectionStart));
@@ -155,15 +166,15 @@ export function installPtyBrowserInput(
     ptyOffset = value.length;
   };
   const rebaseHelper = () => {
-    if (!helperOwned) return;
+    if (!helperOwnedFlag) return;
     acknowledged = '';
     mirror('');
-    helperOwned = false;
+    setHelperOwned(false);
   };
   const reset = () => {
     acknowledged = '';
     ptyOffset = 0;
-    helperOwned = false;
+    setHelperOwned(false);
     composition = undefined;
     showPreedit('');
     compositionTrigger = undefined;
@@ -223,8 +234,8 @@ export function installPtyBrowserInput(
     boundary();
     term.paste(data);
   };
-  const markHelper = () => { settleTransaction(); finishComposition(); flushKeys(true); helperOwned = true; acknowledged = ''; };
-  const nativeSelection = () => !helperOwned && textarea.selectionStart !== textarea.selectionEnd;
+  const markHelper = () => { settleTransaction(); finishComposition(); flushKeys(true); setHelperOwned(true); acknowledged = ''; };
+  const nativeSelection = () => !helperOwnedFlag && textarea.selectionStart !== textarea.selectionEnd;
   const contextMenu = (event: Event) => {
     if (event.target === textarea && nativeSelection()) event.stopImmediatePropagation();
     else markHelper();
@@ -265,7 +276,7 @@ export function installPtyBrowserInput(
       event.stopImmediatePropagation(); // Preserve selection and browser copy default.
       return;
     }
-    if (!key.altKey && !key.ctrlKey && !key.metaKey && !helperOwned) {
+    if (!key.altKey && !key.ctrlKey && !key.metaKey && !helperOwnedFlag) {
       const nav = key.key === "ArrowLeft" || key.key === "ArrowRight" || key.key === "Home" || key.key === "End";
       if (nav) {
         event.stopImmediatePropagation();
@@ -291,7 +302,7 @@ export function installPtyBrowserInput(
       event.stopImmediatePropagation();
       return;
     }
-    const outsideMirror = !helperOwned && textarea.selectionStart === textarea.selectionEnd &&
+    const outsideMirror = !helperOwnedFlag && textarea.selectionStart === textarea.selectionEnd &&
       ((key.key === 'Backspace' && textarea.selectionStart === 0) ||
        (key.key === 'Delete' && textarea.selectionEnd === acknowledged.length));
     if (nativeKey(key) && !outsideMirror) {
@@ -362,7 +373,7 @@ export function installPtyBrowserInput(
     // A replacement rewrites already-acknowledged text. Unrelated pending keys
     // remain outside that transaction and settle against its committed tail.
     if (!keyed && !composition && input.inputType !== 'insertReplacementText') flushKeys(true);
-    const helper = helperOwned;
+    const helper = helperOwnedFlag;
     rebaseHelper();
     transaction = { event: input, value: textarea.value, start: textarea.selectionStart, end: textarea.selectionEnd, helper, key: keyed ? keys.shift() : undefined };
   });
@@ -400,7 +411,7 @@ export function installPtyBrowserInput(
       // matches data: that does not reveal the replaced range.
       const data = input.data;
       const insertion = input.inputType.startsWith('insert') && data !== null;
-      const safePayload = insertion && (helperOwned ||
+      const safePayload = insertion && (helperOwnedFlag ||
         (input.inputType !== 'insertReplacementText' && (textarea.value === data || textarea.value === acknowledged + data)));
       if (safePayload) {
         const first = keys[0]?.event;
@@ -413,7 +424,7 @@ export function installPtyBrowserInput(
         // correction then diffed against a mirror missing that prefix, erased
         // too little and wrote the opening phrase a second time - the shape
         // iOS dictation produces on every self-correction (WB-520).
-        helperOwned = false;
+        setHelperOwned(false);
         commit(acknowledged + data);
         mirror(acknowledged);
       } else {
@@ -431,7 +442,7 @@ export function installPtyBrowserInput(
       flushKeys();
       return;
     }
-    if (edit.helper || helperOwned) {
+    if (edit.helper || helperOwnedFlag) {
       rebaseHelper();
       mirror(plainText(input.data ?? ''));
     }

@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { installPtyBrowserInput } from "./pty-browser-input";
+import { ensurePtyHelperInkCss } from "./pty-ios-textarea";
 
 function fakeTerm(sendBytes?: (data: string) => boolean, syncInkCaret = true) {
   const host = document.createElement("div");
@@ -180,6 +181,31 @@ describe("pty browser input", () => {
     term.emitRender();
     expect(view.style.top).toBe("400px"); // 20 * (480/24)
     live.dispose();
+    host.remove();
+  });
+
+  it("keeps the helper textarea readable while it owns the edit", () => {
+    // Long-press (contextmenu) and a selection both hand the edit to the native
+    // textarea via markHelper(). From then on the textarea IS the rendering: the
+    // terminal row underneath still shows the pre-edit line and no bytes reach the
+    // PTY until the edit settles. The ink stylesheet paints the helper
+    // `color:transparent;opacity:0.01` so it never double-prints over the row —
+    // correct while it is a hidden keystroke sink, WRONG while it owns an edit.
+    // The user reported it as text going black while editing.
+    const { textarea, host, adapter } = fakeTerm();
+    ensurePtyHelperInkCss(document);
+    host.className = "xterm";
+    textarea.className = "xterm-helper-textarea";
+
+    host.dispatchEvent(new Event("contextmenu", { bubbles: true }));
+    textarea.value = "editierter Text";
+
+    const painted = getComputedStyle(textarea);
+    expect(painted.getPropertyValue("-webkit-text-fill-color")).not.toBe("transparent");
+    expect(painted.getPropertyValue("color")).not.toBe("transparent");
+    expect(Number.parseFloat(painted.opacity || "1")).toBeGreaterThan(0.5);
+
+    adapter.dispose();
     host.remove();
   });
 

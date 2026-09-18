@@ -11,6 +11,10 @@ export type PtyTextareaBox =
 
 export const PTY_HELPER_INK_STYLE_ID = "pty-helper-ink";
 
+/** Set on the helper while it OWNS the edit (long-press, selection): it is then the
+ * only rendering of the text, so it must be legible. Cleared when the edit settles. */
+export const PTY_HELPER_EDITING_CLASS = "pty-helper-editing";
+
 /** Survives xterm rewriting the helper's inline style (Safari autocorrect paints black otherwise). */
 export function ensurePtyHelperInkCss(doc: Document): void {
   const css = [
@@ -28,6 +32,19 @@ export function ensurePtyHelperInkCss(doc: Document): void {
      * colour and position are set inline by the input owner, at the cursor cell. */
     ".xterm .composition-view,.xterm .composition-view.active{",
     "text-shadow:none!important;",
+    "}",
+    /* Editing hand-off (long-press / selection / autocorrect): the helper stops being a
+     * hidden keystroke sink and becomes the visible edit surface. Same reason as the
+     * preedit above — no bytes reach the PTY until the edit settles, so the row below
+     * still shows the OLD line. Hiding the helper here is what made edited text look
+     * black. Listed after the base rule so it wins at equal specificity. */
+    ".xterm textarea.xterm-helper-textarea." + PTY_HELPER_EDITING_CLASS + ",",
+    ".xterm .xterm-helper-textarea." + PTY_HELPER_EDITING_CLASS + "{",
+    "color:var(--pty-helper-fg,#e6e6e6)!important;",
+    "-webkit-text-fill-color:var(--pty-helper-fg,#e6e6e6)!important;",
+    "caret-color:var(--pty-helper-fg,#e6e6e6)!important;",
+    "background:var(--pty-helper-bg,#1e1e1e)!important;",
+    "opacity:1!important;",
     "}",
   ].join("");
   const existing = doc.getElementById(PTY_HELPER_INK_STYLE_ID);

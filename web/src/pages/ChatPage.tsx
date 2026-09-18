@@ -1717,6 +1717,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           style={{
             backgroundColor: terminalBg,
             boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
+            // Ink for the helper textarea while it owns an edit (long-press, selection,
+            // dictation). It renders the text itself then, so it must match the terminal
+            // it covers — a hard-coded colour would be unreadable on a light theme.
+            ["--pty-helper-bg" as string]: terminalBg,
+            ["--pty-helper-fg" as string]: terminalFg,
           }}
         >
           <ChatSessionHeader resumeId={resumeParam} title={sessionTitle} />
