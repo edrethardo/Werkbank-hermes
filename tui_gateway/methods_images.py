@@ -93,15 +93,28 @@ def _(rid, params: dict) -> dict:
     ``available: false`` ist der normale Fall für ein Terminal ohne Bildunterstützung, für
     eine fehlende Datei oder ein Nicht-Bild — kein Fehler. Der Aufrufer lässt dann den Pfad
     als Text stehen.
+
+    ``cols``/``rows`` in den Parametern sind die Maße des Terminals, das zusieht. Sie
+    kommen vom Renderer, weil nur der sie kennt: bei einer angehängten Sitzung läuft dieser
+    Prozess auf einer anderen Maschine. Ohne sie wird auf einem Telefon-Pane rechts
+    abgeschnitten.
     """
-    from .transcript_images import graphics_protocol, render_image
+    from .transcript_images import MAX_COLS, MAX_ROWS, graphics_protocol, render_image
 
     protocol = str(params.get("protocol") or "") or graphics_protocol()
     if protocol == "none":
         return _ok(rid, {"available": False, "protocol": protocol})
 
+    def _dim(key: str, fallback: int) -> int:
+        try:
+            value = int(params.get(key) or 0)
+        except (TypeError, ValueError):
+            return fallback
+        # Ein Bild soll den Schirm nicht ganz füllen und nie breiter als das Terminal sein.
+        return min(fallback, value) if value > 0 else fallback
+
     path = str(params.get("path") or "")
-    rendered = render_image(path, protocol)
+    rendered = render_image(path, protocol, _dim("cols", MAX_COLS), _dim("rows", MAX_ROWS))
     if rendered is None:
         return _ok(rid, {"available": False, "protocol": protocol})
 

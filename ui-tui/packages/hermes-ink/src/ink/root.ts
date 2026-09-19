@@ -120,6 +120,32 @@ export const writeAbove = (payload: string, stdout: NodeJS.WriteStream = process
 }
 
 /**
+ * Paint raw bytes into a frame block the caller reserved and marked.
+ *
+ * Use this instead of `writeAbove` whenever the content belongs BESIDE its
+ * text: the caller renders an empty `<Box height={n}>` whose first row holds
+ * `marker`, and Ink locates that row in the frame it just drew and paints
+ * there. See `Ink.writeIntoFrame`.
+ *
+ * Returns false when no Ink instance drives this stream, or when the marker
+ * is not in the current frame (not rendered yet, or scrolled out) — callers
+ * must have a fallback for that case.
+ */
+export const writeIntoFrame = (
+  marker: string,
+  payload: string,
+  stdout: NodeJS.WriteStream = process.stdout
+): boolean => {
+  const instance = instances.get(stdout)
+
+  if (!instance) {
+    return false
+  }
+
+  return instance.writeIntoFrame(marker, payload)
+}
+
+/**
  * Mount a component and render the output.
  */
 export const renderSync = (node: ReactNode, options?: NodeJS.WriteStream | RenderOptions): Instance => {

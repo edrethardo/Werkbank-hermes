@@ -46,6 +46,7 @@ import {
   cellAt,
   CellWidth,
   CharPool,
+  charInCellAt,
   createScreen,
   HyperlinkPool,
   isEmptyCellAt,
@@ -1401,6 +1402,88 @@ export default class Ink {
     this.onRender()
 
     return true
+  }
+
+  /**
+   * Paint raw bytes INTO a block of rows the frame has reserved for them.
+   *
+   * The counterpart to `writeAbove`, and the right tool whenever the content
+   * belongs BESIDE its text rather than above everything. `writeAbove` puts
+   * the payload above the frame's first row — and while a session still fits
+   * on one screen the frame starts at the banner, so "above the frame" is the
+   * top of the screen. Worse, the frame is redrawn from the cursor down, so
+   * the taller the frame the more of the payload the repaint reclaims
+   * (measured across frame heights on a 30-row screen: 6 rows leaves the
+   * payload whole, 29 rows leaves 4% of it). On a phone, where the frame
+   * fills the screen, that is the difference between "misplaced" and "gone".
+   *
+   * Here the caller renders an empty `<Box height={n}>` carrying `marker` in
+   * its first row. Those cells belong to the frame, so Ink accounts for them:
+   * an unchanged empty block produces no diff and is never re-emitted, and
+   * the bytes painted there survive every repaint until the block itself
+   * moves or unmounts.
+   *
+   * The marker is what makes this exact rather than a guess. The block's
+   * distance from the cursor depends on everything rendered below it
+   * (composer, activity feed, prompts), which the caller cannot know; so we
+   * find the marker's row in the frame we just drew and move relatively from
+   * the cursor Ink parked. `\x1b[s`/`\x1b[u` bracket the whole thing, leaving
+   * the cursor exactly where Ink believes it is.
+   *
+   * Returns false when there is no TTY, when Ink is paused/unmounted, or when
+   * the marker is not in the current frame (block scrolled out of the
+   * viewport, or not rendered yet — the caller must wait for the render).
+   */
+  writeIntoFrame(marker: string, payload: string): boolean {
+    if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused || !marker || !payload) {
+      return false
+    }
+
+    const row = this.findMarkerRow(marker)
+
+    if (row === null) {
+      return false
+    }
+
+    // The cursor sits at the frame's bottom row; the block starts at `row`.
+    const up = this.frontFrame.screen.height - 1 - row
+
+    if (up < 0) {
+      return false
+    }
+
+    this.options.stdout.write(`\x1b[s${up > 0 ? `\x1b[${up}A` : ''}\r${payload}\x1b[u`)
+
+    return true
+  }
+
+  /** Row of the first cell run matching `marker` in the current frame, or null. */
+  private findMarkerRow(marker: string): null | number {
+    const { screen } = this.frontFrame
+    const first = marker[0]!
+
+    for (let y = 0; y < screen.height; y++) {
+      for (let x = 0; x + marker.length <= screen.width; x++) {
+        if (charInCellAt(screen, x, y) !== first) {
+          continue
+        }
+
+        let hit = true
+
+        for (let i = 1; i < marker.length; i++) {
+          if (charInCellAt(screen, x + i, y) !== marker[i]) {
+            hit = false
+            break
+          }
+        }
+
+        if (hit) {
+          return y
+        }
+      }
+    }
+
+    return null
   }
 
   /**

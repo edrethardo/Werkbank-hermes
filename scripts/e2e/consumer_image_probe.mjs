@@ -6,7 +6,8 @@
  *
  *   node scripts/e2e/consumer_image_probe.mjs
  */
-import { chromium } from 'playwright'
+import { chromium, webkit } from 'playwright'
+const ENGINE = process.env.ENGINE === 'webkit' ? webkit : chromium
 import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join, extname } from 'node:path'
@@ -47,7 +48,7 @@ const server = createServer((req, res) => {
 await new Promise(r => server.listen(0, '127.0.0.1', r))
 const port = server.address().port
 
-const browser = await chromium.launch()
+const browser = await ENGINE.launch()
 const page = await browser.newPage({ viewport: { width: 1000, height: 700 } })
 const errs = []
 page.on('pageerror', e => errs.push(String(e)))

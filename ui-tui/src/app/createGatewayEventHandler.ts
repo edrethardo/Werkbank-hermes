@@ -1,7 +1,6 @@
 import { execFile } from 'child_process'
-import { appendFileSync } from 'fs'
 
-import { forceRedraw, onTerminalBackground, onTerminalForeground, writeAbove } from '@hermes/ink'
+import { forceRedraw, onTerminalBackground, onTerminalForeground, writeIntoFrame } from '@hermes/ink'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { relativeLuminance } from '@hermes/shared/color'
 import type { SubagentStatus, Usage } from '@hermes/shared/gateway-events'
@@ -444,11 +443,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
   /* `MEDIA:/pfad`-Bilder einer Antwort im Terminal zeigen.
    *
-   * Geschrieben wird über `writeAbove`: Ink schiebt die Bildsequenz in den Scrollback
-   * HOCH, oberhalb seines eigenen Frames, und zeichnet den Frame darunter neu. Der Grund
-   * ist Inks Rendering — es baut den Bildschirm als Zell-Diff auf und holt sich jede Zeile
-   * zurück, die es erreichen kann. Ein Bild in diesem Bereich überlebt den nächsten Turn
-   * nicht; oberhalb davon liegt History, die Ink nie wieder anfasst.
+   * Der Platz für das Bild wird als Nachricht ANGEMELDET (`kind: 'image'`), Ink rendert
+   * dafür einen Block leerer Zeilen mit einem unsichtbaren Marker, und erst danach malt
+   * `writeIntoFrame` die Pixel genau in diesen Block.
+   *
+   * Warum nicht einfach `writeAbove`: das schreibt oberhalb von Inks Frame, und der
+   * Repaint zeichnet den Frame von dort abwärts neu — er frisst das Bild anteilig zur
+   * Framehöhe. Gemessen auf 30 Zeilen: bei 6 Frame-Zeilen bleibt das Bild ganz, bei 20
+   * noch 42 %, bei 29 noch 4 %. Auf einem Telefon, wo der Frame den Schirm füllt, ist es
+   * damit weg — und solange die Sitzung auf einen Schirm passt, beginnt der Frame beim
+   * Banner, das Bild landet also oben statt bei seinem Text. Ein Symptom, eine Ursache.
    *
    * Das Encoding macht das Gateway (`image.terminal_sequence`): bei einer entfernten
    * Sitzung liegt die Datei dort und nicht hier.
@@ -475,46 +479,74 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       shownImages.add(path)
 
       try {
+        /* Die Terminalmaße MÜSSEN mitreisen. Das Gateway kann sie nicht kennen: bei einer
+         * angehängten Sitzung (Dashboard-Chat, i3-Pane) läuft es auf einer anderen
+         * Maschine als das Terminal. Ohne sie kodierte es fest 80 Spalten, und ein
+         * Telefon-Pane schnitt rechts ab — gemessen blieb bei 32 Spalten ein Sechstel der
+         * Pixel übrig. Zwei Zeilen Luft, damit der Block nicht bündig am Rand klebt. */
         const res = await rpc<{ available?: boolean; cols?: number; rows?: number; sequence?: string }>(
           'image.terminal_sequence',
-          // `protocol` nur mitschicken, wenn dieser Prozess es besser weiss als das
-          // Gateway (siehe IMAGE_PROTOCOL). Leer = das Gateway erkennt selbst.
-          IMAGE_PROTOCOL ? { path, protocol: IMAGE_PROTOCOL } : { path }
+          {
+            path,
+            ...(IMAGE_PROTOCOL ? { protocol: IMAGE_PROTOCOL } : {}),
+            ...(stdout.columns ? { cols: Math.max(1, stdout.columns - 2) } : {}),
+            ...(stdout.rows ? { rows: Math.max(1, Math.floor(stdout.rows / 2)) } : {})
+          }
         )
 
-        // TEMPORAER (Fehlersuche): ohne Env-Gate, damit laufende Sitzungen mitschreiben.
-        try {
-          appendFileSync('/tmp/img_debug.log',
-            `${new Date().toISOString()} pane=${process.env.HERMES_I3_PANE ?? '-'} ` +
-            `dash=${process.env.HERMES_TUI_DASHBOARD ?? '-'} envProto=${process.env.HERMES_TUI_IMAGE_PROTOCOL ?? '-'} ` +
-            `proto=${IMAGE_PROTOCOL || '(leer)'} available=${res?.available} ` +
-            `seq=${res?.sequence?.length ?? 0} isTTY=${stdout?.isTTY} path=${path}\n`)
-        } catch {
-          // Mitschrift ist Beiwerk.
-        }
+        if (res?.available && res.sequence && res.rows) {
+          /* Der Marker muss je Bild eindeutig sein: `writeIntoFrame` sucht die ERSTE
+           * Zeile, die ihn trägt, und zwei Bilder in einer Antwort bekämen sonst beide
+           * den Block des ersten.
+           *
+           * U+2800 (Braille-Blank) ist ein echtes, leeres Zeichen und kommt in normalem
+           * Text nicht vor. Zero-width-Zeichen (U+200B, U+2063) scheiden aus: Ink wirft
+           * sie beim Rendern weg, sie erreichen die Zellen nie — gemessen. Das führende
+           * Blank hält den Marker auch dann auffindbar, wenn die Zahl allein irgendwo
+           * sonst im Transcript stünde. */
+          const marker = `\u2800\u2800img${nextImageId++}\u2800`
 
-        if (res?.available && res.sequence) {
-          /* Ein einziger Aufruf: Ink erledigt Frame verlassen, Scrollback füllen und
-           * Neuzeichnen. Jede Variante, die das von außen versuchte, ist live gescheitert
-           * — Bild unter der Eingabezeile, vom Banner überlappt, nach `forceRedraw()`
-           * gelöscht oder vom nächsten Frame zerschnitten. */
-          const ok = writeAbove(res.sequence, stdout)
-
-          try {
-            appendFileSync('/tmp/img_debug.log', `  writeAbove=${ok}\n`)
-          } catch {
-            // Mitschrift ist Beiwerk.
-          }
+          appendMessage({ imageMarker: marker, imageRows: res.rows, kind: 'image', role: 'assistant', text: path })
+          pendingImageWrites.push({ marker, sequence: res.sequence })
         }
-      } catch (err) {
-        try {
-          appendFileSync('/tmp/img_debug.log', `  ERROR ${String(err)}\n`)
-        } catch {
-          // Mitschrift ist Beiwerk.
-        }
+      } catch {
         // Gateway zu alt oder Bild nicht lesbar: der Pfad im Text bleibt die Auslieferung.
       }
     }
+  }
+
+  /* Bildsequenzen, die auf ihren reservierten Block warten. Geschrieben wird erst,
+   * nachdem Ink den Block gerendert hat — vorher findet `writeIntoFrame` den Marker
+   * nicht und gibt false zurück. */
+  const pendingImageWrites: { marker: string; sequence: string }[] = []
+  let nextImageId = 0
+
+  /* Schreibversuche über mehrere Frames hinweg, weil `appendMessage` den Render nur
+   * PLANT. Ein einzelner Timer reichte nicht: ein langsamer Render oder ein Prompt, das
+   * dazwischenkommt, verschiebt ihn, und ein fehlgeschlagener Versuch hinterließ ein
+   * leeres Loch im Transcript. Nach der letzten Runde wird der Eintrag verworfen — der
+   * Pfad im Text bleibt dann die Auslieferung. */
+  const IMAGE_FLUSH_DELAYS_MS = [60, 160, 400, 900]
+
+  const flushImageWrites = (attempt = 0) => {
+    if (!stdout?.isTTY || !pendingImageWrites.length) {
+      return
+    }
+
+    const stillPending = pendingImageWrites
+      .splice(0)
+      .filter(({ marker, sequence }) => !writeIntoFrame(marker, sequence, stdout))
+
+    if (!stillPending.length) {
+      return
+    }
+
+    if (attempt + 1 >= IMAGE_FLUSH_DELAYS_MS.length) {
+      return
+    }
+
+    pendingImageWrites.push(...stillPending)
+    setTimeout(() => flushImageWrites(attempt + 1), IMAGE_FLUSH_DELAYS_MS[attempt + 1])
   }
 
   let pendingThinkingStatus = ''
@@ -1635,19 +1667,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
 
-          /* Erst den Text rendern, dann das Bild. `writeAbove` setzt die Sequenz direkt
-           * über Inks Frame — nachdem die Antwort im Frame steht, ist das genau die Zeile
-           * unter ihrem Text. Umgekehrt (Bild zuerst) landet es am Anfang des Verlaufs,
-           * solange die Sitzung noch auf einen Bildschirm passt.
+          /* Der Text wird SYNCHRON angehängt. Ihn hinter das `await` der Bild-RPC zu
+           * schieben war ein Regress: der Aufrufer sieht `message.complete` als erledigt
+           * an, und ein Test, der direkt danach den Transcript liest, fand nichts.
            *
-           * Das setTimeout ist nicht kosmetisch: `appendMessage` PLANT nur einen Render.
-           * Ohne die Pause liest `writeAbove` eine Framehöhe von vor der Antwort und
-           * schreibt oberhalb davon — das Bild landete im Test am Bildschirmanfang statt
-           * beim Text. */
+           * Die Bildblöcke kommen danach — was auch die natürliche Leserichtung ist:
+           * erst "siehe MEDIA:/pfad", dann das Bild. `flushImageWrites` malt die Pixel
+           * hinein, sobald Ink den Block gerendert hat, und versucht es über mehrere
+           * Frames, weil `appendMessage` den Render nur PLANT. */
           msgs.forEach(appendMessage)
-          setTimeout(() => {
-            void showTranscriptImages(msgs.map(m => m.text ?? '').join('\n'))
-          }, 150)
+          void showTranscriptImages(msgs.map(m => m.text ?? '').join('\n')).finally(() => {
+            setTimeout(() => flushImageWrites(), IMAGE_FLUSH_DELAYS_MS[0])
+          })
 
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')

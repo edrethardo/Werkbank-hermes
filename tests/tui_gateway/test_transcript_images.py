@@ -74,6 +74,39 @@ def test_cell_box_is_capped_so_a_4k_screenshot_cannot_flood_the_pty():
     assert small_cols < cols and small_rows < rows
 
 
+def test_a_narrow_terminal_gets_an_image_that_fits_it(tmp_path):
+    """Die Breite des ZUSEHENDEN Terminals deckelt das Bild, nicht eine Konstante.
+
+    Der Grund ist das Telefon: ein i3-Pane dort hat gut 32 Spalten. Ein auf 80 Spalten
+    kodiertes Bild wird vom Emulator rechts abgeschnitten — gemessen blieben von 311904
+    gemalten Pixeln noch 52364. Das Gateway kann die Maße nicht selbst kennen (bei einer
+    angehängten Sitzung läuft es auf einer anderen Maschine), also reisen sie mit.
+    """
+    shot = _png(tmp_path, size=(2000, 1500))
+
+    weit = render_image(str(shot), "kitty")
+    schmal = render_image(str(shot), "kitty", max_cols=32, max_rows=20)
+
+    assert weit is not None and schmal is not None
+    assert schmal[1] <= 32 and schmal[2] <= 20
+    # Und es ist wirklich schmaler geworden, nicht bloß anders deklariert.
+    assert schmal[1] < weit[1]
+    assert len(schmal[0]) < len(weit[0])
+
+
+def test_narrow_cap_keeps_the_aspect_ratio(tmp_path):
+    """Nur die Breite zu deckeln würde das Bild im Terminal in die Breite quetschen."""
+    breit, hoch = image_cell_box(1600, 400)
+    schmal_breit, schmal_hoch = image_cell_box(1600, 400, max_cols=20, max_rows=24)
+
+    assert schmal_breit <= 20
+    # Relativ vergleichen, nicht absolut: bei wenigen Zeilen dominiert die Ganzzahl-
+    # Rundung (2 statt 2.5 Zeilen sind schon 20 % Abweichung), ohne dass das Bild
+    # gequetscht wäre. Ein Viertel Toleranz fängt die Rundung, nicht aber den Fehler,
+    # den der Test sucht: nur die Breite zu deckeln ergäbe hier Faktor 4.
+    assert abs(schmal_breit / schmal_hoch - breit / hoch) / (breit / hoch) < 0.25
+
+
 def test_render_downscales_a_large_image_instead_of_sending_it_whole(tmp_path):
     """Die Nutzlast eines großen Bildes muss kleiner sein als das Original."""
     big = _png(tmp_path, "big.png", size=(2000, 1500))

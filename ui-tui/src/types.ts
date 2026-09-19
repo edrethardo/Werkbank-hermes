@@ -132,7 +132,17 @@ export interface ClarifyReq {
 
 export interface Msg {
   info?: SessionInfo
-  kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
+  kind?: 'diff' | 'event' | 'image' | 'intro' | 'panel' | 'slash' | 'trail'
+  // For `kind: 'image'`: the block of rows Ink reserves so the terminal can
+  // paint an inline image into cells the frame OWNS. Cells inside the frame
+  // survive every repaint; bytes written outside it are reclaimed by the next
+  // one (measured: the taller the frame, the more of the image disappears).
+  imageRows?: number
+  // Marker text rendered in the block's first row. `writeIntoFrame` finds this
+  // row in the drawn frame and paints there — the block's distance from the
+  // cursor depends on everything below it (composer, activity feed, prompts),
+  // which no caller can compute.
+  imageMarker?: string
   panelData?: PanelData
   role: Role
   text: string

@@ -51,10 +51,32 @@ def _pil():
         return None
 
 
-def image_cell_box(width: int, height: int) -> Tuple[int, int]:
-    """Zellenrechteck (Spalten, Zeilen) für ein Bild dieser Pixelgröße, gedeckelt."""
-    cols = max(1, min(MAX_COLS, -(-width // CELL_W)))
-    rows = max(1, min(MAX_ROWS, -(-height // CELL_H)))
+def image_cell_box(width: int, height: int,
+                   max_cols: int = MAX_COLS, max_rows: int = MAX_ROWS) -> Tuple[int, int]:
+    """Zellenrechteck (Spalten, Zeilen) für ein Bild dieser Pixelgröße, gedeckelt.
+
+    ``max_cols`` ist die Breite des Terminals, das zusieht, nicht eine Konstante: auf einem
+    Telefon hat ein Pane gut halb so viele Spalten wie ein Fenster am Rechner. Ein zu breit
+    kodiertes Bild wird dort vom Emulator rechts abgeschnitten — gemessen: bei 32 Spalten
+    blieben von 311904 Pixeln noch 52364, also ein Sechstel.
+
+    Das Seitenverhältnis bleibt erhalten: wird die Breite gedeckelt, sinkt die Höhe im
+    gleichen Verhältnis mit (sonst quetscht das Terminal das Bild in die Breite).
+    """
+    max_cols = max(1, max_cols)
+    max_rows = max(1, max_rows)
+
+    cols = max(1, -(-width // CELL_W))
+    rows = max(1, -(-height // CELL_H))
+
+    scale = min(1.0, max_cols / cols, max_rows / rows)
+    if scale < 1.0:
+        # Runden, nicht abschneiden: `int()` machte aus 2.5 Zeilen 2, und das Terminal
+        # streckt das Bild dann auf ein falsches Seitenverhältnis. Der Deckel bleibt
+        # hart — Aufrunden darf nie über die Terminalmaße hinausschießen.
+        cols = max(1, min(max_cols, int(cols * scale + 0.5)))
+        rows = max(1, min(max_rows, int(rows * scale + 0.5)))
+
     return cols, rows
 
 
@@ -102,8 +124,13 @@ def encode_iterm(payload: str, cols: int, rows: int) -> str:
             f"preserveAspectRatio=1;width={cols};height={rows}:{payload}\x07")
 
 
-def render_image(path: str, protocol: str) -> Optional[Tuple[str, int, int]]:
+def render_image(path: str, protocol: str,
+                 max_cols: int = MAX_COLS, max_rows: int = MAX_ROWS) -> Optional[Tuple[str, int, int]]:
     """``(sequenz, cols, rows)`` für ein Bild, oder None wenn es nicht darstellbar ist.
+
+    ``max_cols``/``max_rows`` sind die Maße des Terminals, das zusieht — der Renderer kennt
+    sie, dieser Prozess nicht (bei einer angehängten Sitzung läuft er woanders). Ohne sie
+    wird auf einem schmalen Pane rechts abgeschnitten.
 
     None heißt immer: der Aufrufer soll den Pfad als Text stehen lassen. Gründe dafür sind
     gewöhnlich (kein Pillow, Datei weg, kein bildfähiges Terminal) und kein Fehlerfall.
@@ -126,7 +153,7 @@ def render_image(path: str, protocol: str) -> Optional[Tuple[str, int, int]]:
         # Kaputte oder abgeschnittene Datei: Pfad stehen lassen, nicht die Ausgabe stören.
         return None
 
-    cols, rows = image_cell_box(frame.width, frame.height)
+    cols, rows = image_cell_box(frame.width, frame.height, max_cols, max_rows)
     payload = _png_b64(_fit(frame, cols, rows, Image))
     seq = encode_kitty(payload, cols, rows) if protocol == "kitty" else encode_iterm(payload, cols, rows)
     return seq, cols, rows

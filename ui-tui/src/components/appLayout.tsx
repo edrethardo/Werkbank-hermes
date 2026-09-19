@@ -204,7 +204,25 @@ const TranscriptPane = memo(function TranscriptPane({
                 </Box>
               )}
 
-              {row.msg.kind === 'intro' ? (
+              {row.msg.kind === 'image' ? (
+                /* Reservierter Block für ein Inline-Bild. Ink rendert die Zeilen leer bis
+                 * auf den Marker in der ersten — das Terminal malt die Pixel darüber.
+                 *
+                 * Die Zellen müssen dem FRAME gehören: `writeAbove` schreibt oberhalb
+                 * davon, und der Repaint zeichnet den Frame von dort abwärts wieder auf,
+                 * frisst das Bild also anteilig zur Framehöhe (gemessen auf 30 Zeilen:
+                 * bei 6 Frame-Zeilen bleibt es ganz, bei 29 noch 4 %). Auf dem Telefon,
+                 * wo der Frame den Schirm füllt, verschwindet es damit ganz.
+                 *
+                 * Der Marker besteht aus Braille-Blanks (U+2800) und ist damit schon von
+                 * sich aus unsichtbar — Zero-width-Zeichen gingen nicht, die wirft Ink
+                 * beim Rendern weg und sie erreichen die Zellen nie. Ohne Marker müsste
+                 * der Aufrufer den Abstand zum Cursor raten, der von allem darunter
+                 * abhängt (Composer, Aktivitätszeile, Prompts). */
+                <Box flexDirection="column" height={Math.max(1, row.msg.imageRows ?? 1)}>
+                  <Text>{row.msg.imageMarker ?? ''}</Text>
+                </Box>
+              ) : row.msg.kind === 'intro' ? (
                 <Box flexDirection="column" paddingTop={1}>
                   <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
 
