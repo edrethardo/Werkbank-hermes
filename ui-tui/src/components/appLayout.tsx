@@ -204,7 +204,14 @@ const TranscriptPane = memo(function TranscriptPane({
                 </Box>
               )}
 
-              {row.msg.kind === 'intro' ? (
+              {row.msg.kind === 'image' ? (
+                /* Reservierter Block für ein Inline-Bild: Ink rendert Leerzeilen, das
+                 * Terminal malt die Bildpixel hinein (die Sequenz schreibt
+                 * createGatewayEventHandler, nachdem dieser Platz existiert). Die Zellen
+                 * gehören damit dem Frame, und jeder Repaint räumt sie korrekt ab — ohne
+                 * diese Reservierung zerschneidet der nächste Frame das Bild. */
+                <Box flexDirection="column" height={Math.max(1, row.msg.imageRows ?? 1)} />
+              ) : row.msg.kind === 'intro' ? (
                 <Box flexDirection="column" paddingTop={1}>
                   <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
 

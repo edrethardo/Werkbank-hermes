@@ -24,6 +24,7 @@ import { topLevelSubagents } from '../lib/subagentTree.js'
 import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
 import { formatAbandonedClarify, formatAbandonedClarifyBatch, formatToolCall } from '../lib/text.js'
 import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/themeBoot.js'
+import { imagePaths } from '../lib/transcriptImages.js'
 import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
 import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
 
@@ -439,6 +440,85 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const { setInput } = ctx.composer
   const { submitLiteralRef, submitRef } = ctx.submission
   const { setProcessing: setVoiceProcessing, setRecording: setVoiceRecording, setVoiceEnabled } = ctx.voice
+
+  /* `MEDIA:/pfad`-Bilder einer Antwort im Terminal zeigen.
+   *
+   * Geschrieben wird direkt auf stdout, an Inks Rendering vorbei — dasselbe Vorgehen wie
+   * beim Maskottchen, weil Ink den Bildschirm als Zell-Diff aufbaut und Bildzellen nicht
+   * vermessen kann. Anders als das Maskottchen wird DIREKT platziert (kein `U=1`), damit
+   * das Bild im Textfluss steht und mitscrollt (live belegt: spikes/004).
+   *
+   * Das Encoding macht das Gateway (`image.terminal_sequence`): bei einer entfernten
+   * Sitzung liegt die Datei dort und nicht hier.
+   *
+   * Alle Fehler sind still. Das Bild ist eine Zugabe — der Pfad steht ohnehin im Text, und
+   * ein Fehlerrauschen im Transcript wäre schlimmer als ein nicht gezeigtes Bild.
+   */
+  const shownImages = new Set<string>()
+  const showTranscriptImages = async (text: string) => {
+    if (!stdout?.isTTY || !text) {
+      return
+    }
+
+    for (const path of imagePaths(text)) {
+      // Ein Pfad, den der Agent in mehreren Antworten nennt, wird nicht wiederholt gemalt.
+      if (shownImages.has(path)) {
+        continue
+      }
+
+      shownImages.add(path)
+
+      try {
+        const res = await rpc<{ available?: boolean; cols?: number; rows?: number; sequence?: string }>(
+          'image.terminal_sequence',
+          { path }
+        )
+
+        if (res?.available && res.sequence && res.rows) {
+          /* Zwei Schritte, die zusammengehören:
+           *
+           * 1. `appendMessage` mit `kind: 'image'` lässt Ink `rows` LEERZEILEN rendern.
+           *    Damit gehört der Platz dem Frame — Ink weiß von diesen Zellen und räumt
+           *    sie bei jedem Repaint korrekt ab.
+           * 2. Die Bildsequenz wird in genau diesen reservierten Block geschrieben.
+           *
+           * Ohne Schritt 1 ist jede Ausgabe eine Wette gegen den nächsten Repaint: live
+           * gemessen landete das Bild unter der Eingabezeile, überlappte nach einem
+           * Hochfahren per `\x1b[<n>A` den Banner, verschwand nach `forceRedraw()` ganz
+           * und wurde beim Schreiben vor dem Rendern vom nächsten Frame zerschnitten.
+           *
+           * Der Weg des Maskottchens (kitty `U=1`-Platzhalter) scheidet aus: der
+           * kitty-Handler im Browser-Terminal kennt `U=1` nicht, und ein Overlay würde
+           * nicht mitscrollen.
+           */
+          appendMessage({ imageRows: res.rows, kind: 'image', role: 'assistant', text: path })
+          pendingImageWrites.push({ rows: res.rows, sequence: res.sequence })
+        }
+      } catch {
+        // Gateway zu alt oder Bild nicht lesbar: der Pfad im Text bleibt die Auslieferung.
+      }
+    }
+  }
+
+  /* Bildsequenzen, die auf ihren reservierten Block warten. Sie werden geschrieben,
+   * nachdem Ink die Platzhalterzeilen gerendert hat — vorher gibt es den Platz nicht. */
+  const pendingImageWrites: { rows: number; sequence: string }[] = []
+  const flushImageWrites = () => {
+    if (!stdout?.isTTY || !pendingImageWrites.length) {
+      return
+    }
+
+    for (const { rows, sequence } of pendingImageWrites.splice(0)) {
+      /* Der Cursor steht nach dem Render unten am Frame. Der reservierte Block liegt
+       * weiter oben — dorthin per relativer Bewegung, Bild schreiben, zurück. Relativ,
+       * weil Ink selbst ausschließlich relativ rechnet und eine absolute Positionierung
+       * seine Buchführung bräche.
+       *
+       * `\x1b[s`/`\x1b[u` (Cursor sichern/wiederherstellen) klammert das Ganze, damit Ink
+       * den Cursor exakt dort wiederfindet, wo er ihn gelassen hat. */
+      stdout.write(`\x1b[s\x1b[${rows}A\r${sequence}\x1b[u`)
+    }
+  }
 
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
@@ -1557,7 +1637,17 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
-          msgs.forEach(appendMessage)
+
+          /* Bilder VOR dem Text anmelden: `showTranscriptImages` hängt je Bild eine
+           * Platzhalter-Nachricht an, in die das Terminal danach die Pixel malt. */
+          void showTranscriptImages(msgs.map(m => m.text ?? '').join('\n')).finally(() => {
+            msgs.forEach(appendMessage)
+            /* Erst schreiben, wenn Ink die Platzhalterzeilen gerendert hat. Zwei Frames
+             * Abstand: `appendMessage` plant einen Render, der Render selbst ist noch
+             * einen Tick später. Vorher existiert der reservierte Platz nicht, und die
+             * Sequenz landete wieder irgendwo im Frame. */
+            setTimeout(flushImageWrites, 120)
+          })
 
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')

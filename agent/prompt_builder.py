@@ -657,10 +657,12 @@ PLATFORM_HINTS = {
         f"{_LOCAL_CRON_DELIVERY_NOTE}"
     ),
     "tui": (
-        # Same file-delivery reality as the CLI: no MEDIA: interception in tui/.
-        "You are in the Hermes terminal UI (TUI). Files: there is no attachment channel and MEDIA:/path tags "
-        "are NOT intercepted here (they print as literal text) — deliver a file by stating its absolute path "
-        "or URL in plain text. "
+        # Images ARE intercepted here (tui_gateway/transcript_images.py renders MEDIA: image
+        # tags inline on kitty/iTerm2-class terminals); other file types are not.
+        "You are in the Hermes terminal UI (TUI). Files: to show the user an IMAGE (.png, .jpg, .gif, "
+        ".webp), write MEDIA:/absolute/path/to/image in your response — on an image-capable terminal it is "
+        "rendered inline below your text, and elsewhere the path stays readable as plain text. For any "
+        "OTHER file type there is no attachment channel: state its absolute path or URL in plain text. "
         f"{_LOCAL_CRON_DELIVERY_NOTE}"
     ),
     "desktop": (

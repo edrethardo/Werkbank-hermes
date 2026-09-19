@@ -82,5 +82,33 @@ def _(rid, params: dict) -> dict:
                      **({"image_data": data_url} if data_url else {})})
 
 
+@method("image.terminal_sequence")
+def _(rid, params: dict) -> dict:
+    """Terminalsequenz für ein Bild im Transcript, oder ``{"available": false}``.
+
+    Das Encoding gehört hierher und nicht in den Renderer: der Renderer hat keinen Zugriff
+    auf die Bilddateien des Gateways (bei einer entfernten Sitzung läuft er auf einem
+    anderen Rechner), und Pillow liegt ohnehin auf dieser Seite.
+
+    ``available: false`` ist der normale Fall für ein Terminal ohne Bildunterstützung, für
+    eine fehlende Datei oder ein Nicht-Bild — kein Fehler. Der Aufrufer lässt dann den Pfad
+    als Text stehen.
+    """
+    from .transcript_images import graphics_protocol, render_image
+
+    protocol = str(params.get("protocol") or "") or graphics_protocol()
+    if protocol == "none":
+        return _ok(rid, {"available": False, "protocol": protocol})
+
+    path = str(params.get("path") or "")
+    rendered = render_image(path, protocol)
+    if rendered is None:
+        return _ok(rid, {"available": False, "protocol": protocol})
+
+    sequence, cols, rows = rendered
+    return _ok(rid, {"available": True, "protocol": protocol,
+                     "sequence": sequence, "cols": cols, "rows": rows})
+
+
 def register(server) -> None:
     bind_module(globals(), server, skip=("_",))
