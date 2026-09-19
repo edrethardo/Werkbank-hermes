@@ -16,6 +16,14 @@ class FakeWebglAddon {
   }
 }
 
+class FakeImageAddon {
+  static options: Record<string, unknown>[] = [];
+
+  constructor(options: Record<string, unknown>) {
+    FakeImageAddon.options.push(options);
+  }
+}
+
 class FakeTerminal {
   static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
@@ -117,6 +125,7 @@ const imageMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
+vi.mock("@xterm/addon-image", () => ({ ImageAddon: FakeImageAddon }));
 vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class {} }));
 vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: FakeWebglAddon }));
@@ -229,6 +238,7 @@ async function render(ui: ReactNode) {
 
 beforeEach(() => {
   FakeTerminal.instances = [];
+  FakeImageAddon.options = [];
   FakeWebSocket.instances = [];
   imageMocks.uploadChatImage.mockClear();
   maybeReloadForLoopbackWsAuthFailure.mockClear();
@@ -304,6 +314,21 @@ describe("ChatPage", () => {
     expect(textarea.getAttribute("autocorrect")).toBe("off");
     expect(Number.parseFloat(textarea.style.fontSize)).toBeGreaterThanOrEqual(16);
     expect(textarea.style.width).not.toBe("0px");
+  });
+
+  it("loads the inline image addon without the reports and the codec we never feed", async () => {
+    // Ohne den Addon bleibt ein `MEDIA:`-Bild der TUI unsichtbar — xterm.js verwirft
+    // die Sequenz still. Die zwei Optionen sind bewusst aus und keine Auslassung:
+    // enableSizeReports schriebe CSI-t-Antworten in die PTY, wo Ink sie als Tastatur-
+    // eingabe liest; SIXEL erzeugt niemand auf der Gegenseite.
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(FakeImageAddon.options).toHaveLength(1));
+    expect(FakeImageAddon.options[0]).toMatchObject({
+      enableSizeReports: false,
+      iipSupport: true,
+      sixelSupport: false,
+    });
   });
 
   it("gives an image-bearing paste exclusive ownership while text-only paste reaches the adapter", async () => {

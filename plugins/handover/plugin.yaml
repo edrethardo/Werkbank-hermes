@@ -1,0 +1,7 @@
+name: handover
+version: 1.0.0
+description: "/handover — save a briefing of this session so the NEXT session continues the work. Carries context across a session boundary, which in-session compaction cannot; does not touch the current context (that is /compress)."
+author: NousResearch
+hooks:
+  - pre_llm_call
+  - post_llm_call

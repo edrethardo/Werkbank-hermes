@@ -1,11 +1,12 @@
 import { execFile } from 'child_process'
+import { appendFileSync } from 'fs'
 
 import { forceRedraw, onTerminalBackground, onTerminalForeground, writeAbove } from '@hermes/ink'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { relativeLuminance } from '@hermes/shared/color'
 import type { SubagentStatus, Usage } from '@hermes/shared/gateway-events'
 
-import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
+import { IMAGE_PROTOCOL, STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import type {
@@ -455,14 +456,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
    * Alle Fehler sind still. Das Bild ist eine Zugabe — der Pfad steht ohnehin im Text, und
    * ein Fehlerrauschen im Transcript wäre schlimmer als ein nicht gezeigtes Bild.
    */
-  const shownImages = new Set<string>()
   const showTranscriptImages = async (text: string) => {
     if (!stdout?.isTTY || !text) {
       return
     }
 
+    /* Dubletten NUR innerhalb dieser einen Antwort unterdrücken. Sitzungsweit zu
+     * entdubeln war falsch: wer dasselbe Bild ein zweites Mal anfordert, bekam
+     * kommentarlos nichts — der Pfad stand im Text, das Bild fehlte, und nichts
+     * unterschied das von einem Fehler. Eine neue Antwort ist eine neue Anfrage. */
+    const shownImages = new Set<string>()
+
     for (const path of imagePaths(text)) {
-      // Ein Pfad, den der Agent in mehreren Antworten nennt, wird nicht wiederholt gemalt.
       if (shownImages.has(path)) {
         continue
       }
@@ -472,17 +477,41 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       try {
         const res = await rpc<{ available?: boolean; cols?: number; rows?: number; sequence?: string }>(
           'image.terminal_sequence',
-          { path }
+          // `protocol` nur mitschicken, wenn dieser Prozess es besser weiss als das
+          // Gateway (siehe IMAGE_PROTOCOL). Leer = das Gateway erkennt selbst.
+          IMAGE_PROTOCOL ? { path, protocol: IMAGE_PROTOCOL } : { path }
         )
+
+        // TEMPORAER (Fehlersuche): ohne Env-Gate, damit laufende Sitzungen mitschreiben.
+        try {
+          appendFileSync('/tmp/img_debug.log',
+            `${new Date().toISOString()} pane=${process.env.HERMES_I3_PANE ?? '-'} ` +
+            `dash=${process.env.HERMES_TUI_DASHBOARD ?? '-'} envProto=${process.env.HERMES_TUI_IMAGE_PROTOCOL ?? '-'} ` +
+            `proto=${IMAGE_PROTOCOL || '(leer)'} available=${res?.available} ` +
+            `seq=${res?.sequence?.length ?? 0} isTTY=${stdout?.isTTY} path=${path}\n`)
+        } catch {
+          // Mitschrift ist Beiwerk.
+        }
 
         if (res?.available && res.sequence) {
           /* Ein einziger Aufruf: Ink erledigt Frame verlassen, Scrollback füllen und
            * Neuzeichnen. Jede Variante, die das von außen versuchte, ist live gescheitert
            * — Bild unter der Eingabezeile, vom Banner überlappt, nach `forceRedraw()`
            * gelöscht oder vom nächsten Frame zerschnitten. */
-          writeAbove(res.sequence, stdout)
+          const ok = writeAbove(res.sequence, stdout)
+
+          try {
+            appendFileSync('/tmp/img_debug.log', `  writeAbove=${ok}\n`)
+          } catch {
+            // Mitschrift ist Beiwerk.
+          }
         }
-      } catch {
+      } catch (err) {
+        try {
+          appendFileSync('/tmp/img_debug.log', `  ERROR ${String(err)}\n`)
+        } catch {
+          // Mitschrift ist Beiwerk.
+        }
         // Gateway zu alt oder Bild nicht lesbar: der Pfad im Text bleibt die Auslieferung.
       }
     }

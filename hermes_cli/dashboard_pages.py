@@ -27,7 +27,10 @@ Two properties are deliberate:
 
 from __future__ import annotations
 
+import hmac
+import json
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -145,7 +148,6 @@ def clear_pages() -> None:
 
 def _headless() -> bool:
     """``hermes serve --headless`` exposes JSON-RPC/WS only — never a plugin page."""
-    import os
     return os.environ.get("HERMES_SERVE_HEADLESS") == "1"
 
 
@@ -170,6 +172,16 @@ async def _send_json(send: Callable, status: int, payload: bytes) -> None:
 _PAGE_COOKIE = "hermes_page_session"
 
 
+def _gate_is_on(scope: dict) -> bool:
+    """Whether the dashboard auth gate is enforced for this request.
+
+    Read off the app the request was routed through (Starlette sets ``scope["app"]`` for HTTP and
+    WebSocket alike), never off an imported module global: a test harness mounts the dispatcher on
+    its own app, and reading a global would answer for the wrong one.
+    """
+    return bool(getattr(scope["app"].state, "auth_required", False))
+
+
 def _http_authorized(scope: dict) -> tuple[bool, bool]:
     """``(authorized, issue_cookie)`` for an HTTP request to a plugin page.
 
@@ -179,33 +191,35 @@ def _http_authorized(scope: dict) -> tuple[bool, bool]:
     session token is checked here — from the header, the ``?token=`` of a navigation, or the
     page cookie a previous navigation was issued.
     """
-    import hmac
-
     from starlette.requests import HTTPConnection
 
-    from hermes_cli.web_server import _SESSION_TOKEN, _has_valid_session_token, app
+    from hermes_cli.web_server import _has_valid_session_token
 
     conn = HTTPConnection(scope)
-    # The app the mount lives on (a test harness may mount the dispatcher on its own FastAPI);
-    # fall back to the dashboard's app so a bare scope still resolves the real gate flag.
-    owning_app = scope.get("app") or app
-    if getattr(owning_app.state, "auth_required", False):
+    if _gate_is_on(scope):
         state = scope.get("state") or {}
         ok = state.get("session") is not None or bool(state.get("token_authenticated"))
         return ok, False
     if _has_valid_session_token(conn):  # type: ignore[arg-type]
         return True, False
-
-    def _matches(value: str) -> bool:
-        return bool(value) and hmac.compare_digest(value.encode(), _SESSION_TOKEN.encode())
-
-    if _matches(conn.cookies.get(_PAGE_COOKIE, "")):
+    if _matches_session_token(conn.cookies.get(_PAGE_COOKIE, "")):
         return True, False
     # Only a navigation's ``?token=`` earns the cookie; a header-authenticated API call has no
     # use for one.
-    if _matches(conn.query_params.get("token", "")):
+    if _matches_session_token(conn.query_params.get("token", "")):
         return True, True
     return False, False
+
+
+def _matches_session_token(value: str) -> bool:
+    """Constant-time comparison against the dashboard session token.
+
+    ``compare_digest`` raises on non-ASCII, and a pasted ``?token=abc…`` is a routine way for one
+    to arrive — encoding first turns that into a wrong token (401) instead of a 500.
+    """
+    from hermes_cli.web_server import _SESSION_TOKEN
+
+    return bool(value) and hmac.compare_digest(value.encode(), _SESSION_TOKEN.encode())
 
 
 def _cookie_issuing_send(send: Callable, secure: bool) -> Callable:
@@ -342,14 +356,16 @@ def page_base_path(request_or_scope: Any) -> str:
 
 
 def _proxy_prefix(scope: dict) -> str:
-    """Normalised ``X-Forwarded-Prefix`` for this request, or ``""``."""
-    try:
-        from hermes_cli.dashboard_auth.prefix import normalise_prefix
-        headers = dict(scope.get("headers") or [])
-        return normalise_prefix(headers.get(b"x-forwarded-prefix", b"").decode("latin-1"))
-    except Exception:  # pragma: no cover - prefix support is best-effort
-        _log.debug("prefix resolution failed for plugin page", exc_info=True)
-        return ""
+    """Normalised ``X-Forwarded-Prefix`` for this request, or ``""``.
+
+    ``normalise_prefix`` is the dashboard's single validator for this header (it rejects ``..``,
+    ``//`` and injection characters) — reused rather than re-derived, so a plugin page and the
+    SPA agree on what the prefix is.
+    """
+    from hermes_cli.dashboard_auth.prefix import normalise_prefix
+
+    headers = dict(scope.get("headers") or [])
+    return normalise_prefix(headers.get(b"x-forwarded-prefix", b"").decode("latin-1"))
 
 
 def bootstrap_script(request_or_scope: Any) -> str:
@@ -367,13 +383,10 @@ def bootstrap_script(request_or_scope: Any) -> str:
       published (same rule as the SPA's index.html): the page mints a per-socket ticket via
       ``POST /api/auth/ws-ticket`` instead.
     """
-    import json
-
-    from hermes_cli.web_server import _SESSION_TOKEN, app
+    from hermes_cli.web_server import _SESSION_TOKEN
 
     scope = getattr(request_or_scope, "scope", request_or_scope)
-    owning_app = scope.get("app") or app
-    gated = bool(getattr(owning_app.state, "auth_required", False))
+    gated = _gate_is_on(scope)
     token_js = "" if gated else f"window.__HERMES_SESSION_TOKEN__={json.dumps(_SESSION_TOKEN)};"
     return (
         "<script>"

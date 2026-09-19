@@ -1,10 +1,11 @@
-"""WB-618: plugin-contributed dashboard pages at ``/p/<slug>``.
+"""Plugin-contributed dashboard pages at ``/p/<slug>``.
 
 The acceptance list this file encodes:
 
 * a plugin router answers under ``/p/<slug>`` even with the SPA catch-all mounted,
 * an unauthenticated caller gets 401 (never the page),
 * WebSockets below ``/p/<slug>/`` work, several at once,
+* under the auth gate a socket needs a single-use ``?ticket=``, not the session token,
 * slug validation refuses path escapes and core-route collisions,
 * two plugins do not interfere,
 * unloading the plugin removes the route,
@@ -279,6 +280,66 @@ class TestWebSockets:
         client = TestClient(app, base_url="http://evil.example")
         with pytest.raises(WebSocketDisconnect) as exc:
             with client.websocket_connect(f"/p/i3/ws?token={ws._SESSION_TOKEN}") as sock:
+                sock.receive_text()
+        assert exc.value.code == 4401
+
+
+class TestGatedWebSockets:
+    """Under the auth gate a page renders from its session but its sockets need a ``?ticket=``.
+
+    A browser cannot set a header on a WS upgrade and the session cookie is not accepted there,
+    so core mints a single-use ticket via ``POST /api/auth/ws-ticket``. A page that connects
+    without one shows an empty shell: HTML and assets load, every socket is rejected. These pin
+    both directions so a plugin author can rely on the contract instead of rediscovering it.
+    """
+
+    def test_gated_socket_without_a_ticket_is_refused(self, monkeypatch, tmp_path):
+        from starlette.websockets import WebSocketDisconnect
+
+        app, _ws = _dashboard_app(monkeypatch, tmp_path, gated=True)
+        dp.register_page(dp.DashboardPage("i3", "T", _page_router("i3"), plugin="alpha"))
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with TestClient(app).websocket_connect("/p/i3/ws") as sock:
+                sock.receive_text()
+        assert exc.value.code == 4401
+
+    def test_gated_socket_rejects_the_session_token(self, monkeypatch, tmp_path):
+        """The loopback credential must not open a socket on a gated deployment."""
+        from starlette.websockets import WebSocketDisconnect
+
+        app, ws = _dashboard_app(monkeypatch, tmp_path, gated=True)
+        dp.register_page(dp.DashboardPage("i3", "T", _page_router("i3"), plugin="alpha"))
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with TestClient(app).websocket_connect(f"/p/i3/ws?token={ws._SESSION_TOKEN}") as sock:
+                sock.receive_text()
+        assert exc.value.code == 4401
+
+    def test_gated_socket_opens_with_a_minted_ticket(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
+
+        app, _ws = _dashboard_app(monkeypatch, tmp_path, gated=True)
+        dp.register_page(dp.DashboardPage("i3", "T", _page_router("i3"), plugin="alpha"))
+        ticket = mint_ticket(user_id="probe", provider="local")
+        with TestClient(app).websocket_connect(f"/p/i3/ws?ticket={ticket}") as sock:
+            assert sock.receive_text() == "hello-i3"
+            sock.send_text("ping")
+            assert sock.receive_text() == "echo:ping"
+
+    def test_gated_ticket_is_single_use(self, monkeypatch, tmp_path):
+        from starlette.websockets import WebSocketDisconnect
+
+        from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
+
+        app, _ws = _dashboard_app(monkeypatch, tmp_path, gated=True)
+        dp.register_page(dp.DashboardPage("i3", "T", _page_router("i3"), plugin="alpha"))
+        ticket = mint_ticket(user_id="probe", provider="local")
+        client = TestClient(app)
+        with client.websocket_connect(f"/p/i3/ws?ticket={ticket}") as sock:
+            assert sock.receive_text() == "hello-i3"
+            sock.send_text("ping")
+            assert sock.receive_text() == "echo:ping"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(f"/p/i3/ws?ticket={ticket}") as sock:
                 sock.receive_text()
         assert exc.value.code == 4401
 

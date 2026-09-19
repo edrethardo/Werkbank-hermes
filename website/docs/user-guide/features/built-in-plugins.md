@@ -56,6 +56,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | Plugin | Kind | Purpose |
 |---|---|---|
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
+| `handover` | hooks + slash command | `/handover` — carry a briefing across a session boundary (survives `/new` and restarts) |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `teams_pipeline` | standalone | Microsoft Teams meeting pipeline — Graph-backed, transcript-first meeting summaries |
@@ -116,6 +117,51 @@ Auto-tracks and removes ephemeral files created during sessions — test scripts
 **Enabling:** `hermes plugins enable disk-cleanup` (or check the box in `hermes plugins`).
 
 **Disabling again:** `hermes plugins disable disk-cleanup`.
+
+### handover
+
+`/handover` carries context **across a session boundary**. It summarizes the conversation into a briefing and saves it; the first message of your *next* session is answered with that briefing in context — after `/new`, after a restart, or when you come back tomorrow.
+
+**This is not another `/compress`.** In-session compaction is `/compress`'s job and it does it better: a structured template, a `focus` argument with budget priorisation, secret redaction, iterative updates across repeated compactions. What compaction cannot do is survive a session boundary — the compressor drops its summary on `/new` (`ContextCompressor.on_session_reset`). That gap is the only thing this plugin fills, so `/handover` deliberately changes nothing about the current session.
+
+| You want to… | Use |
+|---|---|
+| free context in the session you are in | `/compress` (`/compress focus <topic>` to steer it) |
+| continue this work in a *later* session | `/handover` |
+
+**Usage:**
+
+```
+/handover                  # summarize this session, save the briefing
+/handover <focus>          # steer the summary: /handover focus on the deploy work
+/handover show             # show the pending briefing
+/handover discard          # throw the pending briefing away
+```
+
+The briefing is structured — *Auftrag / Stand / Offen / Nächster Schritt / Kontext* — and written in the language you write in.
+
+**How it works:**
+
+| Hook | Behaviour |
+|---|---|
+| `pre_llm_call` | Captures the running transcript, and injects a pending briefing into the **user message** of the first turn of any session other than the one that wrote it. Delivered exactly once, then cleared. |
+| `post_llm_call` | Keeps the captured transcript current, including the reply just produced. |
+
+The session that wrote a briefing never receives it: it still holds the real history and must not be handed a summary of context it already has.
+
+The briefing never touches the system prompt — that would break per-conversation prompt caching. It rides the same one-shot user-message injection channel that memory prefetch uses.
+
+**Secrets** — the briefing is force-redacted before it is stored (`redact_sensitive_text(force=True)`). It is written to disk and replayed into a later session, so a credential that appeared in the transcript must not travel with it.
+
+**Summarization** runs through the host-owned plugin LLM facade on your active model. If that call fails or returns nothing, the plugin falls back to a mechanical digest of the last exchanges rather than losing the handover; `/handover show` labels such a briefing.
+
+**Caps** — 2 000 chars per message, 80 messages / 24 000 chars of transcript into the summarizer, 8 000 chars for the stored briefing. Tool rows and system prompts are stripped before summarizing; tool-only assistant turns collapse to a `[used tools: …]` marker.
+
+**State** — one record in profile-scoped plugin state (`$HERMES_HOME/plugin-data/<handover namespace>/state.json`), cleared as soon as it is delivered.
+
+**Enabling:** `hermes plugins enable handover`.
+
+**Disabling again:** `hermes plugins disable handover`.
 
 ### security-guidance
 

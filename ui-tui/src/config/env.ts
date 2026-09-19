@@ -56,6 +56,37 @@ export const NO_CONFIRM_DESTRUCTIVE = truthy(process.env.HERMES_TUI_NO_CONFIRM)
 // browser-embedded TUI has no healthy restart path after an idle exit.
 export const DASHBOARD_TUI_MODE = truthy(process.env.HERMES_TUI_DASHBOARD)
 
+// Inline-Bildprotokoll fuer `MEDIA:`-Bilder im Transcript.
+//
+// Warum der CLIENT das entscheidet und nicht das Gateway: die Erkennung dort
+// (`transcript_images.graphics_protocol()`) liest TERM/TERM_PROGRAM/KITTY_WINDOW_ID
+// des GATEWAY-Prozesses. Bei einer angehaengten Sitzung — der Dashboard-Chat haengt
+// am Gateway des Dashboards — beschreiben die die Konsole, aus der das Dashboard
+// gestartet wurde, und nicht das Terminal, das den Nutzer ansieht. Gemessen: die RPC
+// antwortet dort `available: false, protocol: 'none'`, also wurde nie ein Bild
+// gesendet. Das Terminal ist eine Eigenschaft DIESES Prozesses, also reist die
+// Angabe mit dem Aufruf.
+//
+// VORRANG, und die Reihenfolge ist hart erarbeitet:
+//
+// 1. Eine explizit gesetzte Variable gewinnt. Wer ein Terminal einbettet, WEISS was es
+//    kann und sagt es — das i3-Plugin setzt `kitty`, weil es ein selbstgebautes xterm.js
+//    mit kitty-Handler ausliefert (das npm-Paket kann nur SIXEL/IIP).
+// 2. Erst danach der Dashboard-Standard `iterm` (xterm.js + @xterm/addon-image versteht
+//    iTerm2-IIP und kann kitty-Grafik nicht parsen).
+//
+// NICHT umgekehrt: `HERMES_TUI_DASHBOARD=1` heisst nur "von der Dashboard-Maschinerie
+// gestartet", nicht "im Chat-Tab des Dashboards". Gemessen: i3-Panes tragen BEIDE
+// Variablen, weil sie das Dashboard-Env erben. Wuerde der Dashboard-Fall die Variable
+// schlagen, bekaemen sie `iterm` statt des kitty, das ihr Terminal tatsaechlich spricht.
+const imageProtocolOverride = (process.env.HERMES_TUI_IMAGE_PROTOCOL ?? '').trim().toLowerCase()
+
+export const IMAGE_PROTOCOL = ['kitty', 'iterm', 'none'].includes(imageProtocolOverride)
+  ? imageProtocolOverride
+  : DASHBOARD_TUI_MODE
+    ? 'iterm'
+    : ''
+
 // HERMES_DEV_CREDITS — dev-only live-spend readout (Δ status segment + "(dev credits)"
 // banner). Throwaway dev scaffolding; the whole readout gates on this one flag.
 export const DEV_CREDITS_MODE = truthy(process.env.HERMES_DEV_CREDITS)

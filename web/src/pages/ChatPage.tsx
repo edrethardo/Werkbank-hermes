@@ -17,6 +17,7 @@
  */
 
 import { FitAddon } from "@xterm/addon-fit";
+import { ImageAddon } from "@xterm/addon-image";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -802,6 +803,25 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.unicode.activeVersion = "11";
 
     term.loadAddon(new WebLinksAddon());
+
+    // Inline images (`MEDIA:` tags rendered by the embedded TUI).  The TUI
+    // encodes for the protocol named by HERMES_TUI_IMAGE_PROTOCOL, which the
+    // PTY bridge pins to `iterm` for this pane — kitty graphics is the one
+    // protocol xterm.js cannot parse, and IIP is the only inline format the
+    // addon shares with our encoder.
+    //
+    // `enableSizeReports: false`: the reports (CSI 14/16/18 t) are written back
+    // into the PTY, where Ink reads them as stdin. Our encoder sizes images in
+    // CELLS (`width=N;height=N`), so nothing here needs pixel metrics.
+    // `sixelSupport: false`: we never emit SIXEL (35 s/screenshot to encode);
+    // leaving it on only buys a decoder we never feed.
+    try {
+      term.loadAddon(
+        new ImageAddon({ enableSizeReports: false, sixelSupport: false, iipSupport: true }),
+      );
+    } catch (err) {
+      console.warn("[hermes-chat] inline image addon unavailable", err);
+    }
 
     term.open(host);
     if (coarsePointer) lockPtyViewportScrolling(host);

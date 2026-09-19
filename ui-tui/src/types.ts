@@ -132,11 +132,7 @@ export interface ClarifyReq {
 
 export interface Msg {
   info?: SessionInfo
-  kind?: 'diff' | 'event' | 'image' | 'intro' | 'panel' | 'slash' | 'trail'
-  // Höhe des reservierten Blocks für ein `kind: 'image'`. Ink rendert so viele Leerzeilen,
-  // damit die Bildzellen dem Frame gehören und jeder Repaint sie korrekt abräumt; ohne
-  // diese Reservierung zerschneidet der nächste Frame das Bild.
-  imageRows?: number
+  kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData
   role: Role
   text: string

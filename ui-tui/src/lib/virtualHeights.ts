@@ -93,12 +93,6 @@ export const estimatedMsgHeight = (
     return msg.info?.version ? 9 : 5
   }
 
-  if (msg.kind === 'image') {
-    // Muss GENAU dem reservierten Block in appLayout entsprechen: eine abweichende
-    // Schätzung verschiebt jede Zeile darunter beim Virtual-Scrolling.
-    return Math.max(1, msg.imageRows ?? 1)
-  }
-
   if (msg.kind === 'panel') {
     return Math.max(3, (msg.panelData?.sections.length ?? 1) * 2 + 1)
   }
