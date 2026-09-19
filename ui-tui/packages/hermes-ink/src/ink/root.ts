@@ -102,6 +102,24 @@ export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolea
 }
 
 /**
+ * Commit raw bytes to the terminal's scrollback above Ink's frame
+ * (see Ink.writeAbove).
+ *
+ * Returns false when no Ink instance drives this stream, or when Ink cannot
+ * reach the scrollback (no TTY, paused, alt screen). Callers must have a text
+ * fallback for that case.
+ */
+export const writeAbove = (payload: string, stdout: NodeJS.WriteStream = process.stdout): boolean => {
+  const instance = instances.get(stdout)
+
+  if (!instance) {
+    return false
+  }
+
+  return instance.writeAbove(payload)
+}
+
+/**
  * Mount a component and render the output.
  */
 export const renderSync = (node: ReactNode, options?: NodeJS.WriteStream | RenderOptions): Instance => {

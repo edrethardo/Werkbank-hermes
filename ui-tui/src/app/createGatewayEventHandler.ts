@@ -1,6 +1,6 @@
 import { execFile } from 'child_process'
 
-import { forceRedraw, onTerminalBackground, onTerminalForeground } from '@hermes/ink'
+import { forceRedraw, onTerminalBackground, onTerminalForeground, writeAbove } from '@hermes/ink'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { relativeLuminance } from '@hermes/shared/color'
 import type { SubagentStatus, Usage } from '@hermes/shared/gateway-events'
@@ -443,10 +443,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
   /* `MEDIA:/pfad`-Bilder einer Antwort im Terminal zeigen.
    *
-   * Geschrieben wird direkt auf stdout, an Inks Rendering vorbei — dasselbe Vorgehen wie
-   * beim Maskottchen, weil Ink den Bildschirm als Zell-Diff aufbaut und Bildzellen nicht
-   * vermessen kann. Anders als das Maskottchen wird DIREKT platziert (kein `U=1`), damit
-   * das Bild im Textfluss steht und mitscrollt (live belegt: spikes/004).
+   * Geschrieben wird über `writeAbove`: Ink schiebt die Bildsequenz in den Scrollback
+   * HOCH, oberhalb seines eigenen Frames, und zeichnet den Frame darunter neu. Der Grund
+   * ist Inks Rendering — es baut den Bildschirm als Zell-Diff auf und holt sich jede Zeile
+   * zurück, die es erreichen kann. Ein Bild in diesem Bereich überlebt den nächsten Turn
+   * nicht; oberhalb davon liegt History, die Ink nie wieder anfasst.
    *
    * Das Encoding macht das Gateway (`image.terminal_sequence`): bei einer entfernten
    * Sitzung liegt die Datei dort und nicht hier.
@@ -474,49 +475,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           { path }
         )
 
-        if (res?.available && res.sequence && res.rows) {
-          /* Zwei Schritte, die zusammengehören:
-           *
-           * 1. `appendMessage` mit `kind: 'image'` lässt Ink `rows` LEERZEILEN rendern.
-           *    Damit gehört der Platz dem Frame — Ink weiß von diesen Zellen und räumt
-           *    sie bei jedem Repaint korrekt ab.
-           * 2. Die Bildsequenz wird in genau diesen reservierten Block geschrieben.
-           *
-           * Ohne Schritt 1 ist jede Ausgabe eine Wette gegen den nächsten Repaint: live
-           * gemessen landete das Bild unter der Eingabezeile, überlappte nach einem
-           * Hochfahren per `\x1b[<n>A` den Banner, verschwand nach `forceRedraw()` ganz
-           * und wurde beim Schreiben vor dem Rendern vom nächsten Frame zerschnitten.
-           *
-           * Der Weg des Maskottchens (kitty `U=1`-Platzhalter) scheidet aus: der
-           * kitty-Handler im Browser-Terminal kennt `U=1` nicht, und ein Overlay würde
-           * nicht mitscrollen.
-           */
-          appendMessage({ imageRows: res.rows, kind: 'image', role: 'assistant', text: path })
-          pendingImageWrites.push({ rows: res.rows, sequence: res.sequence })
+        if (res?.available && res.sequence) {
+          /* Ein einziger Aufruf: Ink erledigt Frame verlassen, Scrollback füllen und
+           * Neuzeichnen. Jede Variante, die das von außen versuchte, ist live gescheitert
+           * — Bild unter der Eingabezeile, vom Banner überlappt, nach `forceRedraw()`
+           * gelöscht oder vom nächsten Frame zerschnitten. */
+          writeAbove(res.sequence, stdout)
         }
       } catch {
         // Gateway zu alt oder Bild nicht lesbar: der Pfad im Text bleibt die Auslieferung.
       }
-    }
-  }
-
-  /* Bildsequenzen, die auf ihren reservierten Block warten. Sie werden geschrieben,
-   * nachdem Ink die Platzhalterzeilen gerendert hat — vorher gibt es den Platz nicht. */
-  const pendingImageWrites: { rows: number; sequence: string }[] = []
-  const flushImageWrites = () => {
-    if (!stdout?.isTTY || !pendingImageWrites.length) {
-      return
-    }
-
-    for (const { rows, sequence } of pendingImageWrites.splice(0)) {
-      /* Der Cursor steht nach dem Render unten am Frame. Der reservierte Block liegt
-       * weiter oben — dorthin per relativer Bewegung, Bild schreiben, zurück. Relativ,
-       * weil Ink selbst ausschließlich relativ rechnet und eine absolute Positionierung
-       * seine Buchführung bräche.
-       *
-       * `\x1b[s`/`\x1b[u` (Cursor sichern/wiederherstellen) klammert das Ganze, damit Ink
-       * den Cursor exakt dort wiederfindet, wo er ihn gelassen hat. */
-      stdout.write(`\x1b[s\x1b[${rows}A\r${sequence}\x1b[u`)
     }
   }
 
@@ -1638,16 +1606,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
 
-          /* Bilder VOR dem Text anmelden: `showTranscriptImages` hängt je Bild eine
-           * Platzhalter-Nachricht an, in die das Terminal danach die Pixel malt. */
-          void showTranscriptImages(msgs.map(m => m.text ?? '').join('\n')).finally(() => {
-            msgs.forEach(appendMessage)
-            /* Erst schreiben, wenn Ink die Platzhalterzeilen gerendert hat. Zwei Frames
-             * Abstand: `appendMessage` plant einen Render, der Render selbst ist noch
-             * einen Tick später. Vorher existiert der reservierte Platz nicht, und die
-             * Sequenz landete wieder irgendwo im Frame. */
-            setTimeout(flushImageWrites, 120)
-          })
+          /* Erst den Text rendern, dann das Bild. `writeAbove` setzt die Sequenz direkt
+           * über Inks Frame — nachdem die Antwort im Frame steht, ist das genau die Zeile
+           * unter ihrem Text. Umgekehrt (Bild zuerst) landet es am Anfang des Verlaufs,
+           * solange die Sitzung noch auf einen Bildschirm passt.
+           *
+           * Das setTimeout ist nicht kosmetisch: `appendMessage` PLANT nur einen Render.
+           * Ohne die Pause liest `writeAbove` eine Framehöhe von vor der Antwort und
+           * schreibt oberhalb davon — das Bild landete im Test am Bildschirmanfang statt
+           * beim Text. */
+          msgs.forEach(appendMessage)
+          setTimeout(() => {
+            void showTranscriptImages(msgs.map(m => m.text ?? '').join('\n'))
+          }, 150)
 
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')

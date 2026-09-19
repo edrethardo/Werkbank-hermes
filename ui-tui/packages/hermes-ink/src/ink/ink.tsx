@@ -92,7 +92,8 @@ import {
   ENABLE_KITTY_KEYBOARD,
   ENABLE_MODIFY_OTHER_KEYS,
   ERASE_SCREEN,
-  ERASE_SCROLLBACK
+  ERASE_SCROLLBACK,
+  eraseToEndOfScreen
 } from './termio/csi.js'
 import {
   DBP,
@@ -1337,6 +1338,69 @@ export default class Ink {
     // Clear displayCursor so the cursor preamble doesn't emit a stale
     // relative move from where we last parked it.
     this.displayCursor = null
+  }
+
+  /**
+   * Commit raw bytes to the terminal's scrollback, above Ink's frame.
+   *
+   * For content Ink cannot model as cells — terminal graphics sequences
+   * (kitty/iTerm2 inline images), anything the emulator owns and the diff
+   * engine cannot reason about. Writing such bytes from outside is otherwise
+   * a bet against the next repaint: Ink parks the cursor at the bottom of its
+   * frame and moves only RELATIVELY from there, so a bare write lands under
+   * the composer, and the next diff overwrites or bisects it.
+   *
+   * The mechanism is scrolling, not positioning. Ink's frame occupies the
+   * bottom of the screen and is redrawn every turn, so any row it can reach
+   * is a row it will eventually reclaim. So: walk to the frame's top row,
+   * erase Ink's rows, and emit the payload there. The payload now sits ABOVE
+   * where the fresh frame will be drawn — `repaint()` + `onRender()` rebuild
+   * the frame from the cursor down, pushing the payload up into the
+   * scrollback as they grow. Content that scrolls out stays intact (measured:
+   * a kitty image scrolled out and back returned identical pixel counts).
+   *
+   * Do NOT pad with a frame's worth of newlines "to make room": that scrolls
+   * the payload clean off the screen before the frame is redrawn, and the
+   * image is gone (measured).
+   *
+   * NOTE on placement: the payload lands directly above the frame's first
+   * row, which is where the transcript ends. While a session still fits on
+   * one screen the frame starts at the banner, so "above the frame" is the
+   * top of the screen — correct by this contract, but visually detached from
+   * the text it belongs to. Callers that want the payload to read as part of
+   * a message should render that message first, so the frame has grown past
+   * it (see createGatewayEventHandler's message.complete).
+   *
+   * Returns false when there is no TTY, when Ink is paused/unmounted, or on
+   * the alt screen — there IS no scrollback there, so the caller must fall
+   * back (e.g. leave a plain path in the text).
+   */
+  writeAbove(payload: string): boolean {
+    if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused || this.altScreenActive) {
+      return false
+    }
+
+    if (!payload) {
+      return false
+    }
+
+    // The cursor sits at the frame's bottom row, so this is how far up its
+    // first row is.
+    const frameRows = Math.max(0, this.frontFrame.screen.height - 1)
+
+    this.options.stdout.write(
+      `\r${frameRows > 0 ? `\x1b[${frameRows}A` : ''}${eraseToEndOfScreen()}${payload}\n`
+    )
+
+    // The frame's rows are blank now and its old screen state is gone from
+    // the terminal, so the diff engine must not reason from it. repaint()
+    // drops those buffers; prevFrameContaminated stops the blit fast path
+    // from copying the stale screen back over the fresh draw.
+    this.repaint()
+    this.prevFrameContaminated = true
+    this.onRender()
+
+    return true
   }
 
   /**
