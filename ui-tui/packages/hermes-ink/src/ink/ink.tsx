@@ -140,6 +140,19 @@ const DEEP_ERASE_THEN_HOME_PATCH = Object.freeze({
   content: ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME
 })
 
+/* A block of frame rows holding terminal-owned pixels (see writeIntoFrame).
+ * `rows` is the reserved height — needed to tell "an overlay covers my lower
+ * rows" from "nothing happened", since only the first row carries the marker. */
+interface FrameBlock {
+  dirty: boolean
+  payload: string
+  rows: number
+}
+
+/* Bounded: each entry keeps a full payload (base64 image data is not small),
+ * and blocks this old are far up the scrollback anyway. */
+const MAX_FRAME_BLOCKS = 16
+
 // Cached per-Ink-instance, invalidated on resize. frame.cursor.y for
 // alt-screen is always terminalRows - 1 (renderer.ts).
 function makeAltScreenParkPatch(terminalRows: number) {
@@ -198,6 +211,10 @@ export default class Ink {
   private currentNode: ReactNode = null
   private frontFrame: Frame
   private backFrame: Frame
+  /* Terminal-owned pixel blocks the frame has reserved rows for. Keyed by
+   * marker, re-painted by syncFrameBlocks whenever a frame could have wiped
+   * them — Ink's diff cannot see those pixels, so it never restores them. */
+  private readonly frameBlocks = new Map<string, FrameBlock>()
   private lastPoolResetTime = performance.now()
   private drainTimer: ReturnType<typeof setTimeout> | null = null
   // Write-drain telemetry: pendingWriteStart is the performance.now() of
@@ -475,6 +492,7 @@ export default class Ink {
     }
 
     // Main screen: start fresh to prevent clobbering terminal content
+    this.markFrameBlocksDirty()
     this.frontFrame = emptyFrame(
       this.frontFrame.viewport.height,
       this.frontFrame.viewport.width,
@@ -518,6 +536,10 @@ export default class Ink {
       this.terminalColumns = cols
       this.terminalRows = rows
       this.altScreenParkPatch = makeAltScreenParkPatch(this.terminalRows)
+      // A resize reflows the emulator's own image layer; measured in xterm.js
+      // a kitty image in a reserved block is simply gone afterwards and never
+      // came back, because the cell diff has nothing to restore.
+      this.markFrameBlocksDirty()
     }
 
     // Pending throttled/drain work captured stale dims — cancel so
@@ -1050,6 +1072,13 @@ export default class Ink {
     const optimizeMs = performance.now() - tOptimize
     const hasDiff = optimized.length > 0
     const needsAltScreenErase = this.altScreenActive && this.needsEraseBeforePaint
+    /* True when this frame erases or clears the physical screen. The terminal
+     * drops the pixels of any reserved block along with everything else, and
+     * Ink's diff cannot restore them (it models cells, not images) — so
+     * syncFrameBlocks has to re-paint them. `flickers` (clearTerminal patches)
+     * is folded in below. */
+    const screenWiped =
+      flickers.length > 0 || needsAltScreenErase || (!this.altScreenActive && this.needsEraseBeforePaint && hasDiff)
 
     if (this.altScreenActive && (hasDiff || needsAltScreenErase)) {
       // Prepend CSI H to anchor the physical cursor to (0,0) so
@@ -1298,6 +1327,12 @@ export default class Ink {
 
     this.isRendering = false
 
+    /* After the frame is on the wire: the terminal-owned pixels of any
+     * reserved block may have been destroyed by it, and no future diff will
+     * bring them back. Painting here (not before the write) means we paint
+     * onto the screen state the user is actually looking at. */
+    this.syncFrameBlocks(screenWiped)
+
     if (this.immediateRerenderRequested) {
       this.immediateRerenderRequested = false
       queueMicrotask(() => this.onRender())
@@ -1320,6 +1355,10 @@ export default class Ink {
    * an external process (e.g. tmux, shell, full-screen TUI).
    */
   repaint(): void {
+    // The terminal's own pixels (reserved blocks) do not survive whatever
+    // forced this repaint; the cell diff cannot restore them, so flag them
+    // for syncFrameBlocks.
+    this.markFrameBlocksDirty()
     this.frontFrame = emptyFrame(
       this.frontFrame.viewport.height,
       this.frontFrame.viewport.width,
@@ -1430,31 +1469,162 @@ export default class Ink {
    * the cursor Ink parked. `\x1b[s`/`\x1b[u` bracket the whole thing, leaving
    * the cursor exactly where Ink believes it is.
    *
+   * One paint is not enough, which is why the block is REGISTERED rather than
+   * merely painted. The payload's pixels belong to the emulator, not to Ink's
+   * cell model, so anything that repaints the physical screen over those rows
+   * destroys them while Ink still believes the (empty) block is up to date and
+   * emits no diff for it. Measured live in an xterm.js pane, all of these wipe
+   * a kitty image and it never returns: a full-screen overlay (`/help`),
+   * ctrl+L, a terminal resize, and — partially — the slash menu covering the
+   * block's lower rows. Registered blocks are re-painted by `syncFrameBlocks`
+   * as soon as their rows are free again, so the image survives them.
+   *
+   * `rows` is the block's height. It is what makes "free again" decidable:
+   * with only the marker row known, an overlay covering the rows BELOW the
+   * marker looks identical to an untouched block, and the repaint never fires.
+   *
    * Returns false when there is no TTY, when Ink is paused/unmounted, or when
    * the marker is not in the current frame (block scrolled out of the
-   * viewport, or not rendered yet — the caller must wait for the render).
+   * viewport, or not rendered yet — the caller must wait for the render). The
+   * block stays registered in that case: it is painted on the render that
+   * brings it back.
    */
-  writeIntoFrame(marker: string, payload: string): boolean {
+  writeIntoFrame(marker: string, payload: string, rows = 1): boolean {
     if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused || !marker || !payload) {
       return false
     }
 
+    // Keep the map bounded: a long session shows many images, and each entry
+    // holds a full payload (a base64-encoded image is not small). The oldest
+    // blocks are also the ones furthest up the scrollback.
+    if (!this.frameBlocks.has(marker) && this.frameBlocks.size >= MAX_FRAME_BLOCKS) {
+      const oldest = this.frameBlocks.keys().next()
+
+      if (!oldest.done) {
+        this.frameBlocks.delete(oldest.value)
+      }
+    }
+
+    this.frameBlocks.set(marker, { dirty: false, payload, rows: Math.max(1, rows) })
+
+    const painted = this.paintFrameBlock(marker, payload)
+
+    if (!painted) {
+      this.frameBlocks.get(marker)!.dirty = true
+    }
+
+    return painted
+  }
+
+  /** Forget a registered block (its message left the transcript for good). */
+  clearFrameBlock(marker?: string): void {
+    if (marker === undefined) {
+      this.frameBlocks.clear()
+
+      return
+    }
+
+    this.frameBlocks.delete(marker)
+  }
+
+  /** Paint one block's payload at its marker row. False when not locatable. */
+  private paintFrameBlock(marker: string, payload: string): boolean {
     const row = this.findMarkerRow(marker)
 
     if (row === null) {
       return false
     }
 
-    // The cursor sits at the frame's bottom row; the block starts at `row`.
-    const up = this.frontFrame.screen.height - 1 - row
+    /* Der Sprung geht vom Cursor, den Ink geparkt hat, zur Markerzeile — beides
+     * in FRAME-Koordinaten, deshalb `cursor.y`, nicht `screen.height`. Der
+     * Frame umfasst das ganze Transcript (gemessen: 222 Zeilen auf einem
+     * 40-Zeilen-Schirm), `screen.height - 1` waere also ein Sprung weit ueber
+     * den oberen Rand hinaus; das Terminal klemmt ihn auf Zeile 0 und das Bild
+     * klebt oben statt bei seinem Text. Solange die Sitzung auf einen Schirm
+     * passt, sind beide Werte gleich — genau deshalb fiel es erst auf, als ein
+     * Overlay ein Nachmalen ausloeste. */
+    const up = this.frontFrame.cursor.y - row
 
-    if (up < 0) {
+    // Oberhalb des Cursors und noch auf dem Schirm: sonst ist die Zeile
+    // hinausgescrollt und ein Sprung dorthin landet irgendwo.
+    if (up < 0 || up >= this.terminalRows) {
       return false
     }
 
     this.options.stdout.write(`\x1b[s${up > 0 ? `\x1b[${up}A` : ''}\r${payload}\x1b[u`)
 
     return true
+  }
+
+  /**
+   * Are the block's rows free — i.e. is the frame showing the reserved block
+   * itself rather than something drawn on top of it?
+   *
+   * Painting over an overlay would be worse than not painting at all, so the
+   * answer must be no while anything occupies those rows. Only the marker row
+   * may carry content (the marker).
+   */
+  private isFrameBlockFree(row: number, rows: number): boolean {
+    const { screen } = this.frontFrame
+
+    for (let y = row + 1; y < row + rows && y < screen.height; y++) {
+      for (let x = 0; x < screen.width; x++) {
+        const char = charInCellAt(screen, x, y)
+
+        if (char !== undefined && char !== ' ' && char !== '') {
+          return false
+        }
+      }
+    }
+
+    return true
+  }
+
+  /**
+   * Re-paint registered blocks whose pixels the terminal has lost.
+   *
+   * Runs at the end of every frame. A block is marked dirty whenever this
+   * frame could have destroyed its pixels — the screen was erased or cleared,
+   * or something is drawn over the block's rows (overlay, menu), or the block
+   * is not in the frame at all (scrolled out, or hidden behind a full-screen
+   * overlay; the two are indistinguishable from here, and re-painting one
+   * image once on the way back is the cheaper mistake).
+   *
+   * Dirty blocks are painted on the first frame where their rows are free
+   * again. A block whose rows merely MOVED is not repainted: the terminal
+   * scrolls its own pixels along with the text (measured — the image's row
+   * band tracks the text across new messages while the pixel count stays
+   * identical), so repainting would only queue a duplicate copy in the
+   * emulator's image store.
+   */
+  private syncFrameBlocks(screenWiped: boolean): void {
+    if (this.frameBlocks.size === 0 || !this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
+      return
+    }
+
+    for (const [marker, block] of this.frameBlocks) {
+      const row = this.findMarkerRow(marker)
+
+      if (row === null || !this.isFrameBlockFree(row, block.rows)) {
+        block.dirty = true
+        continue
+      }
+
+      if (screenWiped) {
+        block.dirty = true
+      }
+
+      if (block.dirty && this.paintFrameBlock(marker, block.payload)) {
+        block.dirty = false
+      }
+    }
+  }
+
+  /** Every registered block's pixels are presumed gone (resize, repaint). */
+  private markFrameBlocksDirty(): void {
+    for (const block of this.frameBlocks.values()) {
+      block.dirty = true
+    }
   }
 
   /** Row of the first cell run matching `marker` in the current frame, or null. */
@@ -1743,6 +1913,8 @@ export default class Ink {
    * matches the physical cursor after ENTER_ALT_SCREEN + CSI H (home).
    */
   private resetFramesForAltScreen(): void {
+    // Same contract as repaint(): terminal-owned pixels are presumed gone.
+    this.markFrameBlocksDirty()
     const rows = this.terminalRows
     const cols = this.terminalColumns
 

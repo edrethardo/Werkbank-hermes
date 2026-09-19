@@ -127,6 +127,11 @@ export const writeAbove = (payload: string, stdout: NodeJS.WriteStream = process
  * `marker`, and Ink locates that row in the frame it just drew and paints
  * there. See `Ink.writeIntoFrame`.
  *
+ * Pass the block's height as `rows`: Ink keeps the block registered and
+ * re-paints it whenever a frame destroyed the terminal-owned pixels (overlay,
+ * ctrl+L, resize), and it can only tell "covered" from "untouched" by looking
+ * at the rows below the marker.
+ *
  * Returns false when no Ink instance drives this stream, or when the marker
  * is not in the current frame (not rendered yet, or scrolled out) — callers
  * must have a fallback for that case.
@@ -134,7 +139,8 @@ export const writeAbove = (payload: string, stdout: NodeJS.WriteStream = process
 export const writeIntoFrame = (
   marker: string,
   payload: string,
-  stdout: NodeJS.WriteStream = process.stdout
+  stdout: NodeJS.WriteStream = process.stdout,
+  rows = 1
 ): boolean => {
   const instance = instances.get(stdout)
 
@@ -142,7 +148,18 @@ export const writeIntoFrame = (
     return false
   }
 
-  return instance.writeIntoFrame(marker, payload)
+  return instance.writeIntoFrame(marker, payload, rows)
+}
+
+/**
+ * Drop a registered frame block — its message is gone from the transcript.
+ *
+ * Without this the payload stays in Ink's map and can be re-painted into
+ * whatever now occupies the marker's row. Omit `marker` to drop all blocks
+ * (the transcript was cleared, e.g. on a new session).
+ */
+export const clearFrameBlock = (marker?: string, stdout: NodeJS.WriteStream = process.stdout): void => {
+  instances.get(stdout)?.clearFrameBlock(marker)
 }
 
 /**

@@ -137,3 +137,117 @@ describe('writeIntoFrame', () => {
     expect(ink.writeIntoFrame(MARKER, PAYLOAD)).toBe(false)
   })
 })
+
+/* Einmal malen reicht nicht. Die Pixel gehoeren dem Terminal, nicht Inks
+ * Zellmodell — was den Schirm ueber diesen Zeilen neu zeichnet (Overlay,
+ * ctrl+L, Resize), loescht sie, waehrend Ink den (leeren) Block fuer aktuell
+ * haelt und keinen Diff dafuer erzeugt. Live gemessen: `/help`, ctrl+L und ein
+ * Resize machten ein kitty-Bild weg, und es kam NIE zurueck. */
+describe('writeIntoFrame: das Bild ueberlebt Repaints', () => {
+  /** Ein Overlay, das die Zeilen unter dem Marker belegt. */
+  const overlay = () =>
+    React.createElement(
+      Box,
+      { flexDirection: 'column' },
+      React.createElement(Text, { key: 'a' }, 'transcript row'),
+      React.createElement(Text, { key: 'o1' }, 'OVERLAY ZEILE 1'),
+      React.createElement(Text, { key: 'o2' }, 'OVERLAY ZEILE 2'),
+      React.createElement(Text, { key: 'd' }, '> composer')
+    )
+
+  /** Block mit mehreren Zeilen: nur die erste traegt den Marker. */
+  const tallTree = (extra: null | string = null) =>
+    React.createElement(
+      Box,
+      { flexDirection: 'column' },
+      React.createElement(Text, { key: 'a' }, 'transcript row'),
+      React.createElement(
+        Box,
+        { flexDirection: 'column', height: 3, key: 'b' },
+        React.createElement(Text, null, MARKER),
+        extra === null ? null : React.createElement(Text, null, extra)
+      ),
+      React.createElement(Text, { key: 'd' }, '> composer')
+    )
+
+  it('repaints after a frame that erased the screen', () => {
+    const { ink, stdout } = makeInk()
+    ink.render(tree())
+    ink.onRender()
+    expect(ink.writeIntoFrame(MARKER, PAYLOAD)).toBe(true)
+
+    // Genau das macht ctrl+L: Schirm loeschen und alles neu zeichnen. Die
+    // Bildbytes sind damit weg — Ink muss sie von sich aus nachmalen.
+    stdout.chunks.length = 0
+    ink.forceRedraw()
+
+    expect(stdout.chunks.join('')).toContain(PAYLOAD)
+  })
+
+  it('repaints once the overlay covering the block is gone', () => {
+    const { ink, stdout } = makeInk()
+    ink.render(tallTree())
+    ink.onRender()
+    expect(ink.writeIntoFrame(MARKER, PAYLOAD, 3)).toBe(true)
+
+    // Waehrend das Overlay steht, darf NICHT gemalt werden — das Bild landete
+    // sonst ueber fremdem Text.
+    stdout.chunks.length = 0
+    ink.render(overlay())
+    ink.onRender()
+    expect(stdout.chunks.join('')).not.toContain(PAYLOAD)
+
+    // Overlay zu: die Zeilen gehoeren wieder dem Block, jetzt muss es kommen.
+    stdout.chunks.length = 0
+    ink.render(tallTree())
+    ink.onRender()
+    expect(stdout.chunks.join('')).toContain(PAYLOAD)
+  })
+
+  it('holds back while foreign content sits in the block rows', () => {
+    /* Der Marker allein genuegt nicht: ein Overlay, das nur die Zeilen UNTER
+     * ihm belegt, sieht sonst aus wie ein unberuehrter Block. Deshalb reist die
+     * Blockhoehe mit. */
+    const { ink, stdout } = makeInk()
+    ink.render(tallTree())
+    ink.onRender()
+    expect(ink.writeIntoFrame(MARKER, PAYLOAD, 3)).toBe(true)
+
+    stdout.chunks.length = 0
+    ink.render(tallTree('FREMDER TEXT'))
+    ink.onRender()
+
+    expect(stdout.chunks.join('')).not.toContain(PAYLOAD)
+  })
+
+  it('forgets a cleared block instead of painting it into later content', () => {
+    const { ink, stdout } = makeInk()
+    ink.render(tree())
+    ink.onRender()
+    ink.writeIntoFrame(MARKER, PAYLOAD)
+
+    ink.clearFrameBlock(MARKER)
+    stdout.chunks.length = 0
+    ink.forceRedraw()
+
+    expect(stdout.chunks.join('')).not.toContain(PAYLOAD)
+  })
+
+  it('declines a block scrolled out of the visible screen', () => {
+    /* Ein Block weit oben im Scrollback ist mit relativen Cursorbewegungen
+     * nicht erreichbar; dort zu malen landet irgendwo auf dem Schirm. Live
+     * gemessen umfasst der Frame das ganze Transcript (222 Zeilen auf einem
+     * 52-Zeilen-Terminal), die Framehoehe taugt also nicht als Grenze. */
+    const { ink, stdout } = makeInk()
+    const kinder = [React.createElement(Box, { height: 1, key: 'b' }, React.createElement(Text, null, MARKER))]
+
+    for (let i = 0; i < stdout.rows * 3; i++) {
+      kinder.push(React.createElement(Text, { key: `f${i}` }, `zeile ${i}`))
+    }
+
+    ink.render(React.createElement(Box, { flexDirection: 'column' }, ...kinder))
+    ink.onRender()
+
+    expect(ink.writeIntoFrame(MARKER, PAYLOAD)).toBe(false)
+  })
+})

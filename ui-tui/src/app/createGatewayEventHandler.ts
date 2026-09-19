@@ -507,7 +507,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           const marker = `\u2800\u2800img${nextImageId++}\u2800`
 
           appendMessage({ imageMarker: marker, imageRows: res.rows, kind: 'image', role: 'assistant', text: path })
-          pendingImageWrites.push({ marker, sequence: res.sequence })
+          pendingImageWrites.push({ marker, rows: res.rows, sequence: res.sequence })
         }
       } catch {
         // Gateway zu alt oder Bild nicht lesbar: der Pfad im Text bleibt die Auslieferung.
@@ -517,8 +517,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
   /* Bildsequenzen, die auf ihren reservierten Block warten. Geschrieben wird erst,
    * nachdem Ink den Block gerendert hat — vorher findet `writeIntoFrame` den Marker
-   * nicht und gibt false zurück. */
-  const pendingImageWrites: { marker: string; sequence: string }[] = []
+   * nicht und gibt false zurück. `rows` reist mit: Ink hält den Block registriert
+   * und malt ihn nach, wenn ein Overlay, ctrl+L oder ein Resize die Pixel des
+   * Terminals zerstört hat, und es erkennt „verdeckt" nur an den Zeilen UNTER dem
+   * Marker. */
+  const pendingImageWrites: { marker: string; rows: number; sequence: string }[] = []
   let nextImageId = 0
 
   /* Schreibversuche über mehrere Frames hinweg, weil `appendMessage` den Render nur
@@ -535,7 +538,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     const stillPending = pendingImageWrites
       .splice(0)
-      .filter(({ marker, sequence }) => !writeIntoFrame(marker, sequence, stdout))
+      .filter(({ marker, rows, sequence }) => !writeIntoFrame(marker, sequence, stdout, rows))
 
     if (!stillPending.length) {
       return

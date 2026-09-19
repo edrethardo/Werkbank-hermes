@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
-import { evictInkCaches } from '@hermes/ink'
+import { clearFrameBlock, evictInkCaches } from '@hermes/ink'
 import type { SessionInflightTurn, SessionResumeResponse, Usage } from '@hermes/shared/gateway-events'
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react'
 
@@ -149,6 +149,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setVoiceProcessing(false)
     patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
     setHistoryItems([])
+    // Die Bildblöcke gehörten den Nachrichten, die es gerade nicht mehr gibt.
+    // Registriert bleiben hieße: Ink malt sie beim nächsten Repaint in Zeilen,
+    // in denen jetzt fremder Text steht.
+    clearFrameBlock()
     setLastUserMsg('')
     setStickyPrompt('')
     composerActions.setComposerTokens([])
