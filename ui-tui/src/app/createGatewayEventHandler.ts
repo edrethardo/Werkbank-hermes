@@ -421,6 +421,18 @@ const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): Sub
   return KNOWN_SUBAGENT_STATUSES.has(normalized) ? normalized : fallback
 }
 
+/* Laufende Nummer für Bild-Marker — MODULWEIT, nicht in der Handler-Closure.
+ *
+ * `createGatewayEventHandler` wird per `useMemo` neu gebaut, sobald eine seiner
+ * Dependencies wechselt (Theme, Session, Voice-Zustand …). Ein Zähler in der Closure
+ * begann dann wieder bei 0, das zweite Bild einer Sitzung trug denselben Marker `img0`
+ * wie das erste — und weil Ink die Blöcke in einer Map auf den Marker hält, überschrieb
+ * es dessen Eintrag. Gemessen (`scripts/e2e/image_second_turn_probe.mjs`, Telefon-Pane):
+ * nach dem zweiten Bild identische Pixelzahl, ein Layer, das Band wandert — ein Bild
+ * statt zweier, und im Block des zweiten stand der Marker als lesbarer Text „img0\".
+ * Ein Prozess, ein Zähler: Marker bleiben über die ganze Sitzung eindeutig. */
+let nextImageId = 0
+
 export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: AnyGatewayEvent) => void {
   syncThemeToTerminalBackground()
 
@@ -522,7 +534,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
    * Terminals zerstört hat, und es erkennt „verdeckt" nur an den Zeilen UNTER dem
    * Marker. */
   const pendingImageWrites: { marker: string; rows: number; sequence: string }[] = []
-  let nextImageId = 0
 
   /* Schreibversuche über mehrere Frames hinweg, weil `appendMessage` den Render nur
    * PLANT. Ein einzelner Timer reichte nicht: ein langsamer Render oder ein Prompt, das

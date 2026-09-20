@@ -143,3 +143,63 @@ selbst mit), was `@xterm/addon-image` nicht implementiert.
 **Messfallstrick:** `painted=0` heißt nicht zwingend „zerstört" — das Bild kann korrekt aus
 dem Schirm gescrollt sein. Erst Hochscrollen unterscheidet das; ohne diesen Schritt hält man
 gesundes Verhalten für einen Fehler.
+
+---
+
+# Nachtrag 2: „nach dem Safari-Reload sind beide weg"
+
+Symptom (19.09.2026, Abend): Bilder standen korrekt, nach einem Reload in Safari am iPhone
+war die Stelle leer — auch bei mehreren Bildern und auch nach Tippen.
+
+## Ursache: ein neuer Client ist für Ink kein Ereignis
+
+Die Bildbytes leben im Node-Prozess (`frameBlocks`, bis zu 16 Blöcke). `syncFrameBlocks` malt
+sie nach — aber **nur schmutzige** Blöcke. Schmutzig wird gesetzt bei Screen-Wipe, `repaint()`,
+SIGCONT und Resize **mit geändertem Maß** (`ink.tsx:542`).
+
+Ein Browser-Reload ist nichts davon. Der Pane-Server spielt beim `attach` nur seinen
+512-KiB-Ring zurück (`panes.py:121`): liegen die kitty-Bytes noch drin, erscheint das Bild —
+sind sie herausgerollt, bleibt es weg, obwohl der Prozess sie noch hält. Tippen hilft nicht,
+weil ein nicht-schmutziger Block nie nachgemalt wird.
+
+## Behebung: `Pane.nudge_repaint()`
+
+Beim `attach` (nicht beim `open` — ein frisches Pane hat nichts nachzumalen) geht ein echter
+Maßwechsel in den PTY: `rows-1`, ein Frame Pause, zurück auf `rows`. Ink markiert alle Blöcke
+schmutzig und malt sie im nächsten Frame neu, unabhängig vom Ring. Ein Resize auf dieselben
+Werte genügt nicht — das verwirft Ink als No-op. Kam inzwischen das `refit` des Clients an,
+gehören ihm die Maße und der zweite Schritt entfällt (sein Resize hat ohnehin schmutzig
+markiert). Eingehängt in beide ws-Handler: `page.py` (Dashboard-Seite) und `server.py`
+(standalone `hermes i3`).
+
+## Live belegt (`image_reload_small_ring.mjs`, WebKit)
+
+```
+ohne Fix:  1_vor_reload 216720 Band 330-689  →  2_nach_reload      0  Band -1--1
+mit  Fix:  1_vor_reload 216720 Band 330-689  →  2_nach_reload 216720  Band 330-689
+```
+
+## Drei Sonden, die NICHTS bewiesen haben — und warum
+
+Der Weg hierhin bestand aus drei unschlüssigen Läufen, die wie Ergebnisse aussahen:
+
+1. **Ring per Tastendruck füllen.** 14 Runden à 220 Zeichen ergaben 98 KB Replay; die
+   Bildbytes lagen noch drin (`a=T,f=100` ×1, direkt am Ring gemessen). Der Lauf war grün,
+   ohne den Fehler je zu erzeugen — und der Lauf OHNE Fix war genauso grün. **Eine Gegenprobe,
+   die ebenfalls grün ist, ist kein Ergebnis, sondern der Beweis, dass die Sonde danebenmisst.**
+2. **Ring per `/help` füllen.** Das füllt ihn, scrollt aber das Bild vom Schirm: `painted=0`
+   schon VOR dem Reload. Rot aus dem falschen Grund.
+3. **Erst danach isoliert:** `_RING_BYTES` server-seitig temporär auf 8 KiB. Der Replay ist
+   garantiert leer, das Bild bleibt, wo es ist — nur eine Variable ändert sich.
+
+Regeln, die daraus folgen und in jede weitere Bildsonde gehören:
+* **Die Vorbedingung messen, nicht annehmen.** „Der Ring ist weitergerollt" ist eine Behauptung,
+  bis der Ring ausgelesen wurde (`ring_check.py`: attach, ersten Byte-Schwung zählen,
+  `a=T,f=100` suchen).
+* **Vor dem Ereignis prüfen, dass das Bild da ist.** Die Sonde bricht ab, wenn
+  `painted <= 0` vor dem Reload — sonst misst man das Wegscrollen statt des Fehlers.
+* **Eine Variable je Lauf.** Statt die Umgebung vollzuschreiben, bis der Effekt eintritt,
+  die eine Größe verstellen, um die es geht.
+* **Safari ist die Engine des Nutzers:** `ENGINE=webkit`. Langsam tippen (`delay: 80`) und den
+  Composer vor Enter prüfen, sonst kommt der Prompt verstümmelt an.
+

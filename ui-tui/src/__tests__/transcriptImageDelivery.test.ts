@@ -146,6 +146,26 @@ describe('transcript image delivery', () => {
     expect(new Set(marker).size).toBe(2)
   })
 
+  it('keeps markers unique across a rebuilt handler', async () => {
+    /* `createGatewayEventHandler` wird per `useMemo` neu gebaut, sobald eine seiner
+     * Dependencies wechselt. Ein Zaehler in der Closure begann dann wieder bei 0 und
+     * das zweite Bild der Sitzung trug den Marker des ersten — Ink haelt die Bloecke
+     * in einer Map auf den Marker, der neue Eintrag ueberschrieb den alten, und der
+     * Nutzer sah statt zweier Bilder eines (live gemessen: identische Pixelzahl, ein
+     * Layer, das Band wandert vom ersten Block zum zweiten). */
+    const ersterLauf = createGatewayEventHandler(buildCtx([], okRpc()))
+
+    await completeWith(ersterLauf, 'MEDIA:/tmp/a.png')
+
+    const zweiterLauf = createGatewayEventHandler(buildCtx([], okRpc()))
+
+    await completeWith(zweiterLauf, 'MEDIA:/tmp/b.png')
+
+    const marker = writeIntoFrameMock.mock.calls.map(c => c[0])
+    expect(marker).toHaveLength(2)
+    expect(new Set(marker).size).toBe(2)
+  })
+
   it('sends the terminal size so a narrow pane is not cropped', async () => {
     /* Das Gateway kann die Masse nicht kennen — bei einer angehaengten Sitzung
      * laeuft es auf einer anderen Maschine und kodierte fest 80 Spalten. */
