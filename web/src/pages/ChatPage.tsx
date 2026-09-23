@@ -97,39 +97,16 @@ import {
   ptyRejectionBanner,
   type PtyBannerAction,
 } from "@/lib/pty-close-copy";
+import { ptyAttachToken } from "@/lib/pty-attach-token";
 import { loseWebglContexts } from "@/lib/xterm-webgl-release";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { errorMessage } from "@/lib/api-error";
 
-// Stable per-browser token identifying THIS chat tab's keep-alive PTY session.
-// Sent as ?attach=; lets a refresh/disconnect reattach to the same live process
-// instead of spawning a fresh one. Per-localStorage, so other devices can't grab it.
-// ``rotate`` mints a new token — used when the user explicitly starts a fresh
-// session so the old keep-alive PTY is NOT reattached (the registry reaps it).
-const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat";
-function ptyAttachToken(rotate = false): string {
-  let t = "";
-  if (!rotate) {
-    try {
-      t = window.localStorage.getItem(PTY_ATTACH_TOKEN_KEY) ?? "";
-    } catch {
-      /* private mode / storage blocked */
-    }
-  }
-  if (!t) {
-    const a = new Uint8Array(16);
-    crypto.getRandomValues(a);
-    t = Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
-    try {
-      window.localStorage.setItem(PTY_ATTACH_TOKEN_KEY, t);
-    } catch {
-      /* ignore */
-    }
-  }
-  return t;
-}
+// Per-tab keep-alive identity (`?attach=`): lives in pty-attach-token.ts so a
+// second tab — including a Chrome "Duplicate tab" — gets its own PTY instead of
+// taking over this one. See #115304.
 
 // Channel id ties this chat tab's PTY child (publisher) to its sidebar
 // (subscriber).  Generated once per mount so a tab refresh starts a fresh
@@ -243,7 +220,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // A breadcrumb from a previous self-reload names its cause; otherwise upstream's
   // token-missing hint (both start the page with an explanatory banner).
   const [banner, setBanner] = useState<string | null>(
-    () => initialChatBanner ?? (tokenMissing ? PTY_TOKEN_MISSING_BANNER.text : null),
+    // `initialChatBanner` ist eine FUNKTION (chat-reload-breadcrumb.ts:117) und
+    // muss aufgerufen werden. Ohne die Klammern liefert der Lazy-Initializer die
+    // Funktion selbst zurück — immer truthy, also hätte der Token-Hinweis nie
+    // erscheinen können und im Banner stünde ein Funktionsobjekt.
+    () => initialChatBanner() ?? (tokenMissing ? PTY_TOKEN_MISSING_BANNER.text : null),
   );
   // Which one-click fix (if any) the banner offers next to its text.
   const [bannerAction, setBannerAction] = useState<PtyBannerAction>(() =>
@@ -1175,7 +1156,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Keep-alive identity: reattach to this tab's living PTY across
       // refresh/transient drops. A forced-fresh start rotates the token so
       // the previous keep-alive PTY is not reattached (registry reaps it).
-      params.attach = ptyAttachToken(forceFresh);
+      params.attach = await ptyAttachToken(forceFresh);
       // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
@@ -1462,6 +1443,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // This transport must not reinterpret text by equality or elapsed time.
         ws.send(data);
       };
+      // **Hier stand ein Merge-Konflikt** (origin/main 3293dd33e3, „drop mobile
+      // IME double-sends"). Upstream filtert Doppelsendungen NACHTRÄGLICH:
+      // gleicher Text innerhalb eines Zeitfensters (`ECHO_WINDOW_MS`,
+      // `Date.now()`, `lastSent.text === data`) gilt als Echo der IME.
+      //
+      // Dieser Zweig löst dasselbe Problem eine Ebene tiefer: `pty-browser-input`
+      // übernimmt native Eingaben schon bei `beforeinput` und lässt xterm gar
+      // nicht erst mitschreiben — es gibt keine zweite Quelle, deren Echo man
+      // erkennen müsste. Deshalb bleibt es bei der schlichten Weiterleitung.
+      //
+      // Beide Wege zusammen wären schädlich: der Zeitfenster-Filter würde einen
+      // Menschen bestrafen, der denselben Text zweimal schnell tippt.
       onDataDisposable = term.onData(forwardPtyData);
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
