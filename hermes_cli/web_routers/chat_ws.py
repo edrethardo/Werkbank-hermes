@@ -563,7 +563,7 @@ async def pty_ws(ws: WebSocket) -> None:
 
     def _spawn():
         if program:
-            from hermes_cli.werkbank_programs import spawn_size
+            from hermes_cli.terminal_programs import spawn_size
             cols, rows = spawn_size(ws.query_params.get("cols"),
                                     ws.query_params.get("rows"))
             return PtyBridge.spawn(argv, cwd=cwd, env=env, cols=cols, rows=rows)

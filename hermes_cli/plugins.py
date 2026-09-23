@@ -827,6 +827,52 @@ class PluginContext:
         return handle
 
     @_serialized_replacement
+    def register_terminal_program(
+        self, name: str, title: str, resolve: Callable,
+    ) -> Optional[PluginRegistration]:
+        """Host a foreign terminal program in the dashboard's chat PTY at ``?program=<name>``.
+
+        ``resolve(argument)`` returns ``(argv, cwd, env)`` like Hermes' own chat resolver;
+        ``argument`` is the opaque ``?project=`` string, already checked for length and control
+        characters but otherwise uninterpreted — the plugin decides what it means and whether it
+        is allowed. Use ``hermes_cli.terminal_programs.scrubbed_child_env()`` to start from an
+        environment with Hermes' provider credentials and ``HERMES_TUI_*`` removed.
+
+        The plugin inherits the dashboard's auth gate, Host/Origin guard, PTY keep-alive and
+        resize handling instead of running a second terminal server — the same argument
+        ``register_dashboard_page`` makes for HTTP (see ``hermes_cli/terminal_programs.py``).
+
+        A malformed name, a name another plugin already serves, or a non-callable resolver warn
+        and are ignored, never raised — a broken program must not abort the plugin's
+        ``register()``.
+        """
+        from hermes_cli.terminal_programs import (
+            ProgramNameError, TerminalProgram, register_program, unregister_program)
+        try:
+            program = TerminalProgram(
+                name=str(name or "").strip(), title=str(title or name), resolve=resolve,
+                plugin=self.manifest.name)
+            register_program(program)
+        except (ProgramNameError, TypeError, ValueError) as e:
+            logger.warning("Plugin '%s' failed to register terminal program %r: %s",
+                           self.manifest.name, name, e)
+            return None
+
+        # Same lifetime question as ``register_dashboard_page`` (#91701): the registry is
+        # process-global and lives as long as the web server, so a ROUTINE per-home teardown
+        # must not blank the program for the whole process. ``persistent=True`` keeps it out of
+        # unload-all's reverse-order teardown; a targeted unload still disposes the handle, and a
+        # forced re-discovery evicts it when the plugin stops supplying the program. The
+        # unregister is identity-conditional, so an older generation cannot evict a newer entry.
+        def _release() -> None:
+            unregister_program(program.name, program)
+
+        handle = self._track("terminal_program", program.name, _release, persistent=True)
+        logger.info("Plugin '%s' registered terminal program: ?program=%s (%s)",
+                    self.manifest.name, program.name, program.title)
+        return handle
+
+    @_serialized_replacement
     def register_platform(
         self, name: str, label: str, adapter_factory: Callable, check_fn: Callable,
         validate_config: Callable | None = None, required_env: list | None = None,

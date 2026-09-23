@@ -335,10 +335,10 @@ def _resolve_chat_argv(
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
     dir, the same propagation ``hermes -p <name>`` performs.
     """
-    # An allowlisted foreign program (Werkbank's Claude Code) hosts in the same
-    # PTY and the same /chat surface, but shares none of Hermes' TUI plumbing —
-    # no profile home, no session DB, no gateway. See werkbank_programs.
-    from hermes_cli.werkbank_programs import is_external, resolve_external_program
+    # A plugin-registered foreign program (see hermes_cli/terminal_programs.py) hosts in the
+    # same PTY and the same /chat surface, but shares none of Hermes' TUI plumbing — no profile
+    # home, no session DB, no gateway.
+    from hermes_cli.terminal_programs import is_external, resolve_external_program
     if is_external(program):
         return resolve_external_program(program, project)
 

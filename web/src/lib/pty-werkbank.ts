@@ -1,7 +1,13 @@
-// Werkbank hosts this /chat surface in a frame and may ask the PTY to run one
-// of a fixed set of foreign programs instead of Hermes' own TUI (see
-// hermes_cli/werkbank_programs.py). The terminal, its input adapter and every
-// improvement made to them are shared; only the child process differs.
+// A plugin may register a foreign terminal program the PTY can run instead of
+// Hermes' own TUI (core surface: hermes_cli/terminal_programs.py; the Werkbank
+// entries come from the werkbank_terminal plugin). The terminal, its input
+// adapter and every improvement made to them are shared; only the child process
+// differs.
+//
+// The names below stay a client-side allowlist on purpose: this only decides
+// which query parameters are FORWARDED. The server resolves `?program=` against
+// its registry and refuses anything unregistered, so a name added here without a
+// plugin to serve it simply fails there.
 //
 // Kept in a file of its own so an upstream rebase of ChatPage never conflicts.
 

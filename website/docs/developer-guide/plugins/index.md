@@ -28,6 +28,7 @@ Hermes has several distinct pluggable interfaces — some use Python `register_*
 | A **secret-manager backend** (vault / password manager / OS keystore) | [Secret Source Plugins](../secret-source-plugin.md) |
 | A **dashboard OIDC/auth provider** | [Web Dashboard — custom providers](../../user-guide/features/web-dashboard.md#custom-providers) — `ctx.register_dashboard_auth_provider()` |
 | A **plugin's own web page** (own HTML/JS/WebSockets, served at `/p/<slug>` on the dashboard's port) | [Web Dashboard — plugin pages](../../user-guide/features/web-dashboard.md#plugin-pages-pslug) — `ctx.register_dashboard_page()` |
+| A **foreign terminal program** in the dashboard's chat PTY (`/chat?program=<name>` — another coding agent, a board's launcher, any TUI) | `ctx.register_terminal_program()` — see `hermes_cli/terminal_programs.py` |
 | A **TTS backend** (any CLI — Piper, VoxCPM, Kokoro, voice cloning, …) | [TTS custom command providers](../../user-guide/features/tts.md#custom-command-providers) — config-driven, no Python needed |
 | An **STT backend** (custom whisper / ASR CLI) | [Voice Message Transcription](../../user-guide/features/tts.md#voice-message-transcription-stt) — set `HERMES_LOCAL_STT_COMMAND` to an argv-tokenized template |
 | **External tools via MCP** (filesystem, GitHub, Linear, any MCP server) | [MCP](../../user-guide/features/mcp.md) — declare `mcp_servers.<name>` in `config.yaml` |
