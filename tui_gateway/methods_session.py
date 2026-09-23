@@ -705,7 +705,10 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
         return refusal
     transport = current_transport() or _stdio_transport
-    with session["history_lock"]:
+    # setdefault wie im Schwesterpfad `_resume_live_unpersisted`: ein deferred/lazy
+    # Record hat noch kein `history_lock`, und ein harter Zugriff sprengt den Resume
+    # mit KeyError statt die Sitzung zu übernehmen.
+    with session.setdefault("history_lock", threading.Lock()):
         refusal, ownership = _attach_browser_resume(ctx.rid, sid, session, ctx.params, transport)
     if refusal is not None:
         return refusal

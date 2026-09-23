@@ -193,6 +193,33 @@ method("image.detach", params=ImageDetachParams, result=ImageDetachResult,
        doc="Drop a queued image before the turn is sent.")
 
 
+class ImageTerminalSequenceParams(Params):
+    """``cols``/``rows`` are the WATCHING terminal's size and must come from the renderer: with an
+    attached session this process runs on another machine, and a gateway-side constant crops a
+    phone pane. ``protocol`` likewise — the client resolves what its terminal can paint."""
+
+    path: str
+    protocol: str | None = None
+    cols: int | None = None
+    rows: int | None = None
+    profile: str | None = None
+
+
+class ImageTerminalSequenceResult(Result):
+    """``available: false`` is the NORMAL answer for a terminal without graphics support, a missing
+    file or a non-image — not an error; the caller then leaves the path as plain text."""
+
+    available: bool
+    protocol: str | None = None
+    sequence: str | None = None
+    cols: int | None = None
+    rows: int | None = None
+
+
+method("image.terminal_sequence", params=ImageTerminalSequenceParams, result=ImageTerminalSequenceResult,
+       doc="Encode an image as a terminal graphics sequence (kitty/iTerm2) for the transcript.")
+
+
 class InputDetectDropParams(SessionParams):
     text: str | None = None
 

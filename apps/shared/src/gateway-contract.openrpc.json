@@ -1231,6 +1231,24 @@
       }
     },
     {
+      "name": "image.terminal_sequence",
+      "summary": "Encode an image as a terminal graphics sequence (kitty/iTerm2) for the transcript.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ImageTerminalSequenceParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ImageTerminalSequenceResult"
+        }
+      }
+    },
+    {
       "name": "input.detect_drop",
       "summary": "Recognise a terminal file drop pasted into the composer and turn it into an attachment.",
       "params": [
@@ -3099,6 +3117,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SessionCorrectionResult"
+        }
+      }
+    },
+    {
+      "name": "session.takeover",
+      "summary": "Atomically transfer a browser-owned session to this client after explicit confirmation.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionTakeoverParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionTakeoverResult"
         }
       }
     },
@@ -12738,6 +12774,132 @@
           "available"
         ],
         "title": "ImageGenerateResult",
+        "type": "object"
+      },
+      "ImageTerminalSequenceParams": {
+        "additionalProperties": false,
+        "description": "``cols``/``rows`` are the WATCHING terminal's size and must come from the renderer: with an\nattached session this process runs on another machine, and a gateway-side constant crops a\nphone pane. ``protocol`` likewise \u2014 the client resolves what its terminal can paint.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Protocol"
+          },
+          "cols": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cols"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rows"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "ImageTerminalSequenceParams",
+        "type": "object"
+      },
+      "ImageTerminalSequenceResult": {
+        "additionalProperties": false,
+        "description": "``available: false`` is the NORMAL answer for a terminal without graphics support, a missing\nfile or a non-image \u2014 not an error; the caller then leaves the path as plain text.",
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Protocol"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
+          "cols": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cols"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rows"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "ImageTerminalSequenceResult",
         "type": "object"
       },
       "InflightTurn": {
@@ -26906,6 +27068,78 @@
           "output"
         ],
         "title": "SessionStatusResult",
+        "type": "object"
+      },
+      "SessionTakeoverParams": {
+        "additionalProperties": false,
+        "description": "Take a browser-owned session away from its current owner.\n\n``confirmed`` must be ``true`` (the user answered the \"another window has this chat\" prompt),\nand ``ownership_epoch`` is the CAS token from the last resume/takeover \u2014 a stale one is\nrefused with ``SESSION_OWNERSHIP_CHANGED`` rather than silently winning the race.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "owner_id": {
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "ownership_epoch": {
+            "title": "Ownership Epoch",
+            "type": "integer"
+          },
+          "confirmed": {
+            "default": false,
+            "title": "Confirmed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id",
+          "owner_id",
+          "ownership_epoch"
+        ],
+        "title": "SessionTakeoverParams",
+        "type": "object"
+      },
+      "SessionTakeoverResult": {
+        "additionalProperties": false,
+        "description": "The caller is the owner now; the previous owner gets a ``session.revoked`` event.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "owner_id": {
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "ownership_epoch": {
+            "title": "Ownership Epoch",
+            "type": "integer"
+          },
+          "read_only": {
+            "title": "Read Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id",
+          "owner_id",
+          "ownership_epoch",
+          "read_only"
+        ],
+        "title": "SessionTakeoverResult",
         "type": "object"
       },
       "SessionTitleParams": {

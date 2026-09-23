@@ -2236,6 +2236,22 @@ export interface ImageDetachResult {
   detached: boolean
   count: number
 }
+/** ``cols``/``rows`` are the WATCHING terminal's size and must come from the renderer: with an attached session this process runs on another machine, and a gateway-side constant crops a phone pane. ``protocol`` likewise — the client resolves what its terminal can paint. */
+export interface ImageTerminalSequenceParams {
+  path: string
+  protocol?: string | null
+  cols?: number | null
+  rows?: number | null
+  profile?: string | null
+}
+/** ``available: false`` is the NORMAL answer for a terminal without graphics support, a missing file or a non-image — not an error; the caller then leaves the path as plain text. */
+export interface ImageTerminalSequenceResult {
+  available: boolean
+  protocol?: string | null
+  sequence?: string | null
+  cols?: number | null
+  rows?: number | null
+}
 export interface InputDetectDropParams {
   session_id: string
   profile?: string | null
@@ -2986,6 +3002,21 @@ export interface LlmOneshotParams {
 }
 export interface LlmOneshotResult {
   text: string
+}
+/** Take a browser-owned session away from its current owner. ``confirmed`` must be ``true`` (the user answered the "another window has this chat" prompt), and ``ownership_epoch`` is the CAS token from the last resume/takeover — a stale one is refused with ``SESSION_OWNERSHIP_CHANGED`` rather than silently winning the race. */
+export interface SessionTakeoverParams {
+  session_id: string
+  profile?: string | null
+  owner_id: string
+  ownership_epoch: number
+  confirmed?: boolean
+}
+/** The caller is the owner now; the previous owner gets a ``session.revoked`` event. */
+export interface SessionTakeoverResult {
+  session_id: string
+  owner_id: string
+  ownership_epoch: number
+  read_only: boolean
 }
 export interface SystemBatteryParams {
   profile?: string | null
@@ -4328,6 +4359,8 @@ export interface RpcMethods {
   'image.detach': { params: ImageDetachParams; result: ImageDetachResult }
   /** Generate an image through the tool's provider dispatcher and hand the renderer a data URL. */
   'image.generate': { params: ImageGenerateParams; result: ImageGenerateResult }
+  /** Encode an image as a terminal graphics sequence (kitty/iTerm2) for the transcript. */
+  'image.terminal_sequence': { params: ImageTerminalSequenceParams; result: ImageTerminalSequenceResult }
   /** Recognise a terminal file drop pasted into the composer and turn it into an attachment. */
   'input.detect_drop': { params: InputDetectDropParams; result: InputDetectDropResult }
   /** Session/message counts over the last ``days`` for the (optionally scoped) profile store. */
@@ -4536,6 +4569,8 @@ export interface RpcMethods {
   'session.status': { params: SessionStatusParams; result: SessionStatusResult }
   /** Inject text into the next tool result without interrupting the turn. */
   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
+  /** Atomically transfer a browser-owned session to this client after explicit confirmation. */
+  'session.takeover': { params: SessionTakeoverParams; result: SessionTakeoverResult }
   /** Read or set a live session's title; a title set before the row exists is queued. */
   'session.title': { params: SessionTitleParams; result: SessionTitleResult }
   /** Drop the last user turn (and everything after it) from an idle session. */
@@ -4699,6 +4734,7 @@ export const RPC_METHODS = [
   'image.attach_bytes',
   'image.detach',
   'image.generate',
+  'image.terminal_sequence',
   'input.detect_drop',
   'insights.get',
   'learning.delete',
@@ -4803,6 +4839,7 @@ export const RPC_METHODS = [
   'session.set_hidden',
   'session.status',
   'session.steer',
+  'session.takeover',
   'session.title',
   'session.undo',
   'session.usage',
