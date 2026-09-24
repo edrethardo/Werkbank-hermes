@@ -484,10 +484,11 @@ def _not_found(session_id: str) -> dict:
 
 
 def _output_tail(session: "ProcessSession", n: int) -> str:
-    """Last *n* chars of the session output with ANSI sequences stripped."""
-    from tools.ansi_strip import strip_ansi
+    """Last *n* chars of the session output with ANSI sequences stripped and ``\\r``
+    progress redraws collapsed to their settled frame (the model reads this)."""
+    from tools.ansi_strip import collapse_carriage_returns, strip_ansi
 
-    return strip_ansi(session.output_buffer[-n:])
+    return collapse_carriage_returns(strip_ansi(session.output_buffer[-n:]))
 
 
 def _completion_output(session: "ProcessSession") -> dict:
@@ -679,6 +680,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             delta = session.total_output_chars - session._heartbeat_total_at_last
             output = session.output_buffer[-delta:] if delta > 0 else ""
             session._heartbeat_total_at_last = session.total_output_chars
+        from tools.ansi_strip import collapse_carriage_returns, strip_ansi
+        output = collapse_carriage_returns(strip_ansi(output))  # model-bound: settled frames only
         if len(output) > HEARTBEAT_OUTPUT_CHARS:
             cut = len(output) - HEARTBEAT_OUTPUT_CHARS
             output = f"...({cut} earlier characters omitted)\n" + output[-HEARTBEAT_OUTPUT_CHARS:]
@@ -1949,13 +1952,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:
         """Read the full output log with optional pagination by lines."""
-        from tools.ansi_strip import strip_ansi
+        from tools.ansi_strip import collapse_carriage_returns, strip_ansi
 
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
         with session._lock:
-            full_output = strip_ansi(session.output_buffer)
+            full_output = collapse_carriage_returns(strip_ansi(session.output_buffer))
         lines = full_output.splitlines()
         total_lines = len(lines)
         # offset=None -> last N lines; an explicit offset=0 means the HEAD (don't

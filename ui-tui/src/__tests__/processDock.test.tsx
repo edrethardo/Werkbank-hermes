@@ -3,9 +3,17 @@ import { PassThrough } from 'node:stream'
 import { renderSync } from '@hermes/ink'
 import React from 'react'
 import stripAnsi from 'strip-ansi'
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 
-import { buildProcessRows, PROCESS_RETAIN_SECONDS, type ProcessEntry } from '../app/processRoster.js'
+import {
+  $processSnapshot,
+  applyProcessOutput,
+  applyProcessSnapshot,
+  buildProcessRows,
+  LIVE_FLUSH_MS,
+  PROCESS_RETAIN_SECONDS,
+  type ProcessEntry
+} from '../app/processRoster.js'
 import { AgentsPanelView, buildProcessBlock, splitDockBudget } from '../components/agentsPanel.js'
 import { buildAgentRows, dockRowLimit } from '../lib/agentRows.js'
 import { DEFAULT_THEME } from '../theme.js'
@@ -110,4 +118,38 @@ it('paints a Processes block under the agents without letting either block hide 
 
   expect(collapsed.trim().split('\n')).toHaveLength(1)
   expect(collapsed).toContain('6 live agents · 1 procs')
+})
+
+it('repaints a running process from the live output stream with its newest \\r progress frame', async () => {
+  vi.useFakeTimers()
+
+  try {
+    applyProcessSnapshot('sid-live', [{ ...running, output_preview: '' }])
+    // An rsync-style redraw split across chunks, with styling: only the newest frame may show.
+    applyProcessOutput('proc_run', '\r\x1b[1m 10%\x1b[0m  1.0GB')
+    applyProcessOutput('proc_run', '\r 42%  4.2GB\r 43%  4.3')
+    applyProcessOutput('proc_other', '\r 99% not ours')
+    await vi.advanceTimersByTimeAsync(LIVE_FLUSH_MS)
+
+    const rows = buildProcessRows($processSnapshot.get().processes, NOW * 1000)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ output: '43% 4.3' })
+
+    const text = paint(
+      <AgentsPanelView
+        cols={40}
+        {...buildAgentRows([], [], NOW * 1000)}
+        processes={buildProcessBlock(rows, 5)}
+        t={DEFAULT_THEME}
+      />
+    )
+
+    // Own line, so a phone-width pane still shows the bar next to a long command.
+    expect(text).toContain('↳ 43% 4.3')
+    expect(text).not.toContain('10%')
+    expect(text).not.toContain('99%')
+  } finally {
+    applyProcessSnapshot(null)
+    vi.useRealTimers()
+  }
 })

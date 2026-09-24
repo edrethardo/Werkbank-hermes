@@ -33,6 +33,7 @@ import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
+import { applyProcessOutput } from './processRoster.js'
 import { forgetServerRequest } from './serverRequestStore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
@@ -1169,6 +1170,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       }
+
+      case 'agent.terminal.output':
+        // A background process's live output: repaint its dock row, never the transcript.
+        applyProcessOutput(String(ev.payload?.process_id ?? ''), String(ev.payload?.chunk ?? ''))
+
+        return
 
       case 'voice.status': {
         // Continuous VAD loop reports its internal state so the status bar

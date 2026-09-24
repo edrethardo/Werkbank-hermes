@@ -81,3 +81,29 @@ def strip_unicode_tags(text: str) -> str:
     if not text or not _HAS_UNICODE_TAG.search(text):
         return text
     return _UNICODE_TAG_SUB_RE.sub(lambda m: m.group(1) or "", text)
+
+
+def collapse_carriage_returns(text: str) -> str:
+    """Resolve bare ``\\r`` redraws to what a terminal shows once the output has settled.
+
+    Progress bars (rsync ``--progress``, curl, dd, tqdm, pip) redraw ONE line with ``\\r``
+    and emit a frame per tick; a 20-minute copy leaves thousands of frames in the captured
+    output. Read verbatim they are the whole tail the model receives and the transcript
+    stores — a scroll of stale percentages instead of the final state. Each ``\\r`` returns
+    to column 0 and the next segment overwrites from there, so ``"50%\\r100%"`` becomes
+    ``"100%"`` and ``"abcdef\\rXY"`` becomes ``"XYcdef"``, exactly as the terminal paints it.
+    ``\\r\\n`` is a line ending, not a redraw. Run AFTER :func:`strip_ansi` (escape bytes
+    would count as columns). Live progress belongs on the UI surface (the TUI process dock
+    reads the newest frame); the model gets the settled line.
+    """
+    if not text or "\r" not in text:
+        return text
+    out = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if "\r" in line:
+            screen = ""
+            for segment in line.split("\r"):
+                screen = segment + screen[len(segment):]
+            line = screen
+        out.append(line)
+    return "\n".join(out)

@@ -57,19 +57,34 @@ export const processSummary = (block: ProcessBlock): string => {
   return [block.running ? `${block.running} running` : '', done ? `${done} done` : ''].filter(Boolean).join(' · ')
 }
 
-/** One `⚙ command · 42s · last: …` line per process; the exit verdict replaces the
- * activity once the process has finished. */
+/** One `⚙ command · 42s` line per process. A running process that has written
+ * output gets a second `↳` line with its newest frame, full width: next to the
+ * command a progress bar was truncated to nothing on a phone-width pane. The exit
+ * verdict replaces both once the process has finished. */
 export function ProcessRowLine({ cols, row, t }: { cols: number; row: ProcessRow; t: Theme }) {
   const glyph = processGlyph(row.status, t)
-  const activity = row.status === 'running' ? `${fmtDuration(row.elapsedSeconds)} · ${row.detail}` : row.detail
+  const live = row.status === 'running' && row.output
+
+  const activity =
+    row.status === 'running'
+      ? live
+        ? fmtDuration(row.elapsedSeconds)
+        : `${fmtDuration(row.elapsedSeconds)} · ${row.detail}`
+      : row.detail
+
   const commandWidth = Math.max(8, cols - stringWidth(activity) - 6)
 
   return (
-    <Text wrap="truncate-end">
-      <Text color={glyph.color}>{glyph.glyph} </Text>
-      <Text color={t.color.text}>{compactPreview(row.command, commandWidth)}</Text>
-      <Text color={t.color.muted}> · {activity}</Text>
-    </Text>
+    <Box flexDirection="column">
+      <Text wrap="truncate-end">
+        <Text color={glyph.color}>{glyph.glyph} </Text>
+        <Text color={t.color.text}>{compactPreview(row.command, commandWidth)}</Text>
+        <Text color={t.color.muted}> · {activity}</Text>
+      </Text>
+      {live ? (
+        <Text color={t.color.muted} wrap="truncate-end">{`  ↳ ${compactPreview(row.output, cols - 4)}`}</Text>
+      ) : null}
+    </Box>
   )
 }
 

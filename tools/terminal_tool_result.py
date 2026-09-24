@@ -232,8 +232,8 @@ def finalize_foreground_result(
     # redact secrets; redact_terminal_output is command-aware (env-dump
     # commands get the KEY=value pass, source/config dumps skip it).
     from agent.redact import redact_terminal_output
-    from tools.ansi_strip import strip_ansi
-    output = strip_ansi(output)
+    from tools.ansi_strip import collapse_carriage_returns, strip_ansi
+    output = collapse_carriage_returns(strip_ansi(output))  # a progress bar's \r frames -> its last one
     # For source/config dumps (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string templates) the
     # ENV/JSON/template passes are skipped to avoid false positives (code_file=True). But for env-dump
     # commands (env/printenv/set/export/declare) the output IS a KEY=value credential dump, so
