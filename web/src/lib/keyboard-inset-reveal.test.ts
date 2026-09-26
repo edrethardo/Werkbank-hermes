@@ -15,7 +15,6 @@ import {
   KEYBOARD_INSET_MIN_PX,
   shouldJumpViewportForKeyboard,
   shouldPinPageScroll,
-  shouldPinScroll,
   shouldScrollChatIntoView,
 } from "./keyboard-inset";
 
@@ -82,13 +81,17 @@ describe("computeKeyboardInset", () => {
   });
 });
 
-describe("shouldPinScroll", () => {
-  it("pins while a keyboard inset is active", () => {
-    expect(shouldPinScroll(320)).toBe(true);
+describe("shouldPinPageScroll", () => {
+  it("pins while a keyboard inset is active and the chat sits at the top", () => {
+    expect(shouldPinPageScroll(320, 0)).toBe(true);
   });
 
   it("does not pin without a keyboard", () => {
-    expect(shouldPinScroll(0)).toBe(false);
+    expect(shouldPinPageScroll(0, 0)).toBe(false);
+  });
+
+  it("does not pin inside an iframe — the board embeds /chat and owns its own scroll", () => {
+    expect(shouldPinPageScroll(320, 0, true)).toBe(false);
   });
 });
 
