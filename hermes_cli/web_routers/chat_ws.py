@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from agent.interrupt_scope import InterruptScope, bind_interrupt_scope
-from hermes_cli.pty_session import RegistryFull
+from hermes_cli.pty_session import PtyIdentity, RegistryFull
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
 from hermes_cli.web_server_chat import (
@@ -547,9 +547,20 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     attach_token = ws.query_params.get("attach") or None
+    tab_token = attach_token or ""
     registry_resume = raw_resume
     if raw_resume and env:
         registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
+    # What a PTY must match to be handed to this tab without its exact key (WB-781): the same
+    # session and the same launch variant. Only explicit resumes qualify — the active-session
+    # fallback is per channel and never names another tab's session.
+    identity = PtyIdentity(
+        tab=tab_token,
+        variant=(profile or "", provider or "", model or "", chatgpt_mode or "", program or "", project or ""),
+        resume_ids=frozenset(sid for sid in (raw_resume, registry_resume) if sid and not program),
+        session_file=active_session_file,
+        spawn_resume=None if program else ((env or {}).get("HERMES_TUI_RESUME") or resume),
+    )
     if attach_token is not None and (registry_resume or profile):
         # Key explicit resumes on their canonical target, never the active-session fallback.
         attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
@@ -584,14 +595,15 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        session, _created = await PTY_REGISTRY.attach_or_spawn(attach_token, spawn=_spawn)
+        session, _created = await PTY_REGISTRY.attach_or_spawn(attach_token, spawn=_spawn, identity=identity)
     except (PtyUnavailableError, FileNotFoundError, OSError, RegistryFull) as exc:
         await _pty_fail(ws, exc)
         return
 
     # A fresh xterm can't rebuild the TUI from an arbitrary tail of alternate-
     # screen differential output; reused PTYs emit a full frame after replay.
-    if not await session.attach(ws, force_redraw=not _created):
+    if not await session.attach(ws, force_redraw=not _created,
+                                session_frames=ws.query_params.get("session_frames") == "1"):
         # attach() detaches itself when the client dropped mid-replay, and a socket
         # superseded during replay is already closed by its replacement; only a
         # stalled redraw write leaves THIS socket attached and worth closing.
@@ -612,6 +624,8 @@ async def pty_ws(ws: WebSocket) -> None:
                 break
             if msg.get("type") == "websocket.disconnect":
                 break
+            # Any frame — input or the client's 20 s resize keepalive — proves the tab is alive.
+            session.touch()
             raw = msg.get("bytes")
             if raw is None:
                 text = msg.get("text")

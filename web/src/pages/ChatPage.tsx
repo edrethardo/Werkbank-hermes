@@ -98,6 +98,12 @@ import {
   type PtyBannerAction,
 } from "@/lib/pty-close-copy";
 import { ptyAttachToken } from "@/lib/pty-attach-token";
+import {
+  parseSessionControlMessage,
+  TAB_SESSION_PARAM,
+  tabResumeTarget,
+  withTabSession,
+} from "@/lib/pty-tab-session";
 import { loseWebglContexts } from "@/lib/xterm-webgl-release";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
@@ -208,6 +214,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setHasActivated((prev) => latchChatActivation(prev, isActive));
   }, [isActive]);
   const [searchParams, setSearchParams] = useSearchParams();
+  // Read inside the PTY effect without making every URL change (e.g. the
+  // `?tab_session=` bookkeeping below) rebuild the terminal.
+  const searchParamsRef = useRef(searchParams);
+  useEffect(() => {
+    searchParamsRef.current = searchParams;
+  }, [searchParams]);
   // Lazy-init: the missing-token check happens at construction so the effect
   // body doesn't have to setState (React 19's set-state-in-effect rule).
   // In gated (OAuth) mode the server intentionally omits the session token —
@@ -303,6 +315,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const next = new URLSearchParams(searchParams);
 
     next.delete("resume");
+    next.delete(TAB_SESSION_PARAM);
     forceFreshPtyRef.current = true;
     reconnectAttemptRef.current = 0;
     clearReconnectTimer();
@@ -1026,7 +1039,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // becomes known once the server's control frame arrives (see
     // `ws.onmessage` below) — everything gated on "is this a resume replay"
     // reads this instead of `resumeParam` directly (#93518).
-    let effectiveResume = resumeParam;
+    // WB-781: the session this tab showed last (`?tab_session=`, kept current
+    // from the PTY's session frames) wins over the `?resume=` it was opened
+    // with, so a tab restored after a browser restart asks for exactly it.
+    const resumeTarget = tabResumeTarget(
+      searchParamsRef.current,
+      forceFreshPtyRef.current,
+    );
+    let effectiveResume = resumeTarget;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
     let onScrollDisposable: { dispose(): void } | null = null;
@@ -1058,7 +1078,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         finishResumeHydration();
       }
     };
-    if (resumeParam) {
+    if (resumeTarget) {
       setResumeHydrating(true);
       resumeMaxTimer = setTimeout(
         finishResumeHydration,
@@ -1151,8 +1171,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     void (async () => {
       if (unmounting) return;
       const params: Record<string, string> = { channel };
-      if (resumeParam) params.resume = resumeParam;
+      if (resumeTarget) params.resume = resumeTarget;
       if (forceFresh) params.fresh = "1";
+      // Ask the PTY to name the session it hosts (text frame), see pty-tab-session.ts.
+      params.session_frames = "1";
       // Keep-alive identity: reattach to this tab's living PTY across
       // refresh/transient drops. A forced-fresh start rotates the token so
       // the previous keep-alive PTY is not reattached (registry reaps it).
@@ -1236,7 +1258,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Resumed sessions replay scrollback over the socket. Start pinned to
       // the bottom so the latest output is in view; released once the user
       // scrolls up (#59591).
-      if (resumeParam) stickToBottomRef.current = true;
+      if (resumeTarget) stickToBottomRef.current = true;
       // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
       // skill" panel) is typed into the composer as a /learn command once the
       // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
@@ -1280,12 +1302,20 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         );
       }
     };
-    if (resumeParam) {
+    if (resumeTarget) {
       beginResumeReplay();
     }
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
+        // WB-781: the PTY names the session it hosts; keep it in this tab's
+        // URL so "restore tabs" after a browser restart brings it back.
+        const hostedId = parseSessionControlMessage(ev.data);
+        if (hostedId) {
+          const next = withTabSession(searchParamsRef.current, hostedId);
+          if (next) setSearchParams(next, { replace: true });
+          return;
+        }
         // The active-session fallback (no `?resume=` on the URL) tells us
         // via a one-off JSON control frame that a replay is starting (#93518,
         // see `pty_ws` in web_server.py). Real PTY output always arrives as

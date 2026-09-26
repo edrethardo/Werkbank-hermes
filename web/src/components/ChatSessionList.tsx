@@ -27,6 +27,7 @@ import { useSearchParams } from "react-router";
 
 import { useI18n } from "@/i18n";
 import { api, type SessionInfo } from "@/lib/api";
+import { TAB_SESSION_PARAM } from "@/lib/pty-tab-session";
 import { cn, timeAgo } from "@/lib/utils";
 
 const SESSION_LIMIT = 30;
@@ -120,6 +121,8 @@ export function ChatSessionList({
         (prev) => {
           const next = new URLSearchParams(prev);
           next.set("resume", id);
+          // The tab's last-shown session (WB-781) must not outrank an explicit pick.
+          next.delete(TAB_SESSION_PARAM);
           return next;
         },
         { replace: false },
@@ -143,6 +146,7 @@ export function ChatSessionList({
       (prev) => {
         const next = new URLSearchParams(prev);
         next.delete("resume");
+        next.delete(TAB_SESSION_PARAM);
         return next;
       },
       { replace: false },

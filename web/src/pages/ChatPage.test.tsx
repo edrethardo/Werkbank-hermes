@@ -395,6 +395,52 @@ describe("ChatPage", () => {
     expect(ws.sent.join("")).toBe("hello hello" + "\x7f".repeat(11) + "Hello hello!");
   });
 
+  it("keeps the hosted session in the tab URL and asks for it after a browser restart (WB-781)", async () => {
+    const { useLocation } = await import("react-router");
+    const seen: string[] = [];
+    function LocationProbe() {
+      seen.push(useLocation().search);
+      return null;
+    }
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const firstParams = (apiMocks.buildWsUrl.mock.calls[0] as unknown as [string, Record<string, string>])[1];
+    expect(firstParams.session_frames).toBe("1");
+    expect(firstParams.resume).toBeUndefined();
+
+    const socket = FakeWebSocket.instances[0];
+    const written: string[] = [];
+    (FakeTerminal.instances[0] as unknown as { write: (data: unknown) => void }).write = (data) => {
+      written.push(String(data));
+    };
+    await act(async () => socket.onopen?.());
+    await act(async () => socket.onmessage?.({ data: '{"type":"session","id":"S-42"}' }));
+    // Recorded in the URL (what "restore tabs" brings back), no terminal rebuild.
+    expect(seen.at(-1)).toBe("?tab_session=S-42");
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(written.join("")).not.toContain('"type":"session"');
+
+    // Browser restart: the restored tab has only its URL.
+    await act(async () => root.unmount());
+    container.remove();
+    sessionStorage.clear();
+    apiMocks.buildWsUrl.mockClear();
+    await render(
+      <MemoryRouter initialEntries={["/chat?tab_session=S-42"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(apiMocks.buildWsUrl).toHaveBeenCalled());
+    const restored = (apiMocks.buildWsUrl.mock.calls[0] as unknown as [string, Record<string, string>])[1];
+    expect(restored.resume).toBe("S-42");
+  });
+
   it("sends a PTY keepalive frame every 20 seconds while the socket is open", async () => {
     vi.useFakeTimers();
     try {
