@@ -581,7 +581,24 @@ def check_command_security(command: str) -> dict:
     if action == "warn" and findings and all(_is_emoji_variation_selector_finding(f) for f in findings) \
             and _has_only_emoji_presentation_selectors(command):
         return _verdict("allow")
+    # A runtime package threat-intel lookup (OSV / ecosyste.ms) that ran out of its deadline is,
+    # in Tirith's own words, "incomplete verification, not evidence that the package is malicious".
+    # A warn made ONLY of such findings blocked every `pip install numpy` of unattended workers
+    # whenever the lookup was slow (WB-804). Every other finding keeps the verdict.
+    if action == "warn" and findings and all(_is_lookup_timeout_finding(f) for f in findings):
+        return _verdict("allow")
     return _verdict(action, summary, findings)
+
+
+def _is_lookup_timeout_finding(finding: dict) -> bool:
+    """True only for an ``analysis_incomplete`` finding whose evidence is ALL threat-intel
+    lookup timeouts (``threat_type: lookup_incomplete``). Unresolvable nested bodies, upload
+    analysis gaps, or any extra evidence keep their warn."""
+    if not isinstance(finding, dict) or finding.get("rule_id") != "analysis_incomplete":
+        return False
+    evidence = finding.get("evidence")
+    return bool(evidence) and isinstance(evidence, list) and all(
+        isinstance(e, dict) and e.get("threat_type") == "lookup_incomplete" for e in evidence)
 
 
 def _is_app_tld_finding(finding: dict) -> bool:
