@@ -382,8 +382,8 @@ class GatewayTurnMixin:
 
     async def _hmwa_resolve_session(self, event, source):
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
-        topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
-        the event."""
+        topic-binding heal, operator-pinned DM topics). Returns ``(source, session_entry, session_key)``,
+        ``None`` to drop the event, or a reply string to send instead of running a turn."""
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
@@ -431,7 +431,20 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        # Operator-pinned DM topic (config dm_topics[].session_id): the config, not the lane's own
+        # session, decides which conversation this thread is. Applied before the /topic-lane heal,
+        # which then finds its binding already pointing at the pinned session.
+        session_entry, pin_refusal, operator_pinned = await self._hmwa_apply_operator_topic_pin(
+            source, session_entry, session_key,
+        )
+        if pin_refusal is not None:
+            return pin_refusal
+        if operator_pinned:
+            # The pinned session is an existing conversation: a topic's bound skill must not be
+            # injected into it just because the route was (re)pointed this turn.
+            with suppress(Exception):
+                event.auto_skill = None
+        elif await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
@@ -2140,6 +2153,8 @@ class GatewayTurnMixin:
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
+        if isinstance(resolved, str):
+            return resolved
         source, session_entry, session_key = resolved
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,

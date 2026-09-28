@@ -783,6 +783,7 @@ platforms:
 | `icon_color` | No | Telegram icon color code (integer) |
 | `icon_custom_emoji_id` | No | Custom emoji ID for the topic icon |
 | `skill` | No | Skill to auto-load on new sessions in this topic |
+| `session_id` | No | Pin the topic to an existing session (see [Operator topics bound to an existing session](#operator-topics-bound-to-an-existing-session)) |
 | `thread_id` | No | Auto-populated after topic creation — don't set manually |
 
 ### How it works
@@ -823,6 +824,34 @@ For example, a topic with `skill: arxiv` will have the arxiv skill pre-loaded wh
 :::tip
 Topics created outside of the config (e.g., by manually calling the Telegram API) are discovered automatically when a `forum_topic_created` service message arrives. You can also add topics to the config while the gateway is running — they'll be picked up on the next cache miss.
 :::
+
+### Operator topics bound to an existing session
+
+A config-declared topic can be pinned to an **existing** Hermes session with `session_id`. The topic then *is* that session: same transcript, same memory. It is not a fork or a copy. Use this to chat from your phone with a session that also runs in the TUI or the dashboard, for example a project's admin chat.
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      dm_topics:
+      - chat_id: 123456789
+        topics:
+        - name: Werkbank
+          session_id: 20260928_101500_a1b2c3   # existing session in THIS profile
+        - name: pokeEd
+          session_id: 20260927_184233_d4e5f6
+```
+
+How it behaves:
+
+- **No `/topic` needed.** The pin applies to every message in that topic, whether or not multi-session mode is on. Hermes also mirrors it into `telegram_dm_topic_bindings` (`managed_mode = operator`).
+- **The config is the authority.** Only `config.yaml` can bind a topic to a session that Telegram did not create. Chat input cannot: `/topic <session-id>` still accepts only this user's own Telegram sessions.
+- **The binding is fixed.** Inside a pinned topic, `/new`, `/reset`, `/resume` and `/topic <session-id>` are refused with a note that the topic is pinned. The session is not ended. For a separate conversation, use another topic.
+- **Compression is followed.** When the session is compressed, it continues under a new id. The topic follows it to the newest id, so `session_id` can keep naming the original id.
+- **Unknown session → no new session.** If `session_id` does not exist in the bot's profile, the topic still gets created. Each message in it gets the reply "Session X does not exist in this profile", and Hermes does not start a fresh session. Every profile has its own `state.db`, and one bot serves one profile, so pin only sessions from the profile the gateway runs under.
+- **Parallel use is safe.** If the board chat and Telegram send at the same moment, the session turn lease runs one turn after the other. The second turn waits and reloads the transcript, including the first turn's answer, before it starts. No message is lost, and neither side gets a duplicate reply.
+- **No topic skill injection.** A `skill` on a pinned topic is ignored. The session is an existing conversation, not a fresh one.
+- **Routing metadata.** As with `/handoff`, the session row takes the Telegram routing peer (`source`, `chat_id`, `thread_id`) so that replies, approvals and background notices can reach the topic. The TUI then treats the session as gateway-owned and does not end it when a TUI window closes.
 
 ## Multi-session DM mode (`/topic`)
 

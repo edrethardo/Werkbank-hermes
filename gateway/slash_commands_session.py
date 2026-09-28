@@ -155,6 +155,11 @@ class GatewaySessionCommandsMixin:
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
+        # Operator-pinned topic: a reset would be undone by the pin on the next message, after the
+        # old session had already been ended — refuse with a clear reply instead.
+        pinned = await asyncio.to_thread(self._operator_pinned_topic_session_id, source)
+        if pinned:
+            return self._operator_topic_pinned_reply(pinned, "/new")
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
@@ -658,6 +663,9 @@ class GatewaySessionCommandsMixin:
         if args:
             if not source.thread_id:
                 return t("gateway.topic.restore_needs_topic")
+            pinned = await asyncio.to_thread(self._operator_pinned_topic_session_id, source)
+            if pinned:
+                return self._operator_topic_pinned_reply(pinned, "/topic <session-id>")
             return await self._restore_telegram_topic_session(event, args)
 
         capabilities = await self._get_telegram_topic_capabilities(source)
@@ -863,6 +871,9 @@ class GatewaySessionCommandsMixin:
         if not self._session_db:
             return self._session_db_unavailable_reply()
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        pinned = await asyncio.to_thread(self._operator_pinned_topic_session_id, source)
+        if pinned:
+            return self._operator_topic_pinned_reply(pinned, "/resume")
         session_key = self._session_key_for_source(source)
         try:
             parts = shlex.split(event.get_command_args().strip())

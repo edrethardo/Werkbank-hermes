@@ -227,6 +227,128 @@ class GatewayTopicThreadsMixin:
                 return recovered if recovered and recovered != inbound else None
         return None
 
+    # ── Operator-pinned DM topics (extra.dm_topics[].topics[].session_id) ───────────────────
+    #
+    # An operator can bind a config-declared DM topic to an EXISTING Hermes session (e.g. a
+    # project's admin chat that also runs in the TUI/dashboard). The authority is config.yaml,
+    # never chat input: the /topic <id> IDOR guard (Telegram-owned, same user) stays unchanged
+    # for chat-supplied ids. Works without /topic mode — the pin is applied on every inbound
+    # message of that thread, follows the compression tip, and /new, /resume and /topic <id>
+    # are refused inside a pinned topic instead of silently being undone on the next message.
+
+    def _operator_pinned_topic_session_id(self, source: SessionSource) -> Optional[str]:
+        """The config ``session_id`` of the operator DM topic *source* arrived in, else None.
+        Sync (the adapter may re-read config.yaml on a cache miss) — call off-loop."""
+        if not self._is_telegram_dm(source) or not source.chat_id or not source.thread_id:
+            return None
+        if str(source.thread_id) in self._TELEGRAM_GENERAL_TOPIC_IDS:
+            return None
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None:
+            return None
+        # Cheap gate: only chats that have dm_topics configured at all. Instance attribute, so a
+        # MagicMock adapter would auto-create it — accept only a real set.
+        configured_chats = getattr(adapter, "_dm_topic_chat_ids", None)
+        if isinstance(configured_chats, (set, frozenset)) and str(source.chat_id) not in configured_chats:
+            return None
+        # Class lookup, not instance: getattr() on a MagicMock would fabricate the method.
+        get_info = getattr(type(adapter), "_get_dm_topic_info", None)
+        if not callable(get_info):
+            return None
+        try:
+            info = get_info(adapter, str(source.chat_id), str(source.thread_id))
+        except Exception:
+            logger.debug("operator topic pin: dm topic lookup failed", exc_info=True)
+            return None
+        if not isinstance(info, dict):
+            return None
+        pinned = str(info.get("session_id") or "").strip()
+        return pinned or None
+
+    @staticmethod
+    def _operator_topic_pinned_reply(pinned_session_id: str, command: str) -> str:
+        return (
+            f"This topic is pinned to session `{pinned_session_id}` by the operator "
+            "(config.yaml: platforms.telegram.extra.dm_topics). "
+            f"{command} is disabled here so the binding cannot be lost. "
+            "Use another topic for a separate conversation."
+        )
+
+    def _operator_topic_missing_session_reply(self, source: SessionSource, pinned_session_id: str) -> str:
+        return (
+            f"Session `{pinned_session_id}` does not exist in this profile "
+            f"({self._telegram_topic_profile_name(source)}). This topic is pinned to it in config.yaml "
+            "(platforms.telegram.extra.dm_topics), so no new session was started. "
+            "Fix the session_id there, or run the bot under the profile that owns the session."
+        )
+
+    def _pin_operator_topic_binding(self, source: SessionSource, session_id: str) -> None:
+        """Mirror the operator pin into ``telegram_dm_topic_bindings`` (off-loop, best-effort) so
+        /topic mode, topic recovery and diagnostics see the same session the config names."""
+        session_db = self._sync_session_db()
+        if session_db is None:
+            return
+        profile_name = self._telegram_topic_profile_name(source)
+        try:
+            binding = session_db.get_telegram_topic_binding(
+                chat_id=str(source.chat_id), thread_id=str(source.thread_id), profile_name=profile_name,
+            )
+            if binding and str(binding.get("session_id") or "") == session_id:
+                return
+            session_db.bind_telegram_topic(
+                chat_id=str(source.chat_id), thread_id=str(source.thread_id), user_id=str(source.user_id or ""),
+                session_key=self._session_key_for_source(source), session_id=session_id,
+                managed_mode="operator", profile_name=profile_name,
+            )
+        except ValueError:
+            # Session already bound to a different topic (two config entries naming one session):
+            # routing still follows the config; only the mirror row is skipped.
+            logger.warning(
+                "operator topic pin: session %s is already bound to another Telegram topic; "
+                "binding row for chat=%s thread=%s not written", session_id, source.chat_id, source.thread_id,
+            )
+        except Exception:
+            logger.debug("operator topic pin: binding write failed", exc_info=True)
+
+    async def _hmwa_apply_operator_topic_pin(self, source: SessionSource, session_entry, session_key: str):
+        """Route an operator-pinned topic to its configured session (walked to the compression tip).
+        Returns ``(session_entry, refusal, pinned_id)``: ``pinned_id`` is None and the entry unchanged
+        when the topic is not pinned; ``refusal`` is a reply when the configured session does not
+        exist in this profile (the turn must not run — never silently start a new session)."""
+        pinned = await asyncio.to_thread(self._operator_pinned_topic_session_id, source)
+        if not pinned:
+            return session_entry, None, None
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            from hermes_state import format_session_db_unavailable
+            return None, format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix")), pinned
+        try:
+            resolved = await db.resolve_session_id(pinned)
+        except Exception:
+            logger.warning("operator topic pin: lookup of session %s failed", pinned, exc_info=True)
+            resolved = None
+        if not resolved:
+            return None, self._operator_topic_missing_session_reply(source, pinned), pinned
+        target = resolved
+        try:
+            # A compressed admin session continues under a new id; the config may name any
+            # ancestor of the chain.
+            target = await db.get_compression_tip(resolved) or resolved
+        except Exception:
+            logger.debug("operator topic pin: compression-tip lookup failed for %s", resolved, exc_info=True)
+        if target != session_entry.session_id:
+            switched = await self.async_session_store.switch_session(session_key, target)
+            if switched is None:
+                # No route to repoint (store lost the key) — never run the turn on the wrong session.
+                return None, self._operator_topic_missing_session_reply(source, pinned), pinned
+            logger.info(
+                "operator topic pin: chat=%s thread=%s -> session %s (configured %s)",
+                source.chat_id, source.thread_id, target, pinned,
+            )
+            session_entry = switched
+        await asyncio.to_thread(self._pin_operator_topic_binding, source, session_entry.session_id)
+        return session_entry, None, pinned
+
     # ── Telegram topic mode: /topic activation helpers ──────────────────────────────────────
 
     async def _get_telegram_topic_capabilities(self, source: SessionSource) -> dict:
