@@ -63,7 +63,7 @@ _CONTAINER_KEYS = (
     ("container_cpu", 1), ("container_memory", 5120), ("container_disk", 51200),
     ("container_persistent", True), ("modal_mode", "auto"), ("vercel_runtime", ""), ("vercel_image", ""),
     ("docker_volumes", []), ("docker_mount_cwd_to_workspace", False), ("docker_forward_env", []),
-    ("docker_env", {}), ("docker_run_as_host_user", False), ("docker_extra_args", []),
+    ("docker_env", {}), ("docker_run_as_host_user", False), ("docker_extra_args", []), ("docker_strict", False),
     ("docker_shm_size", "1g"), ("docker_network", True), ("docker_persist_across_processes", True),
     ("docker_shared_container_key", ""), ("docker_orphan_reaper", True), ("docker_snap_compat", False),
     ("docker_image_pinned", False),
@@ -75,6 +75,7 @@ _DOCKER_KWARGS = (
     ("extra_args", "docker_extra_args", []), ("persist_across_processes", "docker_persist_across_processes", True),
     ("shared_container_key", "docker_shared_container_key", ""), ("shm_size", "docker_shm_size", "1g"),
     ("snap_compat", "docker_snap_compat", False), ("image_pinned", "docker_image_pinned", False),
+    ("strict", "docker_strict", False),
 )
 
 
@@ -136,7 +137,8 @@ def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
                                      _maybe_reap_docker_orphans)
     # One-shot reaper for labeled containers orphaned by prior Hermes processes that died before
     # atexit (SIGKILL / OOM / closed terminal); ``terminal.docker_orphan_reaper: false`` disables it.
-    _maybe_reap_docker_orphans(cc)
+    if not cc.get("docker_strict", False):
+        _maybe_reap_docker_orphans(cc)
     # A session-keyed container must not outlive its session, so cross-process reuse/persist is
     # disabled for it (cleanup_vm()/idle reaper stop+rm it). The shared "default" container and
     # RL/benchmark override sandboxes keep their existing lifecycle.
@@ -243,6 +245,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     for local/ssh/vercel; ``container_config`` carries the container_*/docker_* resource keys; ``host_cwd`` is
     the host dir bound into Docker when cwd mounting is enabled. ``probe_only`` asks ssh for a throwaway
     connection with no remote setup/sync (the prompt-time probe). Unknown types fall through to plugin backends."""
+    if (container_config or {}).get("docker_strict") and env_type != "docker":
+        raise ValueError("docker_strict forbids non-Docker backend creation")
     builder = _ENV_BUILDERS.get(env_type)
     kwargs = dict(image=image, cwd=cwd, timeout=timeout, cc=container_config or {}, task_id=task_id,
                   ssh_config=ssh_config, host_cwd=host_cwd, probe_only=probe_only)

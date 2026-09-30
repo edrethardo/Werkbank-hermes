@@ -220,6 +220,12 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    from tools.docker_strict import strict_enabled, tool_denial
+    if strict_enabled():
+        # No host-only requirement probes or deferred catalog under strict policy.
+        selected = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True)
+        return ([{"type": "function", "function": registry.get_schema("terminal")}]
+                if "terminal" in selected and not tool_denial("terminal") and registry.get_schema("terminal") else [])
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                          skip_tool_search_assembly=skip_tool_search_assembly)
@@ -885,6 +891,10 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from tools.docker_strict import tool_denial
+    denial = tool_denial(function_name, function_args if isinstance(function_args, dict) else {})
+    if denial:
+        return tool_error(denial)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

@@ -8,6 +8,10 @@ description: "Security model, dangerous command approval, user authorization, co
 
 Hermes Agent is designed with a defense-in-depth security model. This page covers every security boundary — from command approval to container isolation to user authorization on messaging platforms.
 
+For opt-in terminal-only, fail-closed Docker execution, see
+[Strict Docker tool execution](./docker-strict.md), including its controller and
+network trust boundaries. The default Docker backend does not enable this policy.
+
 ## Overview
 
 The security model has eight layers:

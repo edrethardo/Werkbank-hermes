@@ -718,7 +718,10 @@ def _get_env_config() -> Dict[str, Any]:
     from hermes_cli.config_defaults import DEFAULT_SANDBOX_IMAGE as default_image
     _ensure_terminal_env_bridged()
     env_type = _tenv("TERMINAL_ENV", "local")
-    mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+    docker_strict = _tenv_bool("TERMINAL_DOCKER_STRICT", "false")
+    if docker_strict and env_type != "docker":
+        raise ValueError("docker_strict requires the Docker backend")
+    mount_docker_cwd = not docker_strict and _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
 
     # Container/docker-only payloads are parsed only when such a backend is
     # selected: a stale or invalid Docker value bridged from config.yaml must
@@ -740,6 +743,8 @@ def _get_env_config() -> Dict[str, Any]:
         docker_forward_env, docker_volumes, docker_env, docker_extra_args, docker_shm_size = [], [], {}, [], "1g"
 
     cwd, host_cwd = _resolve_config_cwd(env_type, mount_docker_cwd)
+    if docker_strict and cwd in {"~", "/root"}:
+        cwd = "/tmp"
 
     return {
         "env_type": env_type,
@@ -776,6 +781,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false"),
+        "docker_strict": docker_strict,
         "docker_snap_compat": _tenv_bool("TERMINAL_DOCKER_SNAP_COMPAT", "false"),
         "docker_network": _tenv_bool("TERMINAL_DOCKER_NETWORK", "true"),
         "docker_extra_args": docker_extra_args,
@@ -1406,10 +1412,20 @@ def terminal_tool(
     from hermes_cli.observability.shared_metrics_loop import record_terminal_backend as _metered
     plan = None
     try:
+        from tools.docker_strict import strict_enabled, tool_denial
+        denial = tool_denial("terminal", {"background": background, "pty": pty, "_host_local": _host_local})
+        if denial:
+            return _error_json(denial, status="blocked")
+        strict = strict_enabled()
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
+        if strict and (plan.env_type != "docker" or plan.promoted_from_foreground_timeout is not None):
+            return _error_json("docker_strict requires foreground Docker execution", status="blocked")
         env = _acquire_env(plan, task_id)
+        from tools.environments.docker import DockerEnvironment
+        if strict and not (isinstance(env, DockerEnvironment) and getattr(env, "_strict", False)):
+            return _error_json("docker_strict refuses a cached non-strict environment; start a new session", status="blocked")
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker

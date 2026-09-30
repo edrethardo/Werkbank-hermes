@@ -2559,6 +2559,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     )
     if not isinstance(function_args, dict):
         function_args = {}
+    from tools.docker_strict import tool_denial
+    denial = tool_denial(function_name, function_args)
+    if denial:
+        return json.dumps({"error": denial})
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:

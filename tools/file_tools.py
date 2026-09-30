@@ -324,6 +324,10 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _creation_locks, _creation_locks_lock, _resolve_container_task_id,
         get_session_cwd, record_session_cwd)
 
+    from tools.docker_strict import tool_denial
+    denial = tool_denial("file operations")
+    if denial:
+        raise PermissionError(denial)
     raw_task_id = task_id or "default"
     task_id = _resolve_container_task_id(raw_task_id)
 

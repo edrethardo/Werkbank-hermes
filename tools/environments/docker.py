@@ -428,7 +428,7 @@ _storage_opt_ok: Optional[bool] = None  # cached result across instances
 _cgroup_limits_ok: Optional[bool] = None  # cached result across instances
 
 
-def _cgroup_limits_available(image: str) -> bool:
+def _cgroup_limits_available(image: str, *, strict: bool = False) -> bool:
     """Probe once per process whether ``--cpus``/``--memory``/``--pids-limit`` work here, via a
     throwaway ``sleep 0`` container from *image* (no extra pull). Without delegated cgroup
     controllers (unprivileged LXCs, rootless) these flags fail every start with exit 126;
@@ -443,15 +443,22 @@ def _cgroup_limits_available(image: str) -> bool:
     if not docker_exe or not image:
         return False  # not cached: docker may appear later in this process
 
+    probe_name = f"hermes-strict-probe-{uuid.uuid4().hex[:12]}" if strict else None
+    probe_args = (["--name", probe_name, "--user", _resolve_host_user_spec(),
+                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                   "--network", "none", "--entrypoint", "sleep"] if strict else [])
     try:
         result = run_capture(
             [docker_exe, "run", "--rm", "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
-             image, "sleep", "0"],
+             *probe_args, image, *(["0"] if strict else ["sleep", "0"])],
             timeout=60)
     except Exception as e:
         logger.warning("Cgroup limit probe failed; containers run without "
                        "CPU/memory/PID limits until a probe succeeds: %s", e)
         return False
+    finally:
+        if probe_name:
+            run_capture([docker_exe, "rm", "-f", probe_name], timeout=15)
     if result.returncode == 0:
         _cgroup_limits_ok = True
         return True
@@ -654,7 +661,25 @@ class DockerEnvironment(BaseEnvironment):
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
         snap_compat: bool = False,
-        image_pinned: bool = False):
+        image_pinned: bool = False,
+        strict: bool = False):
+        self._strict = strict
+        if strict:
+            from tools.docker_strict import validate_extra_args, validate_volumes
+            user_spec = _resolve_host_user_spec()
+            if not user_spec or user_spec.split(":")[0] == "0":
+                raise ValueError("docker_strict requires a non-root POSIX host user")
+            volumes = validate_volumes(volumes)
+            extra_args = validate_extra_args(extra_args)
+            if snap_compat:
+                raise ValueError("docker_strict forbids docker_snap_compat")
+            run_as_host_user = True
+            if cwd in {"~", "/root"}:
+                cwd = "/tmp"
+            persistent_filesystem = auto_mount_cwd = persist_across_processes = False
+            cpu, memory = cpu or 1, memory or 5120
+            if cpu <= 0 or memory <= 0:
+                raise ValueError("docker_strict requires positive CPU and memory limits")
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -677,6 +702,13 @@ class DockerEnvironment(BaseEnvironment):
             volumes = []
 
         _ensure_docker_available()
+        if strict:
+            # Docker creates anonymous mounts for image VOLUME declarations.
+            # Require an already-present, inspectable image rather than silently pulling.
+            inspection = run_capture([find_docker() or "docker", "image", "inspect", image,
+                                      "--format", "{{json .Config.Volumes}}"], timeout=15, check=True)
+            if json.loads(inspection.stdout) not in (None, {}):
+                raise ValueError("docker_strict rejects images declaring implicit VOLUME mounts")
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
@@ -687,7 +719,8 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
-        volume_args.extend(_readonly_skill_mount_args())
+        if not strict:
+            volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -709,6 +742,9 @@ class DockerEnvironment(BaseEnvironment):
                 image)
         security_args = _build_security_args(
             run_as_host_user and bool(user_args), run_exec=image_uses_s6_init, snap_compat=snap_compat)
+        if strict:
+            security_args = ["--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                             "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m"]
         self._snap_compat = snap_compat
         if snap_compat:
             logger.warning(
@@ -745,7 +781,7 @@ class DockerEnvironment(BaseEnvironment):
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
 
-        reused = persist_across_processes and self._attach_existing_container(
+        reused = self._persist_across_processes and self._attach_existing_container(
             task_label, profile_name, egress_label, network)
         if not reused:
             self._container_id = self._docker_run(cwd)
@@ -762,6 +798,9 @@ class DockerEnvironment(BaseEnvironment):
         validated docker_extra_args. Returns ``(egress_label, volume_args, host_args, env_args,
         validated_extra)``; sets ``self._run_env_values`` (injected into the docker-client
         subprocess env at run time and reused verbatim by container-recreation recovery)."""
+        if getattr(self, "_strict", False):
+            self._run_env_values = dict(self._env)
+            return "strict", [], [], _name_only_env_args(self._env), []
         egress_volume_args, egress_env_overrides, egress_host_args = _egress_proxy_args_for_docker()
         egress_label = _egress_reuse_fingerprint(egress_volume_args, egress_env_overrides, egress_host_args)
         enforce_egress = _egress_enforce_on_docker() if egress_env_overrides else True
@@ -786,7 +825,11 @@ class DockerEnvironment(BaseEnvironment):
     def _resource_args(self, image, cpu, memory, disk, network, shm_size, extra_args) -> list[str]:
         """cgroup-gated CPU/memory/pids limits, shm size, disk quota and network mode."""
         args: list[str] = []
-        if _cgroup_limits_available(image):
+        limits_available = (_cgroup_limits_available(image, strict=True) if getattr(self, "_strict", False)
+                            else _cgroup_limits_available(image))
+        if getattr(self, "_strict", False) and not limits_available:
+            raise RuntimeError("docker_strict: cgroup CPU/memory/PID limit probe failed; refusing container start")
+        if limits_available:
             if cpu > 0:
                 args.extend(["--cpus", str(cpu)])
             if memory > 0:
@@ -831,6 +874,10 @@ class DockerEnvironment(BaseEnvironment):
         is the drive shape, not a username.
         """
         volume_args: list[str] = []
+        if getattr(self, "_strict", False):
+            self.host_cwd = None
+            self.host_cwd_mount = None
+            return [arg for vol in (volumes or []) for arg in ("-v", vol)], []
         for vol in (volumes or []):
             if not isinstance(vol, str):
                 logger.warning("Docker volume entry is not a string: %r", vol)
@@ -1057,6 +1104,11 @@ class DockerEnvironment(BaseEnvironment):
 
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """See ``remote_common.resolve_passthrough_env``; explicit docker_forward_env bypasses the blocklist."""
+        if getattr(self, "_strict", False):
+            from tools.env_passthrough import resolve_passthrough_value
+            values = {key: resolve_passthrough_value(key, os.environ.get(key)) for key in self._forward_env}
+            return ({key: val for key, val in values.items() if val is not None},
+                    {key for key, val in values.items() if val is None})
         return resolve_passthrough_env(self._forward_env, hermes_env_loader=_load_hermes_env_vars)
 
     def _build_runtime_env_args_with_unsets(self) -> tuple[list[str], tuple[str, ...], dict[str, str]]:
