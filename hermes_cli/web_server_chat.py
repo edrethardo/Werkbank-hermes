@@ -324,6 +324,14 @@ def _bind_oauth_abo_env(env: dict, *, resume, provider, model, chatgpt_mode) -> 
         env["HERMES_INFERENCE_MODEL"] = chosen_model
 
 
+def _is_foreign_profile(profile_dir: Optional[Path]) -> bool:
+    """Whether a chat scoped to ``profile_dir`` runs under a profile other than this dashboard's."""
+    if profile_dir is None:
+        return False
+    from hermes_constants import get_routing_process_hermes_home, hermes_home_key
+    return hermes_home_key(profile_dir) != hermes_home_key(get_routing_process_hermes_home())
+
+
 def _resolve_chat_argv(
     resume: Optional[str] = None, sidecar_url: Optional[str] = None, profile: Optional[str] = None,
     active_session_file: Optional[str] = None, provider: Optional[str] = None,
@@ -336,8 +344,10 @@ def _resolve_chat_argv(
     Tests monkeypatch this with a tiny fake command.  Env contract: resume goes
     through ``HERMES_TUI_RESUME`` (``ui-tui`` does not parse argv), resolved to
     the newest descendant; ``HERMES_TUI_GATEWAY_URL`` attaches to this process's
-    in-memory gateway but is SKIPPED for profile-scoped chats (that gateway runs
-    under the dashboard's own profile, so a scoped chat spawns its own);
+    in-memory gateway but is SKIPPED when the chat is scoped to a profile OTHER
+    than the dashboard's own (that gateway runs under the dashboard's profile, so
+    a foreign-profile chat spawns its own; naming the dashboard's own profile
+    still attaches, so the terminal and the browser chat share one live session);
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
     dir, the same propagation ``hermes -p <name>`` performs. ``workspace_cwd``
     (an already-validated host directory, ``chat_workspaces.resolve_chat_cwd``)
@@ -418,8 +428,11 @@ def _resolve_chat_argv(
         env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
 
     # Without the attach URL, gatewayClient spawns its own `tui_gateway.entry`,
-    # which inherits the profile HERMES_HOME set above.
-    if profile_dir is None and (gateway_ws_url := _build_gateway_ws_url()):
+    # which inherits the profile HERMES_HOME set above. Only a FOREIGN profile needs
+    # that: a scope naming the dashboard's own profile would otherwise open a second
+    # live session for a chat the in-memory gateway already hosts, and the one-writer
+    # lease then refuses whichever of the two surfaces types second.
+    if not _is_foreign_profile(profile_dir) and (gateway_ws_url := _build_gateway_ws_url()):
         env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
 
     _bind_oauth_abo_env(

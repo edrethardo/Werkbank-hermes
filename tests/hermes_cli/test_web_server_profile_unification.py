@@ -623,6 +623,20 @@ class TestProfileScopedTelegramOnboarding:
         assert default_cfg.get("platforms", {}).get("telegram", {}).get("enabled") is not True
 
 
+def _bind_dashboard(monkeypatch):
+    """A bound, ungated dashboard (the in-memory gateway URL is only built once a port is bound)."""
+    from hermes_cli.web_server import app
+
+    monkeypatch.setattr(app.state, "bound_host", "127.0.0.1", raising=False)
+    monkeypatch.setattr(app.state, "bound_port", 9119, raising=False)
+    monkeypatch.setattr(app.state, "auth_required", False, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.main_tui_launch._make_tui_argv",
+        lambda root, tui_dev=False: (["cat"], None),
+        raising=False,
+    )
+
+
 class TestProfileScopedChatPty:
     def test_chat_argv_scopes_hermes_home(self, isolated_profiles, monkeypatch):
 
@@ -634,8 +648,23 @@ class TestProfileScopedChatPty:
         argv, cwd, env = _web_server_chat._resolve_chat_argv(profile="worker_beta")
         assert env is not None
         assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
-        # Scoped chat must NOT attach to the dashboard's in-memory gateway.
+
+    def test_foreign_profile_chat_spawns_its_own_gateway(self, isolated_profiles, monkeypatch):
+        """The in-memory gateway runs under the dashboard's profile; another profile's chat must not use it."""
+        _bind_dashboard(monkeypatch)
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv(profile="worker_beta")
+        assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
         assert "HERMES_TUI_GATEWAY_URL" not in env
+
+    def test_own_profile_chat_attaches_to_the_dashboard_gateway(self, isolated_profiles, monkeypatch):
+        """Naming the dashboard's own profile is not a foreign scope: the terminal must reach the same
+        in-memory gateway the browser chat uses, or the two open two live sessions for one chat."""
+        monkeypatch.setenv("HERMES_HOME", str(isolated_profiles["worker_beta"]))
+        _bind_dashboard(monkeypatch)
+        _argv, _cwd, scoped = _web_server_chat._resolve_chat_argv(profile="worker_beta")
+        _argv, _cwd, unscoped = _web_server_chat._resolve_chat_argv()
+        assert scoped["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
+        assert scoped["HERMES_TUI_GATEWAY_URL"] == unscoped["HERMES_TUI_GATEWAY_URL"]
 
     def test_chat_argv_bridges_selected_profile_terminal_config(
         self, isolated_profiles, monkeypatch
