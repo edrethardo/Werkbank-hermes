@@ -135,14 +135,19 @@ def _browser_mutation_fence(rid, params: dict, session: dict, *, transport=None)
 
 
 def _browser_pending_mutation_fence(rid, params: dict) -> dict | None:
-    """Fence a prompt-card response before its pending registry is changed."""
+    """Fence a prompt-card response before its pending registry is changed.
+
+    The session travels either as ``session_id`` or via the open server→client request
+    (``request_id`` / ``id`` — an id-only RPC like ``request.answer`` carries nothing else).
+    """
     sid = str(params.get("session_id") or "")
     session = _sessions.get(sid) if sid else None
-    if session is None and (request_id := str(params.get("request_id") or "")):
-        with _prompt_lock:
-            entry = _pending.get(request_id)
-        if entry:
-            session = _sessions.get(entry[0])
+    if session is None:
+        request_id = str(params.get("request_id") or params.get("id") or "")
+        if request_id:
+            from tui_gateway import server_requests
+            if owner := server_requests.session_of(request_id):
+                session = _sessions.get(owner)
     return _browser_mutation_fence(rid, params, session) if session is not None else None
 
 

@@ -23,7 +23,7 @@ from tui_gateway import delivery_socket as ds
 from tui_gateway import server
 
 
-pytestmark = pytest.mark.linux_only
+pytestmark = pytest.mark.platforms("linux")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

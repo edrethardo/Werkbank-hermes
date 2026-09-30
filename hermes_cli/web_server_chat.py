@@ -270,7 +270,12 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            _stamp_identity(consume_ticket(ticket))
+            info = consume_ticket(ticket)
+            if info.get("provider") == "bot-desktop":
+                # A display ticket admits one RFB bridge on /api/display/ws (a watch-only
+                # capability handed to a screen viewer); it must not double as a login here.
+                raise TicketInvalid("display ticket presented as a gateway login")
+            _stamp_identity(info)
             if protocol_ticket:
                 # Select only the stable public protocol during accept. The
                 # ticket-bearing protocol is a credential and must never be
@@ -324,6 +329,7 @@ def _resolve_chat_argv(
     active_session_file: Optional[str] = None, provider: Optional[str] = None,
     model: Optional[str] = None, chatgpt_mode: Optional[str] = None,
     program: Optional[str] = None, project: Optional[str] = None,
+    workspace_cwd: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY (what ``hermes --tui`` runs).
 
@@ -333,7 +339,12 @@ def _resolve_chat_argv(
     in-memory gateway but is SKIPPED for profile-scoped chats (that gateway runs
     under the dashboard's own profile, so a scoped chat spawns its own);
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
-    dir, the same propagation ``hermes -p <name>`` performs.
+    dir, the same propagation ``hermes -p <name>`` performs. ``workspace_cwd``
+    (an already-validated host directory, ``chat_workspaces.resolve_chat_cwd``)
+    is the workspace the user picked for a FRESH chat: it becomes ``HERMES_CWD``
+    (where a self-spawned gateway starts) and ``HERMES_TUI_CWD`` (what the TUI
+    passes as the explicit ``cwd`` of ``session.create`` when attached to the
+    in-memory gateway, whose own cwd is the dashboard's launch dir).
     """
     # A plugin-registered foreign program (see hermes_cli/terminal_programs.py) hosts in the
     # same PTY and the same /chat surface, but shares none of Hermes' TUI plumbing — no profile
@@ -375,6 +386,9 @@ def _resolve_chat_argv(
             apply_terminal_config_to_env(env=env)
     except Exception:
         _log.warning("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
+    if workspace_cwd:
+        env["HERMES_CWD"] = workspace_cwd
+        env["HERMES_TUI_CWD"] = workspace_cwd
     _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
     # Mouse tracking would swallow wheel events the browser needs for
@@ -470,6 +484,7 @@ async def _resolve_chat_argv_async(
     active_session_file: Optional[str] = None, provider: Optional[str] = None,
     model: Optional[str] = None, chatgpt_mode: Optional[str] = None,
     program: Optional[str] = None, project: Optional[str] = None,
+    workspace_cwd: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv off the event loop (it may run ``npm run build``); the
     async lock keeps one-build-at-a-time without parking worker threads."""
@@ -479,6 +494,8 @@ async def _resolve_chat_argv_async(
               "program": program, "project": project}
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if workspace_cwd is not None:
+        kwargs["workspace_cwd"] = workspace_cwd
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
