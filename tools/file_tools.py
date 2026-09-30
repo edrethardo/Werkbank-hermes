@@ -608,6 +608,27 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     return count
 
 
+def _strict_read_file(path: str, offset: int, limit: int, task_id: str) -> str:
+    """Read text through the real strict environment, with no host path helpers.
+
+    Normal read_file also performs host metadata checks, document extraction and
+    follow-up hooks. None may handle model-controlled paths in strict mode.
+    """
+    from tools import terminal_tool as terminal
+    from tools.environments.docker import DockerEnvironment
+    plan = terminal._plan_execution("true", task_id=task_id, timeout=30,
+                                    background=False, _host_local=False)
+    if plan.env_type != "docker":
+        raise PermissionError("docker_strict requires Docker for read_file")
+    env = terminal._acquire_env(plan, task_id)
+    if not isinstance(env, DockerEnvironment) or not getattr(env, "_strict", False):
+        raise PermissionError("docker_strict refuses a cached non-strict file environment")
+    result = ShellFileOperations(env).read_file(path, offset, limit).to_dict()
+    content = result.get("content") or ""
+    _apply_char_budget(result, content, offset, result.get("total_lines", 0), _get_max_read_chars())
+    return json.dumps(result, ensure_ascii=False)
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers.
 
@@ -618,6 +639,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
     """
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+        from tools.docker_strict import strict_enabled
+        if strict_enabled():
+            return _strict_read_file(path, offset, limit, task_id)
 
         # On the RAW model-supplied string, before any expanduser()/resolve():
         # on Windows resolving \??\UNC\host\share already sends SMB auth (NTLM

@@ -6,17 +6,36 @@ profile configuration, gateway restart, merge or push is part of this change.
 
 ## Decision
 
-Opt-in, terminal-only model-tool policy rather than attempting to sandbox each
-host tool individually. This intentionally denies file tools and `execute_code`
-(their ordinary paths include host parsers/kernels), browser/web/vision tools,
-process management, delegation, MCP/connectors, and agent-inline tools. The
-existing terminal can perform file operations and run Python in the container.
+Opt-in, terminal-plus-container-text-reader model-tool policy rather than
+attempting to sandbox every host tool individually. The dedicated `read_file`
+path avoids host parsers, metadata, extraction and hooks. File mutation/search,
+`execute_code` (its ordinary paths include host kernels), browser/web/vision,
+process management, delegation, MCP/connectors, and agent-inline tools are
+otherwise denied. Terminal commands can edit files and run Python inside Docker.
 The Docker argument allowlist is empty: dedicated typed configuration covers
 binds, resources, environment and networking.
 
-## Verification receipt
+## Parent's independent runtime verification
 
-Final targeted command (canonical runner, not direct pytest):
+After the initial unit shard below, the parent added the real-container
+`tests/tools/test_docker_strict_live.py` and reusable
+`scripts/verify_docker_strict.py`. The probe checks attempted secret reads and
+SSH-directory enumeration without printing any bytes, socket absence, non-root
+UID, all three cgroup limits, a real HTTPS Git push refusal with network=none,
+and real `read_file` container success plus host-canary failure. Inspect must
+show exactly the explicitly approved bind source. Cleanup is awaited.
+
+The parent ran 11 Docker-related files with the canonical runner and
+`HERMES_TEST_IMAGE=wb855-strict-test:local`: **184 passed, 0 failed** (including
+36 strict-policy cases and the live container case). Observed: UID 1000,
+`memory.max=268435456`, `cpu.max=100000 100000`, `pids.max=256`, push exit 128.
+The standalone receipt is retained in the Werkbank branch as
+`docs/dev/wb855-strict-evidence.json`. A real container probe is NOT a real
+model-driven ticket run, nor proof that the whole host controller is confined.
+
+## Initial unit verification receipt
+
+Initial targeted command (canonical runner, not direct pytest):
 
 ```sh
 HERMES_TEST_SCRATCH_ROOT=/home/aaron/.hermes/profiles/werkbank/cache/scratch/wb855-tests \

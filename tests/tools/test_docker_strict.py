@@ -123,6 +123,16 @@ def test_default_keeps_legacy_automatic_mount_and_env(docker_calls, monkeypatch)
     assert "--user" not in env._all_run_args
 
 
+def test_explicit_false_and_omitted_have_identical_legacy_run_policy(docker_calls, monkeypatch):
+    monkeypatch.setattr(docker, "_readonly_skill_mount_args", lambda: ["-v", "/dummy:/credential:ro"])
+    monkeypatch.setattr(docker, "resolve_passthrough_env", lambda *a, **kw: ({"LEGACY": "dummy"}, set()))
+    implicit = docker.DockerEnvironment("test-image", task_id="same", persist_across_processes=False)
+    explicit = docker.DockerEnvironment("test-image", task_id="same", persist_across_processes=False, strict=False)
+    assert explicit._all_run_args == implicit._all_run_args
+    assert explicit._init_env_values == implicit._init_env_values
+    assert explicit._run_env_values == implicit._run_env_values
+
+
 def test_every_host_tool_denied_through_dispatchers(strict_scope):
     import model_tools
     from tools.registry import registry
@@ -133,20 +143,23 @@ def test_every_host_tool_denied_through_dispatchers(strict_scope):
         "memory", "todo", "delegate_task", "tool_call", "tool_describe", "tool_search",
         "future_plugin_tool", "connectors__test__read", "process_manage",
     }
-    for name in names - {"terminal"}:
+    for name in names - {"terminal", "read_file"}:
         assert "docker_strict" in json.loads(model_tools.handle_function_call(name, {}))["error"]
         assert "docker_strict" in json.loads(registry.dispatch(name, {}))["error"]
     definitions = model_tools.get_tool_definitions(quiet_mode=True)
-    assert {d["function"]["name"] for d in definitions} <= {"terminal"}
+    assert {d["function"]["name"] for d in definitions} <= {"terminal", "read_file"}
 
 
-def test_direct_file_code_and_agent_inline_paths_denied(strict_scope, tmp_path):
+def test_direct_file_code_and_agent_inline_paths_denied(strict_scope, tmp_path, monkeypatch):
     from tools.file_tools import read_file_tool
     from tools.code_execution_tool import execute_code
     from agent.agent_runtime_helpers import invoke_tool
     from agent.tool_executor import _resolve_sequential_dispatch
     target = tmp_path / "canary"
     target.write_text("UNIQUE-HOST-CANARY", encoding="utf-8")
+    import tools.terminal_tool as terminal
+    monkeypatch.setattr(terminal, "_plan_execution", lambda *a, **kw: SimpleNamespace(env_type="docker"))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a, **kw: object())
     result = read_file_tool(str(target))
     assert "UNIQUE-HOST-CANARY" not in result and "docker_strict" in result
     assert "docker_strict" in execute_code("raise Exception('must not execute')")
@@ -169,7 +182,7 @@ def test_config_real_profiles_a_b_a_and_backend_wiring(tmp_path, monkeypatch, do
         try:
             cfg = _get_env_config()
             assert cfg["docker_strict"] is expected
-            assert bool(tool_denial("read_file")) is expected
+            assert bool(tool_denial("execute_code")) is expected
             if expected:
                 env = _build_docker_env(image="test-image", cwd="/tmp", timeout=30,
                     cc=_container_config_from_config(cfg), task_id="strict-test", host_cwd=None)

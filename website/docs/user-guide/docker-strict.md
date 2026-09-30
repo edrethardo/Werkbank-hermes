@@ -27,13 +27,17 @@ terminal:
 
 ## Guarantees at the model-tool boundary
 
-- Only **foreground `terminal`** is admitted. The model tool catalog is narrowed,
-  and dispatch rejects every other tool, including unknown/new tools. The checks
-  also cover direct registry dispatch and sequential/concurrent agent-inline
-  tools. `read_file`, file writes/search/patch, `execute_code`, browser, web,
-  vision, process management, delegation, MCP, connectors and deferred tool
-  wrappers are denied. Use shell commands (including Python) **inside the
-  terminal container** instead. Background/PTY/host-local execution and automatic
+- Only **foreground `terminal` and container-only `read_file`** are admitted.
+  `read_file` takes a dedicated text-only path through the actual strict Docker
+  environment BEFORE host path resolution, metadata, document extraction or
+  follow-up hooks. A visible container file is readable; a host-only canary is
+  not. Document conversion is intentionally unavailable in this path.
+  The catalog is narrowed and dispatch rejects all other tools, including new
+  tools, file writes/search/patch, `execute_code`, browser, web, vision, process
+  management, delegation, MCP, connectors and deferred wrappers. Checks cover
+  direct registry and sequential/concurrent agent-inline dispatch. Use shell
+  commands (including Python) **inside the terminal container** for those file
+  operations. Background/PTY/host-local execution and automatic
   foreground-to-background promotion are refused.
 - Container commands must use an actual strict `DockerEnvironment`; a cached
   local or non-strict environment is refused rather than reused. A non-Docker

@@ -1,4 +1,4 @@
-"""Opt-in Docker tool policy. Only foreground terminal execution is admitted.
+"""Opt-in Docker tool policy: foreground terminal and container-only text reads.
 
 This is a model-tool boundary, not a sandbox for the trusted Hermes controller,
 plugins, image publisher or operator. Never infer permission from a toolset name.
@@ -7,7 +7,7 @@ from pathlib import Path
 import os
 import stat
 
-STRICT_TOOLS = frozenset({"terminal"})
+STRICT_TOOLS = frozenset({"terminal", "read_file"})
 
 
 def strict_enabled() -> bool:
