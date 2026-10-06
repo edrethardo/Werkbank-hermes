@@ -36,6 +36,11 @@ class FakeBridge:
     def close(self):
         self.closed = True
 
+    def is_alive(self):
+        # The fake child never exits; a test that reuses a bridge after close_all() must still
+        # see it as the same live process.
+        return True
+
 
 class FakeWS:
     def __init__(self):

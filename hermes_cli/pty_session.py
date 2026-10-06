@@ -293,6 +293,9 @@ class PtySessionRegistry:
         # already serialized globally for the same reason, and a spawn only
         # delays NEW chats. Per-key locks if spawn throughput ever matters.
         self._attach_lock = asyncio.Lock()
+        # Sessions popped from the registry but still closing in the background; close_all()
+        # awaits them too, and holding the tasks keeps them from being garbage-collected.
+        self._background_closes: set[asyncio.Task] = set()
 
     def _adoptable(self, identity: Optional[PtyIdentity], now: float) -> Optional[PtySession]:
         """A living PTY already hosting the session ``identity`` asks to resume, that no OTHER live
@@ -322,8 +325,10 @@ class PtySessionRegistry:
             if existing is not None and existing.alive:
                 return existing, False
             if existing is not None:                       # dead remnant
-                await existing.close()
+                # Close in the background: ending a dead leader's helpers can take the helper
+                # grace, and this lock serializes every new chat.
                 self._sessions.pop(key, None)
+                self._close_in_background(existing)
             adopted = self._adoptable(identity, time.monotonic())
             if adopted is not None:
                 self._sessions.pop(adopted.key, None)
@@ -388,7 +393,9 @@ class PtySessionRegistry:
         doomed = []
         for key, s in self._sessions.items():
             idle = self._idle_since(s, now)
-            if not s.alive or (idle is not None and (now - idle) > self._ttl):
+            # EOF never arrives if a helper still holds the PTY slave after the child died (#76759);
+            # ask the process itself (a WNOHANG waitpid).
+            if not s.alive or (idle is not None and (now - idle) > self._ttl) or not s.bridge.is_alive():
                 doomed.append(key)
         for key in doomed:
             # Reaps overlap (attach_or_spawn and the background reaper) and close()
@@ -408,12 +415,15 @@ class PtySessionRegistry:
             raise RegistryFull()
         _since, oldest = min(idle, key=lambda pair: pair[0])
         self._sessions.pop(oldest.key, None)
-        asyncio.create_task(oldest.close())
+        self._close_in_background(oldest)
+
+    def _close_in_background(self, session: "PtySession") -> None:
+        task = asyncio.create_task(session.close())
+        self._background_closes.add(task)
+        task.add_done_callback(self._background_closes.discard)
 
     async def close_all(self) -> None:
-        for key in list(self._sessions):
-            # Same overlap window as reap_idle: an in-flight reap may have popped
-            # a snapshot key while we awaited an earlier close().
-            session = self._sessions.pop(key, None)
-            if session is not None:
-                await session.close()
+        # Close concurrently: each close() may wait out its helpers' SIGHUP grace, and shutdown runs
+        # under the backend's SIGTERM -> SIGKILL budget (dashboard_procs._POSIX_TERM_GRACE_SECONDS).
+        sessions = [self._sessions.pop(key) for key in list(self._sessions)]
+        await asyncio.gather(*(s.close() for s in sessions), *self._background_closes, return_exceptions=True)
