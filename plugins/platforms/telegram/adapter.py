@@ -4798,6 +4798,38 @@ class TelegramAdapter(BasePlatformAdapter):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+        # Werkbank (WB-950): off unless ``extra.wb_tap_spool`` is set.
+        if data.startswith("wb:") and self._wb_tap_spool():
+            await self._handle_wb_tap(query, data, cb)
+
+    def _wb_tap_spool(self) -> str:
+        extra = getattr(self.config, "extra", None) or {}
+        return str(extra.get("wb_tap_spool") or "").strip()
+
+    async def _handle_wb_tap(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """Hand a ``wb:<ticket>:<code>`` tap to the board through a spool file.
+
+        The gateway only checks the callback allowlist and writes one file;
+        the board decides (owner, ticket, Rückfrage vs. Review). No network,
+        no board secrets in the gateway.
+        """
+        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+            return
+        import json as _json, os as _os, time as _time, uuid as _uuid
+        spool = self._wb_tap_spool()
+        try:
+            _os.makedirs(spool, mode=0o700, exist_ok=True)
+            name = f"{int(_time.time() * 1000)}-{_uuid.uuid4().hex[:8]}"
+            tmp = _os.path.join(spool, f".{name}.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump({"data": data, "user_id": str(getattr(query.from_user, "id", "")),
+                            "chat_id": cb["chat_id"], "thread_id": cb["thread_id"]}, f)
+            _os.chmod(tmp, 0o600)
+            _os.replace(tmp, _os.path.join(spool, name + ".json"))
+        except OSError:
+            await query.answer(text="Nicht angekommen")
+            return
+        await query.answer(text="Gesendet")
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
