@@ -3,8 +3,11 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 import { defineLocale } from './define-locale'
 import { introJa } from './intro-ja'
 import { jaAuxTasks } from './ja_aux_tasks'
+import { jaLocalModels } from './ja_local_models'
 import { jaModelMenu } from './ja_model_menu'
+import { jaNotices } from './ja_notices'
 import { jaPluginSettings } from './ja_plugins'
+import { jaProjects } from './ja_projects'
 import { jaSharedMetrics } from './ja_shared_metrics'
 
 export const ja = defineLocale({
@@ -259,10 +262,7 @@ export const ja = defineLocale({
     }
   },
 
-  remoteDisplayBanner: {
-    message: reason =>
-      `ソフトウェアレンダリングが有効です — リモートディスプレイを検出しました（${reason}）。ちらつきを防ぐため GPU アクセラレーションは無効化されています。`
-  },
+  ...jaNotices,
 
   billingBlock: {
     titleNous: 'Nous クレジットが不足しています',
@@ -1306,119 +1306,7 @@ export const ja = defineLocale({
       providerDefault: '(プロバイダーのデフォルト)',
       tasks: jaAuxTasks
     },
-    localModels: {
-      connectionChanged: 'ローカルモデルの接続が変更されました',
-      title: 'ローカルモデル',
-      runtimeTitle: 'ローカルランタイム',
-      runtimeReady: backend => `準備完了 · ${backend}`,
-      serverRunning: '実行中',
-      runtimeInstalled: 'llama.cpp ランタイムをインストール済み',
-      runtimeInstalledDetail: (tag, backend) =>
-        `ビルド ${tag}、${backend} バックエンド。サーバーは Hermes が起動・管理します。`,
-      installTitle: 'ローカルランタイムをインストール',
-      installDetail:
-        'llama.cpp 推論エンジン（数百 MB）をダウンロードします。ダウンロードしたモデルはすべてこのマシン上で動作します——アカウント不要、データが外部に送られることはありません。',
-      installAction: 'ランタイムをインストール',
-      installing: 'ランタイムをインストール中…',
-      installFailed: 'ランタイムのインストールに失敗しました',
-      hardwareTitle: 'このマシン',
-      hardwareLoading: 'ハードウェアを確認中…',
-      vram: label => `GPU メモリ ${label}`,
-      ram: label => `RAM ${label}`,
-      unifiedMemory: 'ユニファイドメモリ',
-      modelsTitle: 'モデル',
-      recommended: 'おすすめ',
-      recommendedReason: {
-        'best-quality-resident':
-          'GPU に完全に載り、フルスピードで動くモデルの中で最高品質です。おすすめは品質とこのハードウェアでの予測速度を両立させて選ばれます。',
-        'speed-gated-quality':
-          'より高品質なモデルもこのマシンに載りますが、メモリ帯域の制約で応答が遅くなります — これは速度を保てる最良のモデルです。',
-        'fastest-resident':
-          'このハードウェアでフルスピードに達するモデルはありません。GPU メモリ内で動くものの中で最速です。'
-      } as Record<string, string>,
-      noRecommendationTitle: 'このマシン向けの自動推奨モデルはありません',
-      noRecommendationDetail:
-        '自動セットアップには、GPU メモリまたはユニファイドメモリに完全に収まる厳選モデルが必要です。下の一覧から選ぶか、ほかのモデルを探すこともできます。',
-      noRecommendationAction: 'モデルを探す',
-      quickstartConfigure: '自分で選ぶ',
-      downloaded: 'ダウンロード済み',
-      downloadAction: size => `ダウンロード · ${size}`,
-      downloadProgress: (done, total) => `${done} / ${total}`,
-      downloadStatusRunning: 'ダウンロード中',
-      downloadSpeed: rate => `${rate}`,
-      downloadEta: time => `残り約${time}`,
-      downloadPausedLabel: '一時停止中',
-      downloadPauseAction: '一時停止',
-      downloadResumeAction: '再開',
-      downloadDoneToast: model => `${model} の準備ができました。`,
-      installDoneToast: 'ローカルランタイムのインストールが完了しました。',
-      useAction: '使用する',
-      activePill: 'デフォルト',
-      updateTitle: 'エンジンの更新があります',
-      updateDetail: (next, current) =>
-        `新しい llama.cpp ビルド（${next}）をインストールできます——現在は ${current} です。ダウンロード中もモデルは引き続き使えます。`,
-      updateAction: 'エンジンを更新',
-      updating: 'エンジンを更新中…',
-      upToDateTitle: 'エンジンは最新です',
-      upToDateDetail: (tag, backend) => `llama.cpp ${tag}（${backend}）で動作中。`,
-      activeDetail: '新しいチャットはこのモデルを使用——最初のメッセージ送信時に読み込みます',
-      activeNotLoaded: '最初のメッセージで読み込みます',
-      loadedPill: '読み込み済み',
-      placementResident: 'すべて GPU 上',
-      placementSpilled: '一部 RAM 上',
-      placementResidentTip: 'このコンテキストウィンドウで GPU メモリ内で完全に動作しています — フルスピード。',
-      placementSpilledTip:
-        'モデルの一部がシステム RAM から動作しています — 動作しますが遅くなります。よりコンパクトなビルドか小さいコンテキストなら完全に収まります。',
-      loadingPill: '読み込み中…',
-      ejectTip: 'GPU メモリを解放（必要時に再読み込み）',
-      ejected: 'モデルをアンロードしました——GPU メモリを解放しました。',
-      ejectFailed: 'モデルをアンロードできませんでした',
-      stopServer: 'オフにする',
-      startServer: 'オンにする',
-      runtimeRunningDetail:
-        'ローカルサーバーが実行中です。オフにすると GPU メモリを全て解放し、再度オンにするまで新しいチャットはローカルモデルを使用しません。',
-      serverStopped: 'ローカルサーバーを停止しました——GPU メモリを解放しました。',
-      serverStarted: 'ローカルサーバー実行中。',
-      serverStopFailed: 'ローカルサーバーを停止できませんでした',
-      serverStartFailed: 'ローカルサーバーを起動できませんでした',
-      activating: '起動中…',
-      activateFailed: model => `${model} への切り替えに失敗しました`,
-      activateDoneToast: model => `新しいチャットは ${model} を使用します。`,
-      downloadFailed: model => `${model} のダウンロードに失敗しました`,
-      pillFitsGpu: 'GPU に完全に収まります',
-      pillUsesRam: 'システム RAM を使用',
-      pillTooBig: 'このマシンには大きすぎます',
-      browseTitle: 'さらにモデルを探す',
-      browseHint:
-        'Hugging Face 全体を検索できます。ここでダウンロードしたモデルは自動でマシンに合わせて動作しますが、当方でのテストは行われていません。',
-      browsePlaceholder: 'モデル名または作者で検索…',
-      browseSearching: 'Hugging Face を検索中',
-      browseListing: 'モデルファイルを読み込み中',
-      browseShowFiles: 'ファイルを表示',
-      browseRefresh: '更新',
-      browseDownloads: 'ダウンロード',
-      browseLikes: 'いいね',
-      browseGated: 'Hugging Face へのサインインが必要',
-      browseNoGguf: '互換性のあるモデルファイルが見つかりません。',
-      browseFitUnknown: '適合状況は不明',
-      browseAlreadyDownloaded: 'ダウンロード済みです。',
-      addedByYou: 'あなたが追加',
-      browseDownloadStarted: '{name} をダウンロード中',
-      browseDownloadAria: '{name} をダウンロード',
-      sideloadButton: 'モデルファイルを追加',
-      sideloadTitle: 'GGUF モデルファイルを選択',
-      sideloadDone: '{name} を追加しました。',
-      sideloadAlreadyPresent: '既にライブラリにあります。',
-      pillFullContext: max => `フル ${max} コンテキスト`,
-      pillFullContextTip: '最初からモデルの完全なコンテキストウィンドウで動作します',
-      pillUpTo: max => `最大 ${max} コンテキスト`,
-      pillGrowsTip: '会話が必要とするにつれて自動的に拡張します',
-      pillVision: '画像対応',
-      deleteAction: 'モデルを削除',
-      deleteConfirm: model => `${model} をディスクから削除しますか？`,
-      deleted: model => `${model} を削除しました。`,
-      deleteFailed: '削除に失敗しました'
-    },
+    localModels: jaLocalModels,
     providers: {
       connectAccount: 'アカウントを接続',
       haveApiKey: 'API キーをお持ちですか？',
@@ -2460,79 +2348,7 @@ export const ja = defineLocale({
     projectLoadFailed: 'セッションの読み込みに失敗しました',
     noSessions: 'セッションはまだありません',
     noFilterMatches: 'このフィルターに一致するセッションはありません',
-    projects: {
-      showAllSessions: 'すべてのセッションを表示',
-      sectionLabel: 'プロジェクト',
-      home: 'ホーム',
-      autoDiscovered: '自動検出',
-      showAllCount: count => `${count} 件のセッションをすべて表示`,
-      newButton: '新規プロジェクト',
-      createTitle: '新規プロジェクト',
-      createDesc: 'ワークスペースに名前を付け、1つ以上のフォルダを追加します。',
-      renameTitle: 'プロジェクト名を変更',
-      addFolderTitle: 'フォルダを追加',
-      namePlaceholder: '例: Skunkworks',
-      foldersLabel: 'フォルダ',
-      ideaLabel: 'アイデア',
-      ideaPlaceholder: 'このプロジェクトは何ですか？（IDEA.md に保存）',
-      ideaGenerate: 'アイデアを生成',
-      ideaGenerating: '生成中…',
-      ideaShuffle: 'テンプレートをシャッフル',
-      noFolders: 'まだフォルダがありません。',
-      addFolder: 'フォルダを追加',
-      primaryBadge: 'メイン',
-      removeFolder: '削除',
-      create: '作成',
-      menu: 'アクション',
-      menuRename: '名前を変更…',
-      menuAppearance: '外観',
-      noColor: '色なし',
-      menuAddFolder: 'フォルダを追加',
-      menuSetActive: 'アクティブに設定',
-      menuDelete: '削除',
-      reveal: 'フォルダで表示',
-      copyPath: 'パスをコピー',
-      removeFromSidebar: 'サイドバーから削除',
-      createdInPreviousContext:
-        'プロジェクトは以前の接続またはプロファイルで作成されました。そこに戻ってください。IDEA.md は書き込まれていません。',
-      createFailed: 'プロジェクトを作成できませんでした',
-      staleBackend:
-        'プロジェクトを作成するには Hermes バックエンドを更新してください。バックエンドがこのデスクトップアプリより古いです（設定 → 更新 → バックエンド）。',
-      deleteConfirm:
-        'Hermes から保存済みプロジェクトを削除します。ファイル・git リポジトリ・ワークツリーはそのまま残ります。',
-      startWork: '新しいワークツリー',
-      newWorktreeTitle: '新しいワークツリー',
-      newWorktreeDesc: 'このワークツリーのブランチ名を入力してください。',
-      branchPlaceholder: '例: my-feature',
-      branchOff: () => ({ after: ' から分岐', before: '' }),
-      baseBranchPlaceholder: 'ブランチを検索…',
-      baseBranchNone: 'ブランチが見つかりません',
-      startWorkFailed: 'ワークツリーを作成できませんでした',
-      worktreeStaleBackend:
-        'このリモート接続でワークツリーを作成するには Hermes バックエンドを更新してください — git ワークツリー API 以前のバージョンです。',
-      worktreeProjectLabel: 'プロジェクト',
-      worktreeProjectPlaceholder: 'プロジェクトを検索…',
-      worktreeProjectNone: 'フォルダのあるプロジェクトがありません',
-      convertBranch: 'ブランチを変換…',
-      convertBranchTitle: 'ブランチを変換',
-      convertBranchDesc: 'チェックアウト済みのブランチを開くか、空いているブランチのワークツリーを作成します。',
-      convertBranchPlaceholder: 'ブランチを検索…',
-      convertBranchInstead: '既存のブランチを変換',
-      branchOpenExisting: '開く',
-      branchSwitchHome: 'ホームを切替',
-      branchCreateWorktree: '新しいワークツリー',
-      branchTrackRemote: 'リモートを追跡',
-      branchesLoading: 'ブランチを読み込み中…',
-      noBranches: 'ブランチが見つかりません',
-      removeWorktree: 'ワークツリーを削除',
-      removeWorktreeFailed: 'ワークツリーを削除できませんでした（コミットされていない変更？）',
-      removeWorktreeConfirm:
-        'git から削除（ワークツリーのディレクトリを削除しますが、ブランチは残ります）するか、サイドバーからレーンを隠してワークツリーをディスク上に残します。',
-      removeWorktreeDirty:
-        'このワークツリーにはコミットされていない変更があります。強制削除（変更を破棄）するか、レーンを隠してディスク上に残します。',
-      forceRemove: '強制削除',
-      enter: label => `${label} を開く`
-    },
+    projects: jaProjects,
     newSessionIn: label => `${label} で新しいセッション`,
     showMoreIn: (count, label) => `${label} でさらに ${count} 件を表示`,
     loading: '読み込み中…',

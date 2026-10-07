@@ -14,9 +14,18 @@ class FakeFitAddon {
   fit() {}
 }
 
+const webglInstances: FakeWebglAddon[] = [];
+
 class FakeWebglAddon {
+  disposed = false;
   onContextLoss() {
     return { dispose() {} };
+  }
+  dispose() {
+    this.disposed = true;
+  }
+  constructor() {
+    webglInstances.push(this);
   }
 }
 
@@ -252,6 +261,7 @@ beforeEach(() => {
   FakeImageAddon.options = [];
   FakeWebSocket.instances = [];
   imageMocks.uploadChatImage.mockClear();
+  webglInstances.length = 0;
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
   apiMocks.buildWsUrl.mockResolvedValue("ws://localhost/api/pty?channel=chat-1");
@@ -498,6 +508,45 @@ describe("ChatPage", () => {
       expect(FakeWebSocket.instances).toHaveLength(1);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  // #52471 (text paste through term.paste exactly once) is covered by the browser-input
+  // adapter test above: it owns paste on xterm's textarea and cancels the native insert.
+  async function renderChat() {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    return container.querySelector(".hermes-chat-xterm-host")!;
+  }
+
+  it("keeps the image-paste route working: image pastes upload instead of pasting text", async () => {
+    const host = await renderChat();
+    const pasteSpy = vi.spyOn(FakeTerminal.prototype, "paste");
+    try {
+      const paste = new Event("paste", { bubbles: true, cancelable: true });
+      const file = new File([new Uint8Array([1, 2, 3])], "shot.png", {
+        type: "image/png",
+      });
+      Object.defineProperty(paste, "clipboardData", {
+        value: {
+          files: [file],
+          getData: () => "",
+          items: [{ getAsFile: () => file, kind: "file", type: "image/png" }],
+        },
+      });
+      await act(async () => {
+        host.dispatchEvent(paste);
+      });
+      await vi.waitFor(() => expect(imageMocks.uploadChatImage).toHaveBeenCalledTimes(1));
+      expect(pasteSpy).not.toHaveBeenCalled();
+      expect(paste.defaultPrevented).toBe(true);
+    } finally {
+      pasteSpy.mockRestore();
     }
   });
 
@@ -899,5 +948,138 @@ describe("ChatPage PTY ticket connect deadline", () => {
     // force-close a wedged handshake — the two must not both fire.
     await advance(PTY_TICKET_TIMEOUT_MS);
     expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
+  });
+});
+
+// xterm WebGL renderer gating (#18773 / #45520 / #58685): the addon must only
+// load when the host can actually use it (wide layout, non-Safari, hardware GL)
+// and must be dropped when shaped-script text arrives.
+describe("ChatPage WebGL renderer gating", () => {
+  const CHROME_UA =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  const SAFARI_UA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
+
+  /** Stub the probe's canvas context per test. */
+  function stubCanvasContext(
+    getContext: () => WebGLRenderingContext | null,
+  ): void {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
+      getContext as never,
+    );
+  }
+
+  function hardwareGl(): WebGLRenderingContext | null {
+    return {
+      getExtension: (name: string) => {
+        if (name === "WEBGL_debug_renderer_info") {
+          return { UNMASKED_RENDERER_WEBGL: 0x9246 };
+        }
+        if (name === "WEBGL_lose_context") {
+          return { loseContext: () => undefined };
+        }
+        return null;
+      },
+      getParameter: () => "Apple M2",
+    } as unknown as WebGLRenderingContext;
+  }
+
+  async function renderChat() {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("loads the WebGL addon on a wide hardware-GL Chrome host", async () => {
+    Object.defineProperty(window.navigator, "userAgent", {
+      configurable: true,
+      value: CHROME_UA,
+      writable: true,
+    });
+    stubCanvasContext(hardwareGl);
+
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    expect(webglInstances).toHaveLength(1);
+    expect(webglInstances[0].disposed).toBe(false);
+  });
+
+  it("skips the WebGL addon on Safari (#18773)", async () => {
+    Object.defineProperty(window.navigator, "userAgent", {
+      configurable: true,
+      value: SAFARI_UA,
+      writable: true,
+    });
+    stubCanvasContext(hardwareGl);
+
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    expect(webglInstances).toHaveLength(0);
+  });
+
+  it("skips the WebGL addon when no WebGL context exists (#45520)", async () => {
+    Object.defineProperty(window.navigator, "userAgent", {
+      configurable: true,
+      value: CHROME_UA,
+      writable: true,
+    });
+    stubCanvasContext(() => null);
+
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    expect(webglInstances).toHaveLength(0);
+  });
+
+  it("skips the WebGL addon on a software renderer like llvmpipe (#45520)", async () => {
+    Object.defineProperty(window.navigator, "userAgent", {
+      configurable: true,
+      value: CHROME_UA,
+      writable: true,
+    });
+    stubCanvasContext(() =>
+      ({
+        ...hardwareGl(),
+        getParameter: () => "llvmpipe (LLVM 21.1.8, 256 bits)",
+      }) as unknown as WebGLRenderingContext,
+    );
+
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    expect(webglInstances).toHaveLength(0);
+  });
+
+  it("disposes the WebGL addon when Bengali text arrives (#58685)", async () => {
+    Object.defineProperty(window.navigator, "userAgent", {
+      configurable: true,
+      value: CHROME_UA,
+      writable: true,
+    });
+    stubCanvasContext(hardwareGl);
+
+    await renderChat();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => socket.onopen?.());
+    expect(webglInstances).toHaveLength(1);
+    expect(webglInstances[0].disposed).toBe(false);
+
+    await act(async () => {
+      socket.onmessage?.({ data: "যুক্তাক্ষর প্রযুক্তি" });
+    });
+
+    expect(webglInstances[0].disposed).toBe(true);
   });
 });

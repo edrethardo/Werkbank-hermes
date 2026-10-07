@@ -80,8 +80,15 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(_web_server_chat, "_ws_client_reason", lambda ws: None)
     monkeypatch.setattr(_web_server_chat, "_build_sidecar_url", lambda channel: None)
     files = {}
-    monkeypatch.setattr(_web_server_chat, "_active_session_file_for_channel",
-                        lambda app, channel: files.setdefault(channel, tmp_path / f"{channel}.json"))
+
+    def fake_marker(app, channel):
+        # Register like production does: the handler treats an unregistered marker as its own
+        # fresh allocation and drops it when the tab reattaches to an existing PTY.
+        from hermes_cli.web_server import _get_pty_active_session_files
+        return _get_pty_active_session_files(app).setdefault(
+            channel, files.setdefault(channel, tmp_path / f"{channel}.json"))
+
+    monkeypatch.setattr(_web_server_chat, "_active_session_file_for_channel", fake_marker)
 
     async def fake_argv(**kw):
         resume = kw.get("resume")
@@ -93,6 +100,8 @@ def harness(monkeypatch, tmp_path):
         yield harness
     finally:
         _web_server_chat.PTY_REGISTRY._sessions.clear()
+        from hermes_cli.web_server import _get_pty_active_session_files
+        _get_pty_active_session_files(web_server.app).clear()
 
 
 def _session_frames(ws, n=1):
