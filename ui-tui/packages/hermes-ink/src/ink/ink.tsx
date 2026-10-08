@@ -45,8 +45,8 @@ import createRenderer, { type Renderer } from './renderer.js'
 import {
   cellAt,
   CellWidth,
-  CharPool,
   charInCellAt,
+  CharPool,
   createScreen,
   HyperlinkPool,
   isEmptyCellAt,
@@ -1072,6 +1072,7 @@ export default class Ink {
     const optimizeMs = performance.now() - tOptimize
     const hasDiff = optimized.length > 0
     const needsAltScreenErase = this.altScreenActive && this.needsEraseBeforePaint
+
     /* True when this frame erases or clears the physical screen. The terminal
      * drops the pixels of any reserved block along with everything else, and
      * Ink's diff cannot restore them (it models cells, not images) — so
@@ -1607,6 +1608,7 @@ export default class Ink {
 
       if (row === null || !this.isFrameBlockFree(row, block.rows)) {
         block.dirty = true
+
         continue
       }
 
@@ -1643,6 +1645,7 @@ export default class Ink {
         for (let i = 1; i < marker.length; i++) {
           if (charInCellAt(screen, x + i, y) !== marker[i]) {
             hit = false
+
             break
           }
         }

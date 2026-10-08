@@ -1175,7 +1175,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         applyProcessOutput(String(ev.payload?.process_id ?? ''), String(ev.payload?.chunk ?? ''))
 
         return
-
       case 'voice.transcript': {
         // Explicit user-intent stop: the user said (or typed) a bare stop
         // phrase. The backend already halted the capture loop and flipped

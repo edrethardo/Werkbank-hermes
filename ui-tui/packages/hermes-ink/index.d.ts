@@ -34,8 +34,8 @@ export type { TerminalTitlePair } from './src/ink/hooks/use-terminal-title.ts'
 export { useTerminalViewport } from './src/ink/hooks/use-terminal-viewport.ts'
 export { default as measureElement } from './src/ink/measure-element.ts'
 export {
-  createRoot,
   clearFrameBlock,
+  createRoot,
   forceRedraw,
   default as render,
   renderSync,

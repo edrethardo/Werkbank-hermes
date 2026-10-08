@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+
 import { describe, it } from 'vitest'
 
 import { imagePaths, mediaPaths } from '../lib/transcriptImages.js'
