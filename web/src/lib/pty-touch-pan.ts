@@ -54,6 +54,26 @@ const SYNTHESIZED_WHEEL_WINDOW_MS = 450;
 /** A single terminal row never scrolls further than this many pixels. */
 const MAX_ROW_HEIGHT_PX = 36;
 
+/**
+ * Fire the mousemove/mousedown/mouseup/click quartet ourselves at the tap point. Two
+ * separate things block a bare touch tap from activating an xterm link, and both must
+ * be worked around:
+ *   1. WebKit's `touch-action: none` suppresses its own synthesized mouse/click events
+ *      for every touch under the element (not only ones we preventDefault).
+ *   2. Even with a click delivered, xterm's link renderer only activates a link that
+ *      `_currentLink` already points at — and that is set by hover tracking on
+ *      `mousemove`, never by `mousedown`/`mouseup`/`click` alone. Skip the mousemove
+ *      and `activate()` is never called even though the click "worked".
+ */
+function dispatchSyntheticClick(target: EventTarget | null, clientX: number, clientY: number): void {
+  if (!(target instanceof Element)) return;
+  const opts = { bubbles: true, cancelable: true, clientX, clientY, button: 0 };
+  target.dispatchEvent(new MouseEvent("mousemove", opts));
+  target.dispatchEvent(new MouseEvent("mousedown", opts));
+  target.dispatchEvent(new MouseEvent("mouseup", opts));
+  target.dispatchEvent(new MouseEvent("click", opts));
+}
+
 export function installPtyTouchPan(
   term: PtyPanTerminal,
   host: HTMLElement,
@@ -98,28 +118,35 @@ export function installPtyTouchPan(
     }
     return null;
   };
+  let touchOriginX: number | null = null;
   const onTouchStart = (ev: TouchEvent) => {
     if (ev.touches.length !== 1) {
       touchId = null;
       touchY = null;
       touchOriginY = null;
+      touchOriginX = null;
       touchPanning = false;
       return;
     }
     touchId = ev.touches[0].identifier;
     touchY = ev.touches[0].clientY;
     touchOriginY = ev.touches[0].clientY;
+    touchOriginX = ev.touches[0].clientX;
     touchPanning = false;
   };
   const onTouchMove = (ev: TouchEvent) => {
     if (ev.touches.length !== 1 || touchId === null || touchY === null || touchOriginY === null) return;
     const touch = activeTouch(ev.touches);
     if (!touch) return;
-    ev.preventDefault();
-    ev.stopPropagation();
+    // Only claim the gesture once it is actually a pan. Calling preventDefault on
+    // every touchmove — even the sub-pixel jitter a stationary tap always produces —
+    // suppresses iOS Safari's synthesized mousedown/mouseup/click for that tap, and a
+    // link under the finger then never activates (it needs those synthetic events).
     if (!touchPanning && !isTouchPan(touchOriginY, touch.clientY)) {
       return;
     }
+    ev.preventDefault();
+    ev.stopPropagation();
     touchPanning = true;
     setCaretSuspended?.(true);
     const rowHeight = Math.min(
@@ -135,11 +162,21 @@ export function installPtyTouchPan(
   };
   const onTouchEnd = (ev: TouchEvent) => {
     if (!activeTouch(ev.touches)) {
-      if (touchPanning) suppressClickAfterPan = true;
+      if (touchPanning) {
+        suppressClickAfterPan = true;
+      } else if (touchOriginX !== null && touchOriginY !== null) {
+        // A real tap: dispatch a synthetic click ourselves. `touchRoot.style.touchAction
+        // = "none"` (below) makes WebKit drop its own synthesized mouse/click events for
+        // EVERY touch under this element — not just ones we preventDefault — so a link
+        // (or anything else relying on click) never fires natively. This is the
+        // documented WebKit behavior for touch-action:none, not a bug in this module.
+        dispatchSyntheticClick(ev.target, touchOriginX, touchOriginY);
+      }
       setCaretSuspended?.(false);
       touchId = null;
       touchY = null;
       touchOriginY = null;
+      touchOriginX = null;
       touchPanning = false;
     }
   };
