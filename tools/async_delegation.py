@@ -769,6 +769,11 @@ def _dispatch_admitted(
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
     executor = _get_executor(max(max_async_children, live_units))
+    # The parent turn may finish before this worker asks for consent. Keep its
+    # delivery surface alive until the actual worker exits (not just until a
+    # stale monitor marks the registry row finished).
+    from tools.approval import retain_gateway_notify
+    release_approval_surface = retain_gateway_notify(session_key)
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -795,8 +800,10 @@ def _dispatch_admitted(
     try:
         future = executor.submit(propagate_context_to_thread(_worker))
         future.add_done_callback(lambda _: retirement.release())
+        future.add_done_callback(lambda _: release_approval_surface())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
+        release_approval_surface()
         with _records_lock:
             _records.pop(delegation_id, None)
         with _DB_LOCK, _transaction() as conn:

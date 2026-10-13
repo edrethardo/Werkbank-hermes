@@ -118,6 +118,39 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# Detached runs own a notification lifetime, not an approval grant. Each lease
+# captures only the originating session's verified delivery callback.
+_gateway_notify_leases: dict[str, dict[object, object]] = {}
+
+
+def retain_gateway_notify(session_key: str):
+    """Retain this session's human delivery surface until detached work exits.
+
+    Returns an idempotent release callback. Never changes approval policy or
+    inherits another session's notifier. A new foreground turn takes priority.
+    """
+    token = object()
+    with _lock:
+        cb = _gateway_notify_cbs.get(session_key)
+        if cb is None:
+            leases = _gateway_notify_leases.get(session_key, {})
+            cb = next(reversed(leases.values()), None) if leases else None
+        if cb is None:
+            return lambda: None
+        _gateway_notify_leases.setdefault(session_key, {})[token] = cb
+
+    def release():
+        with _lock:
+            leases = _gateway_notify_leases.get(session_key)
+            if not leases or token not in leases:
+                return
+            del leases[token]
+            if not leases:
+                _gateway_notify_leases.pop(session_key, None)
+                if session_key not in _gateway_notify_cbs:
+                    for entry in _gateway_queues.pop(session_key, []):
+                        entry.event.set()
+    return release
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -132,8 +165,9 @@ def unregister_gateway_notify(session_key: str) -> None:
     they don't hang forever (agent run finished or interrupted)."""
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
-        for entry in _gateway_queues.pop(session_key, []):
-            entry.event.set()
+        if not _gateway_notify_leases.get(session_key):
+            for entry in _gateway_queues.pop(session_key, []):
+                entry.event.set()
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -538,7 +572,11 @@ def _user_approved(session_key: str, description: str) -> dict:
 
 def _gateway_notify_cb(session_key: str):
     with _lock:
-        return _gateway_notify_cbs.get(session_key)
+        cb = _gateway_notify_cbs.get(session_key)
+        if cb is not None:
+            return cb
+        leases = _gateway_notify_leases.get(session_key, {})
+        return next(reversed(leases.values()), None) if leases else None
 
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
