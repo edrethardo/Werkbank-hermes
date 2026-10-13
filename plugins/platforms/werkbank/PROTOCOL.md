@@ -172,3 +172,9 @@ produced; its fields are in the snapshot's `session`.
 * `state: "arbeitet"` while a turn runs (open `turn.start` in the buffer or a running agent),
   else `"wartet"`. `session` counts tools/errors since the board first resolved the session in this
   plugin process; `context_percent` is `null` (not available to the plugin yet).
+
+### Weitere Restgrenzen (Review 4)
+- Ohne uid gilt eine Antwort als bestätigt, sobald eine Assistant-Textzeile über ihrer Startmarke liegt. Schreibt eine In-place-Kompression alte Antworten mit neuen IDs neu, kann eine noch ungeschriebene Antwort ohne uid verworfen werden; sie fehlt, bis ihre Zeile geschrieben ist.
+- Das Ausblenden gepufferter Nutzernachrichten unter der kleinsten History-Zeile greift auch bei Rotation (Nachricht unter alter Session-ID gepuffert, Zeile in der neuen).
+- Ist die Antwortzeile leer oder kein Text, kommt `turn.done` ohne uid; die gepufferte Antwort verschwindet, sobald eine spätere bestätigt ist. Der Puffer ist Brücke, keine zweite History.
+- Wird ein Puffer mitten im Snapshot-Bau verdrängt und neu angelegt, kann eine neue, noch ungeschriebene Antwort kurz fehlen, bis ihre Zeile geschrieben ist.
