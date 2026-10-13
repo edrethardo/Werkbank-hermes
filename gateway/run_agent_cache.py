@@ -516,8 +516,11 @@ class GatewayAgentCacheMixin:
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
+        hook_reason: Optional[str] = None,  # fork: werkbank-chat
     ) -> None:
-        """Interrupt the current run and clear queued session state consistently."""
+        """Interrupt the current run and clear queued session state consistently.
+        ``hook_reason`` overrides the ``agent_loop_stopped`` reason (``plugin:<id>``) while the agent
+        still gets the control ``interrupt_reason``."""
         if not session_key:
             return
         state = self._peek_session_state(session_key)
@@ -545,7 +548,7 @@ class GatewayAgentCacheMixin:
                     "agent_loop_stopped",
                     session_key=session_key,
                     platform=source.platform.value if source.platform else "",
-                    reason=interrupt_reason,
+                    reason=hook_reason or interrupt_reason,  # fork: werkbank-chat
                     invalidation_reason=invalidation_reason,
                 )
             except Exception:

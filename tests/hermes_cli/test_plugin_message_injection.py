@@ -316,3 +316,92 @@ def test_origin_injection_never_lands_in_the_attached_cli():
 
     assert context.inject_message("x", origin=ORIGIN) is False
     assert cli._pending_input.empty() and cli._interrupt_queue.empty()
+
+
+# ── WB-1127: client_message_id, interrupt_session ───────────────────────────────────────────
+# fork: werkbank-chat
+
+
+def test_gateway_injection_forwards_client_message_id(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "hallo", session_key="agent:main:telegram:dm:42", client_message_id="wb-1",
+    ) is True
+    injector.assert_called_once_with(
+        session_key="agent:main:telegram:dm:42", content="hallo", plugin_id="notify-plugin",
+        client_message_id="wb-1",
+    )
+
+
+def test_gateway_injection_rejects_malformed_client_message_id(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    for bad in ("", 42, "x" * 257, "a\nb"):
+        assert context.inject_message(
+            "hallo", session_key="agent:main:telegram:dm:42", client_message_id=bad,
+        ) is False
+    injector.assert_not_called()
+
+
+class _InterruptHost:
+    def __init__(self, result=True):
+        self.calls = []
+        self.result = result
+
+    def _schedule_plugin_session_interrupt(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.result
+
+
+def test_interrupt_session_routes_to_gateway_with_plugin_identity_and_home(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    host = _InterruptHost()
+    manager.set_gateway_message_injector(host, MagicMock(return_value=True))
+
+    assert context.interrupt_session("agent:main:telegram:dm:42") is True
+    assert host.calls == [{
+        "session_key": "agent:main:telegram:dm:42", "plugin_id": "notify-plugin",
+        "plugin_home": manager.home_path,
+    }]
+
+
+def test_interrupt_session_requires_allow_gateway_injection(tmp_path, monkeypatch):
+    for entry in ({}, {"allow_gateway_injection": "true"}):
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        sub = tmp_path / str(len(entry))
+        sub.mkdir()
+        _write_plugin_config(sub, monkeypatch, entry)
+        context, manager = _context()
+        host = _InterruptHost()
+        manager.set_gateway_message_injector(host, MagicMock(return_value=True))
+        assert context.interrupt_session("agent:main:telegram:dm:42") is False
+        assert host.calls == []
+
+
+def test_interrupt_session_fails_closed(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    # no live gateway
+    assert context.interrupt_session("agent:main:telegram:dm:42") is False
+    # a host without the interrupt entry point
+    manager.set_gateway_message_injector(object(), MagicMock(return_value=True))
+    assert context.interrupt_session("agent:main:telegram:dm:42") is False
+    # a raising host
+    host = _InterruptHost()
+    host._schedule_plugin_session_interrupt = MagicMock(side_effect=RuntimeError("boom"))
+    manager.set_gateway_message_injector(host, MagicMock(return_value=True))
+    assert context.interrupt_session("agent:main:telegram:dm:42") is False
+    # no key
+    good = _InterruptHost()
+    manager.set_gateway_message_injector(good, MagicMock(return_value=True))
+    for bad in ("", None, 5):
+        assert context.interrupt_session(bad) is False
+    assert good.calls == []

@@ -455,3 +455,248 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+# ── WB-1127: client_message_id, plugin interrupt ────────────────────────────────────────────
+# fork: werkbank-chat
+
+
+def _plugin_home(tmp_path, monkeypatch, plugin_id="notify-plugin", allow=True):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(exist_ok=True)
+    entry = {"allow_gateway_injection": True} if allow else {}
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"entries": {plugin_id: entry}}})
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    return hermes_home
+
+
+def _live_runner(store, adapter) -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner.config = GatewayConfig()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._running = True
+    runner._draining = False
+    runner._background_tasks = set()
+    runner._queued_events = {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    return runner
+
+
+async def _drain(runner):
+    while runner._background_tasks:
+        await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_two_injected_messages_with_distinct_ids_stay_separate_user_messages(tmp_path, monkeypatch):
+    """Two Werkbank messages sent while a turn runs never fold into one: each is its own
+    ``user.message`` carrying its own ``client_message_id`` (WB-1127)."""
+    from gateway import session_events
+
+    _plugin_home(tmp_path, monkeypatch)
+    session_events._reset_for_tests()
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    source = _entry().origin
+    entry = store.get_or_create_session(source)
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()  # a turn is running
+    runner = _live_runner(store, adapter)
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    manager = PluginManager()
+    manager._discovered = True
+    seen: list[dict] = []
+    manager._hooks.setdefault(session_events.HOOK, []).append(lambda event, **_kw: seen.append(event))
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+
+    try:
+        with patch("hermes_cli.plugins._plugin_manager", manager):
+            runner._install_plugin_message_injector()
+            assert context.inject_message("erste", session_key=entry.session_key, client_message_id="wb-1") is True
+            await _drain(runner)
+            assert context.inject_message("zweite", session_key=entry.session_key, client_message_id="wb-2") is True
+            await _drain(runner)
+            assert session_events.wait_idle(5.0)
+            runner._clear_plugin_message_injector()
+    finally:
+        session_events._reset_for_tests()
+
+    head = adapter._pending_messages[entry.session_key]
+    queued = runner._queued_events[entry.session_key]
+    assert [head.text] + [e.text for e in queued] == ["erste", "zweite"]
+    assert head.metadata["client_message_id"] == "wb-1"
+    assert queued[0].metadata["client_message_id"] == "wb-2"
+    users = [e for e in seen if e["type"] == "user.message"]
+    assert [(e["id"], e["payload"]["client_message_id"], e["payload"]["text"]) for e in users] == [
+        ("wb-1", "wb-1", "erste"), ("wb-2", "wb-2", "zweite")]
+    assert all("merged_into" not in e["payload"] for e in users)
+    assert {e["origin"] for e in users} == {"notify-plugin"}
+    adapter._message_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_distinct_client_message_ids_never_share_a_pending_slot(tmp_path):
+    """``client_message_id`` is a security-context key: even a photo burst (the one case the
+    pending slot still merges) keeps two differently-identified messages apart."""
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    source = _entry().origin
+    entry = store.get_or_create_session(source)
+    adapter = _RoutingAdapter()
+    runner = _live_runner(store, adapter)
+
+    def _photo(cid, url):
+        return MessageEvent(
+            text="", message_type=MessageType.PHOTO, source=source, internal=True,
+            allow_gateway_control=False, media_urls=[url], media_types=["image/jpeg"],
+            metadata={"hermes_plugin_id": "notify-plugin", "hermes_plugin_injection": True,
+                      "gateway_session_key": entry.session_key, "client_message_id": cid},
+        )
+
+    first, second = _photo("wb-1", "a.jpg"), _photo("wb-2", "b.jpg")
+    runner._queue_or_replace_pending_event(entry.session_key, first)
+    runner._queue_or_replace_pending_event(entry.session_key, second)
+
+    assert adapter._pending_messages[entry.session_key] is first
+    assert first.media_urls == ["a.jpg"]
+    assert runner._queued_events[entry.session_key] == [second]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_carries_client_message_id_into_metadata():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="hallo", plugin_id="werkbank", client_message_id="wb-7",
+    ) is True
+    assert adapter.handle_message.await_args.args[0].metadata["client_message_id"] == "wb-7"
+
+
+def _stop_runner(entry, adapter=None):
+    runner = _runner(entry, adapter or SimpleNamespace(send=AsyncMock()))
+    runner.config = GatewayConfig()
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_plugin_interrupt_session_stops_running_turn_like_stop(tmp_path, monkeypatch):
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    home = _plugin_home(tmp_path, monkeypatch)
+    entry = _entry()
+    runner = _stop_runner(entry)
+    runner._gateway_loop = asyncio.get_running_loop()
+    agent = MagicMock()
+    runner._running_agents[entry.session_key] = agent
+    manager = PluginManager(scope_key=str(home))
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+
+    with patch("hermes_cli.plugins._plugin_manager", manager), \
+            patch("hermes_constants.get_routing_process_hermes_home", return_value=home), \
+            patch("hermes_cli.plugins.invoke_hook") as hook:
+        runner._install_plugin_message_injector()
+        assert context.interrupt_session(entry.session_key) is True
+        await _drain(runner)
+        runner._clear_plugin_message_injector()
+
+    # Same hard interrupt /stop sends (a control reason, never replayed as user text) ...
+    agent.interrupt.assert_called_once_with(_INTERRUPT_REASON_STOP)
+    # ... and the hook names the plugin as the issuer.
+    hook.assert_any_call(
+        "agent_loop_stopped", session_key=entry.session_key, platform="telegram",
+        reason="plugin:notify-plugin", invalidation_reason="plugin_interrupt",
+    )
+    assert entry.session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
+async def test_plugin_interrupt_session_needs_allow_gateway_injection(tmp_path, monkeypatch):
+    home = _plugin_home(tmp_path, monkeypatch, allow=False)
+    entry = _entry()
+    runner = _stop_runner(entry)
+    runner._gateway_loop = asyncio.get_running_loop()
+    agent = MagicMock()
+    runner._running_agents[entry.session_key] = agent
+    manager = PluginManager(scope_key=str(home))
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+
+    with patch("hermes_cli.plugins._plugin_manager", manager), \
+            patch("hermes_constants.get_routing_process_hermes_home", return_value=home), \
+            patch("hermes_cli.plugins.invoke_hook") as hook:
+        runner._install_plugin_message_injector()
+        assert context.interrupt_session(entry.session_key) is False
+        await _drain(runner)
+        runner._clear_plugin_message_injector()
+
+    agent.interrupt.assert_not_called()
+    assert runner._running_agents[entry.session_key] is agent
+    assert not [c for c in hook.call_args_list if c.args and c.args[0] == "agent_loop_stopped"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_interrupt_session_refuses_other_profiles_sessions(tmp_path, monkeypatch):
+    """Security: a plugin stops only sessions of its own profile (multiplex: the key namespace;
+    single-profile: a plugin of another home is not served by this gateway at all)."""
+    import gateway.run as gateway_run
+
+    coder_home, other_home = tmp_path / "coder", tmp_path / "other"
+    coder_home.mkdir()
+    other_home.mkdir()
+    entry = _entry()
+    runner = _stop_runner(entry)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._gateway_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(gateway_run, "_multiplex_profile_homes",
+                        lambda _cfg: [("coder", coder_home), ("other", other_home)])
+    foreign, own = "agent:other:telegram:dm:42", "agent:coder:telegram:dm:42"
+    foreign_agent, own_agent = MagicMock(), MagicMock()
+    runner._running_agents[foreign] = foreign_agent
+    runner._running_agents[own] = own_agent
+
+    with patch("hermes_cli.plugins.invoke_hook"):
+        assert runner._schedule_plugin_session_interrupt(
+            session_key=foreign, plugin_id="werkbank", plugin_home=coder_home) is False
+        assert runner._schedule_plugin_session_interrupt(
+            session_key="not-a-gateway-key", plugin_id="werkbank", plugin_home=coder_home) is False
+        assert runner._schedule_plugin_session_interrupt(
+            session_key=own, plugin_id="werkbank", plugin_home=tmp_path / "unserved") is False
+        await _drain(runner)
+        foreign_agent.interrupt.assert_not_called()
+        own_agent.interrupt.assert_not_called()
+
+        assert runner._schedule_plugin_session_interrupt(
+            session_key=own, plugin_id="werkbank", plugin_home=coder_home) is True
+        await _drain(runner)
+    own_agent.interrupt.assert_called_once()
+    foreign_agent.interrupt.assert_not_called()
+
+    # Single-profile gateway: a plugin manager of another home cannot reach its sessions.
+    runner.config = GatewayConfig()
+    runner._running_agents[entry.session_key] = foreign_agent
+    with patch("hermes_constants.get_routing_process_hermes_home", return_value=coder_home):
+        assert runner._schedule_plugin_session_interrupt(
+            session_key=entry.session_key, plugin_id="werkbank", plugin_home=other_home) is False
+    await _drain(runner)
+    foreign_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_plugin_interrupt_session_without_running_turn_is_false(tmp_path):
+    entry = _entry()
+    runner = _stop_runner(entry)
+    runner._gateway_loop = asyncio.get_running_loop()
+    with patch("hermes_constants.get_routing_process_hermes_home", return_value=tmp_path):
+        assert runner._schedule_plugin_session_interrupt(
+            session_key=entry.session_key, plugin_id="werkbank", plugin_home=tmp_path) is False
+    assert runner._background_tasks == set()

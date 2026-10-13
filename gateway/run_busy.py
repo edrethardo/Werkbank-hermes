@@ -379,6 +379,7 @@ class GatewayBusySessionMixin:
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
         "gateway_session_id", "gateway_session_strict",
         "notification_category",
+        "client_message_id",  # sender's own id: two Werkbank messages never share a slot  # fork: werkbank-chat
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:

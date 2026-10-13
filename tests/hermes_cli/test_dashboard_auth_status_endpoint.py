@@ -65,7 +65,9 @@ def test_status_reports_auth_required_in_gated_mode(gated_client):
     body = r.json()
     assert body["auth_required"] is True
     assert body["auth_providers"] == ["stub"]
-    assert body["capabilities"]["structured_chat"] is True
+    # WB-1127: the structured-chat surface is gone, so the status no longer advertises it.  # fork: werkbank-chat
+    assert "structured_chat" not in body.get("capabilities", {})  # fork: werkbank-chat
+    assert "capabilities" not in body  # fork: werkbank-chat
 
 
 

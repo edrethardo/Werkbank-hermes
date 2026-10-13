@@ -22,6 +22,20 @@ from gateway.session import SessionSource
 logger = logging.getLogger("gateway.run")
 
 
+def _client_message_id_meta(client_message_id: Optional[str]) -> dict:  # fork: werkbank-chat
+    """Metadata entry for a sender-chosen message id (absent when none was given)."""
+    return {"client_message_id": client_message_id} if client_message_id else {}  # fork: werkbank-chat
+
+
+def _session_key_profile(session_key: str) -> Optional[str]:  # fork: werkbank-chat
+    """Profile named by a gateway key's ``agent:<ns>`` slot, ``None`` for a non-gateway key."""
+    parts = session_key.split(":")  # fork: werkbank-chat
+    if len(parts) < 3 or parts[0] != "agent" or not parts[1]:  # fork: werkbank-chat
+        return None  # fork: werkbank-chat
+    from gateway.session import profile_from_session_key_namespace  # fork: werkbank-chat
+    return profile_from_session_key_namespace(parts[1])  # fork: werkbank-chat
+
+
 class GatewayPluginInjectionMixin:
     def _install_plugin_message_injector(self) -> None:
         """Publish this live gateway's plugin message scheduler process-wide."""
@@ -38,12 +52,12 @@ class GatewayPluginInjectionMixin:
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
+        client_message_id: Optional[str] = None,  # fork: werkbank-chat
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
         With ``origin`` the profile, origin and adapter checks run here, synchronously, so the plugin
         gets ``False`` for a chat it may not start; authorization is rechecked at dispatch."""
-        from gateway.run import safe_schedule_threadsafe
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
@@ -53,12 +67,22 @@ class GatewayPluginInjectionMixin:
             if source is None:
                 return False
             target = f"origin={source.platform.value}/{source.chat_id}"
-            coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id)
+            coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id,
+                                                          client_message_id=client_message_id)  # fork: werkbank-chat
         else:
             target = f"session={session_key}"
             coro = self._dispatch_plugin_message_injection(
                 session_key=session_key, content=content, plugin_id=plugin_id,
+                client_message_id=client_message_id,  # fork: werkbank-chat
             )
+        return self._submit_plugin_coroutine(coro, loop, plugin_id=plugin_id, target=target,  # fork: werkbank-chat
+                                             what="Plugin message injection")  # fork: werkbank-chat
+
+    def _submit_plugin_coroutine(  # fork: werkbank-chat
+        self, coro, loop, *, plugin_id: str, target: str, what: str,
+    ) -> bool:
+        """Run *coro* on the gateway loop from any thread; log a falsy or failed result."""
+        from gateway.run import safe_schedule_threadsafe
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -69,13 +93,13 @@ class GatewayPluginInjectionMixin:
                 future = loop.create_task(coro)
             except Exception:
                 coro.close()
-                logger.warning("Plugin message injection scheduling failed", exc_info=True)
+                logger.warning("%s scheduling failed", what, exc_info=True)  # fork: werkbank-chat
                 return False
             self._background_tasks.add(future)
             future.add_done_callback(self._background_tasks.discard)
         else:
             future = safe_schedule_threadsafe(
-                coro, loop, logger=logger, log_message="Plugin message injection scheduling failed",
+                coro, loop, logger=logger, log_message=f"{what} scheduling failed",  # fork: werkbank-chat
                 log_level=logging.WARNING,
             )
             if future is None:
@@ -88,9 +112,9 @@ class GatewayPluginInjectionMixin:
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
                 return
             except Exception:  # dispatch boundary: the plugin already got True; log, never raise
-                logger.warning("Plugin message injection failed: plugin=%s %s", plugin_id, target, exc_info=True)
+                logger.warning("%s failed: plugin=%s %s", what, plugin_id, target, exc_info=True)  # fork: werkbank-chat
                 return
-            logger.warning("Plugin message injection was not routed: plugin=%s %s", plugin_id, target)
+            logger.warning("%s was not routed: plugin=%s %s", what, plugin_id, target)  # fork: werkbank-chat
 
         future.add_done_callback(_log_result)
         return True
@@ -124,7 +148,8 @@ class GatewayPluginInjectionMixin:
         return authorized
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        client_message_id: Optional[str] = None,  # fork: werkbank-chat
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not self._plugin_injection_accepting():
@@ -150,6 +175,7 @@ class GatewayPluginInjectionMixin:
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                     "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                     "gateway_session_strict": True,
+                    **_client_message_id_meta(client_message_id),  # fork: werkbank-chat
                 },
             ))
         logger.info(
@@ -216,7 +242,8 @@ class GatewayPluginInjectionMixin:
         return source
 
     async def _dispatch_plugin_origin_injection(
-        self, *, source: SessionSource, content: str, plugin_id: str
+        self, *, source: SessionSource, content: str, plugin_id: str,
+        client_message_id: Optional[str] = None,  # fork: werkbank-chat
     ) -> bool:
         """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
@@ -238,7 +265,74 @@ class GatewayPluginInjectionMixin:
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                     "gateway_session_key": session_key,
+                    **_client_message_id_meta(client_message_id),  # fork: werkbank-chat
                 },
             ))
         logger.info("Plugin message injection dispatched: plugin=%s %s session=%s", plugin_id, target, session_key)
+        return True
+
+    # ── plugin stop (PluginContext.interrupt_session) ─────────────────────────────  # fork: werkbank-chat
+
+    def _plugin_session_in_own_profile(  # fork: werkbank-chat
+        self, session_key: str, *, plugin_home: Optional[Path], plugin_id: str,
+    ) -> bool:
+        """True when *session_key* belongs to the profile the plugin's manager lives in.
+
+        The plugin's home must be served by this gateway. Multiplexed, the key's ``agent:<ns>``
+        namespace must name that profile; single-profile, every key of this gateway belongs to
+        its one served home."""
+        profile = self._served_profile_for_home(plugin_home)
+        if profile is None:
+            logger.warning("Plugin interrupt refused: plugin=%s profile home %s is not served by this gateway",
+                           plugin_id, plugin_home)
+            return False
+        key_profile = _session_key_profile(session_key)
+        if key_profile is None:
+            logger.warning("Plugin interrupt refused: plugin=%s %r is not a gateway session key", plugin_id, session_key)
+            return False
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False) is True and key_profile != profile:
+            logger.warning("Plugin interrupt refused: plugin=%s session %s belongs to profile %s, not %s",
+                           plugin_id, session_key, key_profile, profile)
+            return False
+        return True
+
+    def _schedule_plugin_session_interrupt(  # fork: werkbank-chat
+        self, *, session_key: str, plugin_id: str, plugin_home: Optional[Path] = None,
+    ) -> bool:
+        """Schedule a ``/stop``-equivalent for *session_key* (thread-safe). ``False`` when refused
+        (gateway down, foreign profile) or when no turn runs under that key."""
+        loop = getattr(self, "_gateway_loop", None)
+        if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+            return False
+        if not isinstance(session_key, str) or not session_key:
+            return False
+        if not self._plugin_session_in_own_profile(session_key, plugin_home=plugin_home, plugin_id=plugin_id):
+            return False
+        if self._running_agents.get(session_key) is None:
+            return False
+        coro = self._dispatch_plugin_session_interrupt(session_key=session_key, plugin_id=plugin_id)
+        return self._submit_plugin_coroutine(coro, loop, plugin_id=plugin_id, target=f"session={session_key}",
+                                             what="Plugin interrupt")
+
+    async def _dispatch_plugin_session_interrupt(self, *, session_key: str, plugin_id: str) -> bool:  # fork: werkbank-chat
+        """Run the ``/stop`` interrupt for a plugin: same hard interrupt and cleanup, the
+        ``agent_loop_stopped`` hook attributed to ``plugin:<plugin_id>``."""
+        if not getattr(self, "_running", False):
+            return False
+        entry = await self.async_session_store.lookup_by_session_key(session_key)
+        if entry is None or entry.origin is None:
+            return False
+        from gateway.session_identity import replace_source
+        source = replace_source(self._restored_source(entry))
+        if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
+            return False
+        if self._running_agents.get(session_key) is None:
+            return False
+        from gateway.run import _INTERRUPT_REASON_STOP
+        async with self._plugin_injection_scope(source):
+            await self._interrupt_and_clear_session(
+                session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+                invalidation_reason="plugin_interrupt", hook_reason=f"plugin:{plugin_id}",
+            )
+        logger.info("Plugin interrupt: plugin=%s session=%s", plugin_id, session_key)
         return True

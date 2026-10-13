@@ -606,6 +606,7 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
+        client_message_id: str | None = None,  # fork: werkbank-chat
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -618,9 +619,24 @@ class PluginContext:
         target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
         ``True`` means a host accepted the request, not that the turn completed.
+        ``client_message_id`` (gateway only; a short single-line string) is the sender's own id for
+        this message: it rides in ``MessageEvent.metadata``, keeps two messages from sharing a
+        pending slot, and comes back as the ``user.message`` session event's id.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
+                                     client_message_id=client_message_id)  # fork: werkbank-chat
+
+    def interrupt_session(self, session_key: str) -> bool:  # fork: werkbank-chat
+        """Stop the running turn of a messaging-gateway session the way ``/stop`` does.
+
+        Same consent as :meth:`inject_message` (``plugins.entries.<plugin_id>.allow_gateway_injection``
+        in the plugin's own profile), and only sessions of the plugin's own profile. The hook
+        ``agent_loop_stopped`` fires with ``reason="plugin:<plugin_id>"``. ``True`` means a turn was
+        running and the stop was scheduled; ``False`` means refused or nothing to stop.
+        """
+        from hermes_cli.plugins_injection import interrupt_plugin_session  # fork: werkbank-chat
+        return interrupt_plugin_session(self, session_key)  # fork: werkbank-chat
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns (read from the plugin's
@@ -1346,6 +1362,12 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Submit a plugin-triggered turn to the live gateway."""
         registered = self._gateway_message_injector
         return registered is not None and bool(registered[1](**kwargs))
+
+    def interrupt_gateway_session(self, **kwargs: Any) -> bool:  # fork: werkbank-chat
+        """Ask the live gateway that owns the injector to stop a session's running turn."""
+        registered = self._gateway_message_injector  # fork: werkbank-chat
+        interrupter = getattr(registered[0], "_schedule_plugin_session_interrupt", None) if registered else None  # fork: werkbank-chat
+        return callable(interrupter) and bool(interrupter(**kwargs))  # fork: werkbank-chat
 
     @property
     def has_tui_message_injector(self) -> bool:

@@ -9,9 +9,18 @@ from typing import Any, Optional
 logger = logging.getLogger("hermes_cli.plugins")
 
 
+_CLIENT_MESSAGE_ID_MAX = 256  # fork: werkbank-chat
+
+
+def _valid_client_message_id(value: Any) -> bool:  # fork: werkbank-chat
+    """A sender-chosen id: a non-empty, single-line string of bounded length."""
+    return (isinstance(value, str) and 0 < len(value) <= _CLIENT_MESSAGE_ID_MAX  # fork: werkbank-chat
+            and value.isprintable())  # fork: werkbank-chat
+
+
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
-    origin: Optional[Mapping[str, Any]],
+    origin: Optional[Mapping[str, Any]], client_message_id: Optional[str] = None,  # fork: werkbank-chat
 ) -> bool:
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
@@ -30,6 +39,9 @@ def inject_plugin_message(
     if origin is not None and not isinstance(origin, Mapping):
         logger.warning("inject_message: origin must be a mapping in the SessionSource.to_dict() shape")
         return False
+    if client_message_id is not None and not _valid_client_message_id(client_message_id):  # fork: werkbank-chat
+        logger.warning("inject_message: client_message_id must be a short single-line string")  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
     if not ctx._gateway_injection_allowed():
         logger.warning("inject_message: gateway injection denied for plugin %s; set "
                        "plugins.entries.%s.allow_gateway_injection: true to allow it",
@@ -55,8 +67,35 @@ def inject_plugin_message(
         # The manager's immutable home is the plugin's profile: the gateway creates the session
         # there or nowhere (never the ambient HERMES_HOME of whatever thread called us).
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
+    if client_message_id is not None:  # fork: werkbank-chat
+        target["client_message_id"] = client_message_id  # fork: werkbank-chat
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:
         logger.warning("inject_message: gateway scheduling failed for plugin %s", ctx.plugin_id, exc_info=True)
         return False
+
+
+def interrupt_plugin_session(ctx: Any, session_key: Any) -> bool:  # fork: werkbank-chat
+    """Stop a gateway session's running turn for ``PluginContext.interrupt_session``.
+
+    Gateway only (the REPL and the TUI have their own stop keys). Same consent as injection; the
+    gateway checks that the key belongs to the plugin's own profile (``plugin_home``)."""
+    if not isinstance(session_key, str) or not session_key.strip():  # fork: werkbank-chat
+        logger.warning("interrupt_session: a gateway session_key is required")  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    if not ctx._gateway_injection_allowed():  # fork: werkbank-chat
+        logger.warning("interrupt_session: denied for plugin %s; set "  # fork: werkbank-chat
+                       "plugins.entries.%s.allow_gateway_injection: true to allow it",  # fork: werkbank-chat
+                       ctx.plugin_id, ctx.plugin_id)  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    manager = ctx._manager  # fork: werkbank-chat
+    if not manager.has_gateway_message_injector:  # fork: werkbank-chat
+        logger.warning("interrupt_session: no live gateway is available")  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    try:  # fork: werkbank-chat
+        return bool(manager.interrupt_gateway_session(  # fork: werkbank-chat
+            session_key=session_key, plugin_id=ctx.plugin_id, plugin_home=manager.home_path))  # fork: werkbank-chat
+    except Exception:  # fork: werkbank-chat
+        logger.warning("interrupt_session: gateway scheduling failed for plugin %s", ctx.plugin_id, exc_info=True)  # fork: werkbank-chat
+        return False  # fork: werkbank-chat

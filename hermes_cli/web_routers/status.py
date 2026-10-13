@@ -386,8 +386,7 @@ def _auth_gate_status() -> Dict[str, Any]:
         # Module not importable yet (early startup) — leave as [].
         pass
     return {"auth_required": auth_required, "auth_providers": auth_providers,
-            "auth_flows": auth_flows,
-            "capabilities": {"structured_chat": True}}
+            "auth_flows": auth_flows}  # fork: werkbank-chat (structured_chat capability removed, WB-1127)
 
 
 def _nous_session_validity() -> str:
