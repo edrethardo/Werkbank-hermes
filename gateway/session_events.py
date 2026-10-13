@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re  # fork: werkbank-chat
 import logging
 import threading
 import time
@@ -330,25 +331,59 @@ def redact_command(command: Any) -> str:
 
 _REDACT_WINDOW_CHARS = 64 * 1024  # fork: werkbank-chat — only this prefix runs through the redaction regexes
 _TRUNCATED_MARK = "[truncated]"  # fork: werkbank-chat
+_PEM_END_RE = re.compile(r"-----END[A-Z0-9 ]*-----")  # fork: werkbank-chat — only a complete END closes a block
+
+
+def _open_secret_field_re() -> "re.Pattern[str]":  # fork: werkbank-chat
+    try:  # fork: werkbank-chat
+        from agent.redact import _JSON_KEY_NAMES as names  # fork: werkbank-chat
+    except Exception:  # fork: werkbank-chat
+        names = r"(?:api_?key|token|secret|password)"  # fork: werkbank-chat
+    return re.compile(rf'(\\*)"{names}\1"\s*:\s*\1"[^"]*$', re.IGNORECASE)  # fork: werkbank-chat
+
+
+_OPEN_SECRET_FIELD_RE = _open_secret_field_re()  # fork: werkbank-chat — a secret JSON value cut before its closing quote
 
 
 def _drop_open_block(text: str) -> tuple[str, bool]:  # fork: werkbank-chat
-    """Cut *text* at the first ``-----BEGIN`` with no ``-----END`` after it.
+    """Cut *text* at the first ``-----BEGIN`` behind the last *complete* ``-----END …-----`` marker.
 
     A PEM block is only recognised (and redacted) as a whole BEGIN…END span; one whose END lies
-    behind a cut is plain key material line by line, so nothing from its BEGIN on may be shown.
+    behind a cut is plain key material line by line, so nothing from its BEGIN on may be shown. A
+    cut END line (``-----END RSA PRIVATE``) does not close a block.
     """
-    begin = text.find("-----BEGIN", text.rfind("-----END") + 1)  # fork: werkbank-chat
+    ends = [m.end() for m in _PEM_END_RE.finditer(text)]  # fork: werkbank-chat
+    begin = text.find("-----BEGIN", ends[-1] if ends else 0)  # fork: werkbank-chat
     if begin == -1:  # fork: werkbank-chat
         return text, False  # fork: werkbank-chat
     return text[:begin], True  # fork: werkbank-chat
+
+
+def _window_head(value: str) -> str:  # fork: werkbank-chat
+    """The redaction window of *value*, cut so no line (or token) is split.
+
+    Everything after the window's last line break is dropped: a secret the redactor only knows as
+    a whole (a PEM END line, ``"password": "correct horse …"``) is no longer recognised once cut.
+    A window without any line break falls back to its last whitespace, minus a trailing secret
+    field whose value is still open.
+    """
+    head = value[:_REDACT_WINDOW_CHARS]  # fork: werkbank-chat
+    if value[_REDACT_WINDOW_CHARS] == "\n":  # fork: werkbank-chat
+        return head  # fork: werkbank-chat
+    nl = head.rfind("\n")  # fork: werkbank-chat
+    if nl != -1:  # fork: werkbank-chat
+        return head[: nl + 1]  # fork: werkbank-chat
+    if not value[_REDACT_WINDOW_CHARS].isspace():  # fork: werkbank-chat
+        head = head[: max(head.rfind(" "), head.rfind("\t"), 0)]  # fork: werkbank-chat
+    open_field = _OPEN_SECRET_FIELD_RE.search(head)  # fork: werkbank-chat
+    return head[: open_field.start()] if open_field else head  # fork: werkbank-chat
 
 
 def _capped(value: Any, limit: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
     """Redacted text of at most *limit* UTF-8 bytes, and whether anything was cut.
 
     Only a 64 KB prefix is redacted (a multi-MB tool output never runs through the redaction
-    regexes). The token that window cut splits is dropped before redaction (a secret cut in half
+    regexes). The line that window cut splits is dropped before redaction (a secret cut in half
     is no longer recognised), and so is everything from a ``-----BEGIN`` whose ``-----END`` lies
     behind the window or behind the byte cap. What was dropped that way ends in ``[truncated]``.
     """
@@ -363,10 +398,7 @@ def _capped(value: Any, limit: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
         return "", False  # fork: werkbank-chat
     truncated = len(value) > _REDACT_WINDOW_CHARS  # fork: werkbank-chat
     if truncated:  # fork: werkbank-chat
-        head = value[:_REDACT_WINDOW_CHARS]  # fork: werkbank-chat
-        if not value[_REDACT_WINDOW_CHARS].isspace():  # fork: werkbank-chat
-            head = head[: max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"), 0)]  # fork: werkbank-chat
-        value = head  # fork: werkbank-chat
+        value = _window_head(value)  # fork: werkbank-chat
     text, marked = _drop_open_block(_redact(value))  # fork: werkbank-chat
     truncated = truncated or marked  # fork: werkbank-chat
     raw = text.encode("utf-8")  # fork: werkbank-chat

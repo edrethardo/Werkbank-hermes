@@ -869,3 +869,80 @@ def test_capped_single_token_secret_split_by_the_window_is_dropped():
     assert raw.index(secret) < session_events._REDACT_WINDOW_CHARS < raw.index(secret) + len(secret)
     text, truncated = session_events._capped(raw, 10**6)
     assert truncated and "sk-proj" not in text and "Z9Z9" not in text
+
+
+# ── _capped: the window cut never lands inside a line (review 3 WB-1126) ─────────────────
+
+
+_DASH5 = "-" * 5
+
+
+def _keyblock(kind: str = "RSA", lines: int = 130, marker: str = "MIIJKQIBAAKCAgEA") -> str:
+    body = "\n".join((marker + "q7Lm9Zx3" * 6)[:64] for _ in range(lines))
+    return (_DASH5 + "BEGIN " + kind + " PRIVATE KEY" + _DASH5 + "\n" + body + "\n"
+            + _DASH5 + "END " + kind + " PRIVATE KEY" + _DASH5 + "\n")
+
+
+@pytest.mark.parametrize("offset", range(-80, 81))
+def test_capped_window_cut_inside_the_end_line_does_not_leak(offset):
+    # Review 3 repro (a): the window boundary walks across the END line ('-----END RSA PRIVATE'
+    # without its closing dashes) and the body lines before it.
+    key = _keyblock()
+    window = session_events._REDACT_WINDOW_CHARS
+    raw = "p" * (window - len(key) + offset) + "\n" + key + "after\n"
+    text, _truncated = session_events._capped(raw, 10**6)
+    assert _no_key_material(text), (offset, text[-300:])
+
+
+@pytest.mark.parametrize("offset", range(-80, 81, 4))
+def test_capped_window_cut_after_shrinking_redaction_does_not_leak_at_the_default_cap(offset):
+    # Review 3 repro (b): redacted keys before the cut shrink the text so far that a key cut by the
+    # window inside its END line fits the default 4 KB cap.
+    big, small = _keyblock(), _keyblock("EC", 3, "MHcCAQEEIBkg")
+    key = _keyblock(lines=25)
+    window = session_events._REDACT_WINDOW_CHARS
+    free = window - len(key) - 300
+    m = free // len(big)
+    n = (free - m * len(big)) // len(small)
+    rest = window - m * len(big) - n * len(small) - len(key) - 1 + offset
+    raw = big * m + small * n + "x" * rest + "\n" + key + "after\n"
+    assert 0 <= rest < 600
+    text, _truncated = session_events._capped(raw)
+    assert len(text.encode()) <= session_events.TEXT_CAP_BYTES
+    assert _no_key_material(text), (offset, text[-300:])
+
+
+@pytest.mark.parametrize("cut_after", ["correct", "correct horse", "correct horse battery"])
+def test_capped_json_secret_with_spaces_at_the_window_edge_does_not_leak(cut_after):
+    line = '  "password": "correct horse battery staple",\n'
+    window = session_events._REDACT_WINDOW_CHARS
+    head = '{\n  "user": "aaron",\n'
+    pad = "x" * (window - len(head) - len(line.split(cut_after)[0]) - len(cut_after) - 1) + "\n"
+    raw = pad + head + line + "}\n"
+    assert raw[:window].endswith(cut_after)
+    text, truncated = session_events._capped(raw, 10**6)
+    assert truncated
+    assert "correct" not in text and "horse" not in text, text[-200:]
+
+
+def test_capped_single_line_json_secret_with_spaces_at_the_window_edge_does_not_leak():
+    window = session_events._REDACT_WINDOW_CHARS
+    prefix = '{"log": "' + "x " * ((window - 100) // 2) + '", "password": "correct horse'
+    raw = prefix + " " + "b" * (window - len(prefix) + 5) + ' staple"}'
+    assert len(prefix) < window < len(raw) and "\n" not in raw
+    text, truncated = session_events._capped(raw, 10**6)
+    assert truncated and "correct" not in text and "horse" not in text, text[-200:]
+
+
+def test_drop_open_block_ignores_an_incomplete_end_marker():
+    key = _keyblock()
+    cut = key[: key.rindex(_DASH5 + "END") + len(_DASH5 + "END RSA PRIVATE")]
+    text, dropped = session_events._drop_open_block("keep\n" + cut)
+    assert dropped and text == "keep\n"
+
+
+def test_capped_complete_lines_before_the_window_cut_survive():
+    window = session_events._REDACT_WINDOW_CHARS
+    raw = "line\n" * (window // 5 + 100)
+    text, truncated = session_events._capped(raw, 10**6)
+    assert truncated and text.startswith("line\nline\n") and "line" in text[-30:]
