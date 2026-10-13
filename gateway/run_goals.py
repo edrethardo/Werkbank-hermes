@@ -315,7 +315,9 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                from gateway import session_events  # fork: werkbank-chat
+                _turn = session_events.mark_synthetic(self._synthetic_prompt_event(source, prompt), "goal_continuation")  # fork: werkbank-chat
+                self._enqueue_fifo(_quick_key, _turn, adapter)  # fork: werkbank-chat
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 

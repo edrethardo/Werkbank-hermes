@@ -854,6 +854,8 @@ class GatewayBusySessionMixin:
             return True
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.user_message(session_key, event, "eingereiht")  # default path parks it  # fork: werkbank-chat
             return False  # let default path handle it
         # Internal synthetic events (delegation / background completions) must never interrupt or
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so

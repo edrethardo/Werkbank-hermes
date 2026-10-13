@@ -328,13 +328,29 @@ def redact_command(command: Any) -> str:
         return ""
 
 
+_REDACT_WINDOW_CHARS = 64 * 1024  # fork: werkbank-chat — only this prefix runs through the redaction regexes
+_TRUNCATED_MARK = "[truncated]"  # fork: werkbank-chat
+
+
+def _drop_open_block(text: str) -> tuple[str, bool]:  # fork: werkbank-chat
+    """Cut *text* at the first ``-----BEGIN`` with no ``-----END`` after it.
+
+    A PEM block is only recognised (and redacted) as a whole BEGIN…END span; one whose END lies
+    behind a cut is plain key material line by line, so nothing from its BEGIN on may be shown.
+    """
+    begin = text.find("-----BEGIN", text.rfind("-----END") + 1)  # fork: werkbank-chat
+    if begin == -1:  # fork: werkbank-chat
+        return text, False  # fork: werkbank-chat
+    return text[:begin], True  # fork: werkbank-chat
+
+
 def _capped(value: Any, limit: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
     """Redacted text of at most *limit* UTF-8 bytes, and whether anything was cut.
 
-    Only a ~2x *limit* prefix is redacted (a multi-MB tool output never runs through the
-    redaction regexes). The token the pre-cut splits is dropped before redaction: redaction can
-    shrink the text and pull that boundary into view, and a secret cut in half is no longer
-    recognised by the redactor.
+    Only a 64 KB prefix is redacted (a multi-MB tool output never runs through the redaction
+    regexes). The token that window cut splits is dropped before redaction (a secret cut in half
+    is no longer recognised), and so is everything from a ``-----BEGIN`` whose ``-----END`` lies
+    behind the window or behind the byte cap. What was dropped that way ends in ``[truncated]``.
     """
     if value is None:
         return "", False
@@ -343,17 +359,25 @@ def _capped(value: Any, limit: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
             value = json.dumps(value, ensure_ascii=False, default=str)
         except Exception:
             value = str(value)
-    precut = len(value) > 2 * limit
-    if precut:
-        head = value[: 2 * limit]
-        if not value[2 * limit].isspace():
-            head = head[: max(i for i in (head.rfind(" "), head.rfind("\n"), head.rfind("\t"), 0))]
-        value = head
-    text = _redact(value)
-    raw = text.encode("utf-8")
-    if len(raw) <= limit:
-        return text, precut
-    return raw[:limit].decode("utf-8", errors="ignore"), True
+    if not value:  # fork: werkbank-chat
+        return "", False  # fork: werkbank-chat
+    truncated = len(value) > _REDACT_WINDOW_CHARS  # fork: werkbank-chat
+    if truncated:  # fork: werkbank-chat
+        head = value[:_REDACT_WINDOW_CHARS]  # fork: werkbank-chat
+        if not value[_REDACT_WINDOW_CHARS].isspace():  # fork: werkbank-chat
+            head = head[: max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"), 0)]  # fork: werkbank-chat
+        value = head  # fork: werkbank-chat
+    text, marked = _drop_open_block(_redact(value))  # fork: werkbank-chat
+    truncated = truncated or marked  # fork: werkbank-chat
+    raw = text.encode("utf-8")  # fork: werkbank-chat
+    if len(raw) > limit - (len(_TRUNCATED_MARK) if marked else 0):  # fork: werkbank-chat
+        truncated = True  # fork: werkbank-chat
+        text, cut_open = _drop_open_block(  # fork: werkbank-chat
+            raw[: max(limit - len(_TRUNCATED_MARK), 0)].decode("utf-8", errors="ignore"))  # fork: werkbank-chat
+        marked = marked or cut_open  # fork: werkbank-chat
+    if truncated and (marked or not text):  # fork: werkbank-chat
+        text += _TRUNCATED_MARK  # fork: werkbank-chat
+    return text, truncated  # fork: werkbank-chat
 
 
 def _source_platform(source: Any) -> Optional[str]:
@@ -373,6 +397,17 @@ def event_origin(event: Any) -> Optional[str]:
 
 
 _ANNOUNCED_ATTR = "_hm_session_event_announced"
+_SYNTHETIC_ATTR = "_hm_session_event_synthetic"  # fork: werkbank-chat
+
+
+def mark_synthetic(event: Any, kind: str) -> Any:  # fork: werkbank-chat
+    """Tag a gateway-built prompt (``goal_kickoff``, ``goal_continuation``): its ``user.message``
+    carries ``synthetic: <kind>`` so a chat can tell it from a message the user typed."""
+    try:  # fork: werkbank-chat
+        setattr(event, _SYNTHETIC_ATTR, str(kind))  # fork: werkbank-chat
+    except Exception:  # fork: werkbank-chat
+        pass  # fork: werkbank-chat
+    return event  # fork: werkbank-chat
 
 
 def _message_ref(event: Any) -> Optional[str]:
@@ -425,6 +460,9 @@ def user_message(session_key: Optional[str], event: Any, delivery: str, *, sessi
             payload["merged_into"] = head
         if interrupt:
             payload["interrupt"] = True
+        synthetic = getattr(event, _SYNTHETIC_ATTR, None)  # fork: werkbank-chat
+        if synthetic:  # fork: werkbank-chat
+            payload["synthetic"] = synthetic  # fork: werkbank-chat
         emit(session_key, session_id or meta.get("gateway_session_id"), _source_platform(getattr(sender, "source", None)),
              "user.message", client_message_id or message_id, None, payload, origin=event_origin(sender))
     except Exception:

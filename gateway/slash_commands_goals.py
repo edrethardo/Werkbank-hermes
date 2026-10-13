@@ -85,6 +85,8 @@ class GatewayGoalCommandsMixin:
                     message_id=event.message_id if kickoff else None,
                     channel_prompt=event.channel_prompt if kickoff else None,
                 )
+                from gateway import session_events  # fork: werkbank-chat
+                session_events.mark_synthetic(turn, "goal_kickoff" if kickoff else "goal_continuation")  # fork: werkbank-chat
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)

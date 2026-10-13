@@ -709,9 +709,9 @@ def test_offer_failure_becomes_overflow_not_a_gap(monkeypatch):
 def test_capped_redacts_only_a_bounded_prefix(monkeypatch):
     lengths = []
     monkeypatch.setattr(session_events, "_redact", lambda text: lengths.append(len(text)) or text)
-    text, truncated = session_events._capped("a" * 1_000_000, 100)
+    text, truncated = session_events._capped("a " * 1_000_000, 100)
     assert truncated and len(text.encode()) <= 100
-    assert lengths and max(lengths) <= 200
+    assert lengths and max(lengths) <= session_events._REDACT_WINDOW_CHARS
 
 
 def test_capped_never_leaks_a_secret_cut_at_the_prefix_boundary():
@@ -722,4 +722,150 @@ def test_capped_never_leaks_a_secret_cut_at_the_prefix_boundary():
     raw = (secret + " ") * 2 + "y" * 10 + " " + secret
     assert raw.index(secret, 180) < 200 < raw.index(secret, 180) + len(secret)
     text, truncated = session_events._capped(raw, 100)
-    assert truncated and "sk-proj-" not in text
+    assert "sk-proj-" not in text and len(text.encode()) <= 100
+
+
+# ── _capped: no multi-line secret survives a cut (review 2 WB-1126) ──────────────────────
+
+
+def _pem(lines: int = 130) -> str:
+    """An RSA-8192-sized PEM (~8.6 KB): only recognised by the redactor as a whole BEGIN…END block."""
+    body = "\n".join(("MIIJKQIBAAKCAgEA" + "q7Lm9Zx3" * 6)[:64] for _ in range(lines))
+    return "-----BEGIN RSA PRIVATE KEY-----\n" + body + "\n-----END RSA PRIVATE KEY-----\n"
+
+
+def _no_key_material(text: str) -> bool:
+    return "MIIJKQIBAAKCAgEA" not in text and "-----BEGIN" not in text
+
+
+def test_capped_pem_after_build_log_does_not_leak():
+    raw = "build log line\n" * 150 + _pem()
+    assert len(_pem()) > 8000
+    text, _truncated = session_events._capped(raw)
+    assert len(text.encode()) <= session_events.TEXT_CAP_BYTES
+    assert _no_key_material(text), text[-400:]
+
+
+def test_capped_pem_at_the_start_longer_than_twice_the_limit_does_not_leak():
+    raw = _pem() + "trailer\n"
+    assert len(raw) > 2 * 1024  # the old 2x-limit pre-cut split this key in half
+    text, _truncated = session_events._capped(raw, 1024)
+    assert len(text.encode()) <= 1024
+    assert _no_key_material(text) and text.rstrip().endswith("trailer")
+
+
+def test_capped_pem_across_the_redaction_window_is_dropped_from_its_begin():
+    pad = "x " * ((session_events._REDACT_WINDOW_CHARS - 2000) // 2)
+    raw = pad + _pem()  # BEGIN inside the window, END far behind it
+    assert raw.index("-----BEGIN") < session_events._REDACT_WINDOW_CHARS < raw.index("-----END")
+    text, truncated = session_events._capped(raw, 10**6)
+    assert truncated and _no_key_material(text)
+    assert text.endswith("[truncated]")
+
+
+def test_capped_complete_pem_in_the_window_is_redacted_not_dropped():
+    text, truncated = session_events._capped("before\n" + _pem() + "after\n", 10**6)
+    assert not truncated and _no_key_material(text)
+    assert text.startswith("before\n") and text.rstrip().endswith("after")
+
+
+def test_capped_open_begin_left_by_the_byte_cap_is_dropped():
+    # A public certificate is not redacted; cut by the 4 KB cap its BEGIN would stay open.
+    cert = "-----BEGIN CERTIFICATE-----\n" + ("A" * 64 + "\n") * 200 + "-----END CERTIFICATE-----\n"
+    text, truncated = session_events._capped("head\n" + cert)
+    assert truncated and "-----BEGIN" not in text and text.startswith("head\n")
+    assert len(text.encode()) <= session_events.TEXT_CAP_BYTES
+
+
+def test_capped_huge_base64_without_whitespace_is_bounded():
+    lengths = []
+    real = session_events._redact
+    session_events._redact = lambda t: lengths.append(len(t)) or real(t)
+    try:
+        text, truncated = session_events._capped("data:" + "QUJD" * 2_000_000)
+    finally:
+        session_events._redact = real
+    assert truncated and text == "[truncated]"
+    assert max(lengths, default=0) <= session_events._REDACT_WINDOW_CHARS
+
+
+def test_capped_empty_input_stays_empty():
+    assert session_events._capped("") == ("", False)
+
+
+def test_tool_start_args_never_carry_a_cut_pem():
+    seen = _subscribe()
+    scope = session_events.TurnScope(session_key="k", session_id="s", platform="telegram", turn_id="turn_1")
+    agent = SimpleNamespace(tool_progress_callback=None, tool_start_callback=None, tool_complete_callback=None,
+                            stream_delta_callback=None, interim_assistant_callback=None, status_callback=None)
+    session_events.wire_agent(scope, agent)
+    agent.tool_start_callback("call-p", "write_file", {"path": "x", "content": "log\n" * 300 + _pem()})
+    _settle(seen, lambda s: len(s) >= 1)
+    start = [e for e in seen if e["type"] == "tool.start"][0]
+    assert _no_key_material(start["payload"]["args"])
+
+
+# ── synthetic goal turns are marked as such (review 2 WB-1126) ───────────────────────────
+
+
+from tests.gateway.test_goal_verdict_send import _make_runner_with_adapter, hermes_home  # noqa: E402,F401
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_is_announced_as_synthetic(hermes_home):
+    from unittest.mock import patch
+    from hermes_cli.goals import GoalManager
+
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    GoalManager(session_entry.session_id).set("polish the docs")
+    seen = _subscribe()
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "more", False, None, False)):
+        await runner._post_turn_goal_continuation(session_entry=session_entry, source=src, final_response="partial")
+    _settle(seen, lambda s: any(e["type"] == "user.message" for e in s))
+    msgs = [e for e in seen if e["type"] == "user.message"]
+    assert len(msgs) == 1 and msgs[0]["payload"]["delivery"] == "eingereiht"
+    assert msgs[0]["payload"]["synthetic"] == "goal_continuation"
+
+
+@pytest.mark.parametrize("kickoff, kind", [(True, "goal_kickoff"), (False, "goal_continuation")])
+def test_goal_command_turn_is_announced_as_synthetic(tmp_path, monkeypatch, kickoff, kind):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    runner._adapter_and_key_for = lambda _e: (adapter, "key")
+    seen = _subscribe()
+    runner._enqueue_goal_turn(_tg_event("/goal ship it", "tg-g"), "ship it", label="t", kickoff=kickoff)
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-g" if kickoff else None, "ship it")]
+    assert seen[0]["payload"]["synthetic"] == kind
+
+
+def test_ordinary_message_carries_no_synthetic_field(tmp_path, monkeypatch):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    runner._enqueue_fifo("key", _tg_event("plain", "tg-p"), adapter)
+    _settle(seen, lambda s: len(s) >= 1)
+    assert "synthetic" not in seen[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_busy_message_without_delivery_adapter_is_announced(tmp_path, monkeypatch):
+    runner, _adapter = _busy_runner(tmp_path, monkeypatch)
+    runner._delivery_adapter_for = lambda _s: None
+    seen = _subscribe()
+    runner._is_user_authorized_for_source = lambda _s: True
+    runner._admit_bot_message_for_source = lambda _s: True
+    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
+    runner._effective_busy_input_mode = lambda _s: "interrupt"
+    event = _tg_event("no adapter yet", "tg-na")
+
+    assert await runner._handle_active_session_busy_message(event, "key") is False
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-na", "no adapter yet")]
+
+
+def test_capped_single_token_secret_split_by_the_window_is_dropped():
+    secret = "sk-proj-" + "Z9" * 40
+    pad = "x " * ((session_events._REDACT_WINDOW_CHARS - 10) // 2)
+    raw = pad + secret + " tail"
+    assert raw.index(secret) < session_events._REDACT_WINDOW_CHARS < raw.index(secret) + len(secret)
+    text, truncated = session_events._capped(raw, 10**6)
+    assert truncated and "sk-proj" not in text and "Z9Z9" not in text
