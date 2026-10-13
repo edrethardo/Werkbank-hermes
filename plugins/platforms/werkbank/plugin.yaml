@@ -1,0 +1,11 @@
+name: werkbank
+label: Werkbank
+kind: platform
+version: 1.0.0
+description: >
+  Local, key-protected interface for the Werkbank board to one gateway session
+  (WB-1128): ordered event stream with replay, snapshot, send, stop. No
+  messaging adapter of its own; listens on 127.0.0.1 only and only inside the
+  gateway process with plugins.entries.werkbank.enabled. See README.md and
+  PROTOCOL.md.
+author: hermes (werkbank-chat fork)

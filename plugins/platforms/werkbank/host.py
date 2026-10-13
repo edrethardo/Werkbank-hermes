@@ -1,0 +1,201 @@
+"""The gateway as the plugin server sees it: one narrow object around the plugin context and the
+live gateway runner (the owner of the published plugin message injector).
+
+Everything that touches gateway internals sits here, guarded: an attribute that is missing in
+this Hermes build degrades to "not available", never to an exception in a request.
+
+Feature detection against WB-1127 (built in parallel):
+
+* ``PluginContext.inject_message(..., client_message_id=…)`` — present: the id rides in the
+  message's metadata and comes back on ``user.message``. Missing: the message is sent without it
+  and the buffer gives the id to the next ``user.message`` this plugin injected (FIFO).
+* ``PluginContext.interrupt_session(session_key)`` — missing: ``interrupt`` returns ``None`` and the
+  server answers 501 with the reason.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import resolve as resolve_mod
+
+logger = logging.getLogger("plugins.platforms.werkbank")
+
+TOOL_OUTPUT_MAX = 1024 * 1024        # GET tools/{id}/output: the full text, up to 1 MB
+_TOOL_SCAN = 500                     # newest messages searched for a tool call id
+
+
+def accepts_kwarg(func: Any, name: str) -> bool:
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+class GatewayHost:
+    def __init__(self, ctx: Any, home: Path) -> None:
+        self.ctx = ctx
+        self.home = Path(home)
+        self.profile = resolve_mod.profile_of(self.home)
+        self.supports_client_message_id = accepts_kwarg(getattr(ctx, "inject_message", None),
+                                                        "client_message_id")
+        self.supports_interrupt = callable(getattr(ctx, "interrupt_session", None))
+
+    # -- the live gateway -------------------------------------------------------------------------
+    def owner(self) -> Any:
+        slot = getattr(getattr(self.ctx, "_manager", None), "_gateway_message_injector", None)
+        return slot[0] if slot else None
+
+    def _entry(self, session_key: str) -> Any:
+        store = getattr(self.owner(), "session_store", None)
+        lookup = getattr(store, "lookup_by_session_key", None)
+        return lookup(session_key) if lookup is not None else None
+
+    # -- resolve ----------------------------------------------------------------------------------
+    def resolve(self, session_id: str) -> Optional[Dict[str, Any]]:
+        return resolve_mod.resolve(self.owner(), session_id, self.profile)
+
+    def current_session_id(self, session_key: str) -> Optional[str]:
+        return resolve_mod.current_session_id(self.owner(), session_key)
+
+    # -- send / stop ----------------------------------------------------------------------------
+    def inject(self, session_key: str, text: str, client_message_id: str) -> Tuple[bool, bool]:
+        """(accepted, the id travels with the message)."""
+        if self.supports_client_message_id:
+            ok = self.ctx.inject_message(text, session_key=session_key, client_message_id=client_message_id)
+        else:
+            ok = self.ctx.inject_message(text, session_key=session_key)
+        return bool(ok), self.supports_client_message_id
+
+    def interrupt(self, session_key: str) -> Optional[bool]:
+        if not self.supports_interrupt:
+            return None
+        try:
+            return bool(self.ctx.interrupt_session(session_key))
+        except Exception:
+            logger.warning("werkbank: interrupt_session failed", exc_info=False)
+            return False
+
+    def mirror(self, session_key: str, line: str) -> bool:
+        """Post *line* into the session's own chat (the Telegram topic). Best effort, async."""
+        owner = self.owner()
+        entry = self._entry(session_key)
+        if owner is None or entry is None or getattr(entry, "origin", None) is None:
+            return False
+        restore = getattr(owner, "_restored_source", None)
+        source = restore(entry) if callable(restore) else entry.origin
+        deliver = getattr(owner, "_delivery_adapter_for", None)
+        adapter = deliver(source) if callable(deliver) and source is not None else None
+        loop = getattr(owner, "_gateway_loop", None)
+        if adapter is None or loop is None or loop.is_closed():
+            return False
+        thread_id = getattr(source, "thread_id", None)
+        metadata = {"thread_id": str(thread_id)} if thread_id else None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.send(str(source.chat_id), line, metadata=metadata), loop)
+        except Exception:
+            logger.info("werkbank: mirror line not scheduled")
+            return False
+
+        def _done(fut) -> None:
+            try:
+                result = fut.result()
+            except Exception:
+                logger.info("werkbank: mirror line not delivered")
+                return
+            if getattr(result, "success", True) is False:
+                logger.info("werkbank: mirror line not delivered")
+
+        future.add_done_callback(_done)
+        return True
+
+    # -- state for the snapshot --------------------------------------------------------------------
+    def is_running(self, session_key: str) -> bool:
+        running = getattr(self.owner(), "_running_agents", None)
+        try:
+            return bool(running) and session_key in running
+        except Exception:
+            return False
+
+    def session_state(self, session_key: str) -> Dict[str, Any]:
+        return {}
+
+    def _db(self, session_key: str) -> Any:
+        owner = self.owner()
+        store = getattr(owner, "session_store", None)
+        for_key = getattr(store, "_db_for_key", None)
+        db = None
+        if callable(for_key):
+            try:
+                db = for_key(session_key)
+            except Exception:
+                db = None
+        if db is None:
+            db = getattr(owner, "_session_db", None)
+        return getattr(db, "_db", db)
+
+    def history(self, session_key: str, session_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
+        db = self._db(session_key)
+        get = getattr(db, "get_messages", None)
+        if not session_id or get is None:
+            return []
+        try:
+            return list(get(session_id, latest=True, limit=limit))
+        except Exception:
+            logger.info("werkbank: history not readable for the snapshot")
+            return []
+
+    def tool_output(self, session_key: str, session_id: Optional[str], tool_call_id: str) -> Optional[str]:
+        for row in reversed(self.history(session_key, session_id, _TOOL_SCAN)):
+            if row.get("role") == "tool" and row.get("tool_call_id") == tool_call_id:
+                content = row.get("content")
+                text = content if isinstance(content, str) else str(content or "")
+                try:
+                    from gateway.session_events import _redact
+                    text = _redact(text[:TOOL_OUTPUT_MAX])
+                except Exception:
+                    text = text[:TOOL_OUTPUT_MAX]
+                return text
+        return None
+
+    def pending_approvals(self, session_key: str) -> List[Dict[str, Any]]:
+        try:
+            from tools.approval import list_gateway_approvals
+            from gateway.session_events import redact_command
+        except Exception:
+            return []
+        return [approval_payload(data, redact_command) for data in list_gateway_approvals(session_key)]
+
+    def pending_clarify(self, session_key: str) -> List[Dict[str, Any]]:
+        try:
+            from tools.clarify_gateway import get_pending_for_session
+        except Exception:
+            return []
+        entry = get_pending_for_session(session_key, include_choice_prompts=True)
+        return [] if entry is None else [clarify_payload(entry)]
+
+
+def approval_payload(data: Dict[str, Any], redact) -> Dict[str, Any]:
+    """An open approval in the ``approval.request`` event payload shape (command scrubbed alike)."""
+    return {
+        "request_id": data.get("request_id"), "command": redact(data.get("command")),
+        "description": redact(data.get("description")),
+        "pattern_key": data.get("pattern_key", ""), "pattern_keys": list(data.get("pattern_keys") or []),
+        "allow_permanent": data.get("allow_permanent", True), "allow_session": data.get("allow_session", True),
+        "smart_denied": bool(data.get("smart_denied", False)), "surface": data.get("surface"),
+        "delegated_child": bool(data.get("delegated_child", False)),
+        "subagent_id": data.get("subagent_id"),
+    }
+
+
+def clarify_payload(entry: Any) -> Dict[str, Any]:
+    """An open clarify prompt in the ``clarify.request`` event payload shape."""
+    return {"clarify_id": entry.clarify_id, "question": str(entry.question or ""),
+            "choices": list(entry.choices or []), "multi_select": bool(entry.multi_select),
+            "awaiting_text": bool(getattr(entry, "awaiting_text", False))}
