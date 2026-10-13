@@ -160,6 +160,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                        if e.data.get("command") == approval_data.get("command")
                        and list(e.data.get("pattern_keys") or []) == keys), None)
     if leader is not None and not preparing_terminal_approval():
+        # No new prompt is sent on this path, so say which pending request it waits on.
+        logger.info("Approval request coalesced onto pending request %s for session %s (surface=%s)",
+                    leader.data.get("request_id"), session_key, surface)
         adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
             return adopted
@@ -205,6 +208,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         try:
             notify_cb(dict(entry.data))
             approval_published()
+            # The success path was silent, so a delivered prompt and one that never left
+            # the process were indistinguishable in the logs.
+            logger.info("Approval request %s handed to notifier for session %s (surface=%s)",
+                        entry.data.get("request_id"), session_key, surface)
         except Exception as exc:
             logger.warning("Gateway approval notify failed: %s", exc)
             _drop_entry("notify_failed")
@@ -226,6 +233,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         # A choice that landed in the gap between the deadline check and leaving the queue is an answer,
         # not a timeout (#112548) — the same first-settlement rule as server_requests.send().
         resolved = state != "timeout" or choice is not None
+        if not resolved or cancelled:
+            logger.info("Approval request %s for session %s ended unanswered (%s)",
+                        entry.data.get("request_id"), session_key, cancelled or "timeout")
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
         return _finish(payload, resolved, choice, entry.reason, **extra)

@@ -1483,11 +1483,14 @@ class TurnRunner:
                     raise RuntimeError("send_exec_approval: loop unavailable")
                 outcome = _approval_send_outcome(fut, timeout=15)
                 if outcome == "sent":
+                    card_message_id = getattr(fut.result(timeout=0), "message_id", None)
+                    # Proof of delivery (which chat/topic, which message) for a card the user may not see.
+                    logger.info("Exec approval card %s sent: chat=%s thread=%s message_id=%s",
+                                approval_data.get("request_id"), ctx._status_chat_id,
+                                (ctx._status_thread_metadata or {}).get("thread_id"), card_message_id)
                     # Without this, a card whose timer runs out keeps live buttons and nobody
                     # learns the command did NOT run (only the TUI registered a settle hook).
-                    register_timeout_notice(
-                        self, approval_data, command=cmd,
-                        card_message_id=getattr(fut.result(timeout=0), "message_id", None))
+                    register_timeout_notice(self, approval_data, command=cmd, card_message_id=card_message_id)
                     return
                 if outcome == "ambiguous":
                     # Timeout ≠ failure: the card may have posted with a late ack. The prompt
