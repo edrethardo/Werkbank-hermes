@@ -70,6 +70,10 @@ class GatewayPluginInjectionMixin:
             coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id,
                                                           client_message_id=client_message_id)  # fork: werkbank-chat
         else:
+            if not isinstance(session_key, str) or not self._plugin_session_in_own_profile(  # fork: werkbank-chat
+                    session_key, plugin_home=plugin_home, plugin_id=plugin_id,  # fork: werkbank-chat
+                    what="Plugin message injection"):  # fork: werkbank-chat
+                return False  # fork: werkbank-chat
             target = f"session={session_key}"
             coro = self._dispatch_plugin_message_injection(
                 session_key=session_key, content=content, plugin_id=plugin_id,
@@ -275,6 +279,7 @@ class GatewayPluginInjectionMixin:
 
     def _plugin_session_in_own_profile(  # fork: werkbank-chat
         self, session_key: str, *, plugin_home: Optional[Path], plugin_id: str,
+        what: str = "Plugin interrupt",  # fork: werkbank-chat
     ) -> bool:
         """True when *session_key* belongs to the profile the plugin's manager lives in.
 
@@ -283,16 +288,17 @@ class GatewayPluginInjectionMixin:
         its one served home."""
         profile = self._served_profile_for_home(plugin_home)
         if profile is None:
-            logger.warning("Plugin interrupt refused: plugin=%s profile home %s is not served by this gateway",
-                           plugin_id, plugin_home)
+            logger.warning("%s refused: plugin=%s profile home %s is not served by this gateway",  # fork: werkbank-chat
+                           what, plugin_id, plugin_home)
             return False
         key_profile = _session_key_profile(session_key)
         if key_profile is None:
-            logger.warning("Plugin interrupt refused: plugin=%s %r is not a gateway session key", plugin_id, session_key)
+            logger.warning("%s refused: plugin=%s %r is not a gateway session key",  # fork: werkbank-chat
+                           what, plugin_id, session_key)
             return False
         if getattr(getattr(self, "config", None), "multiplex_profiles", False) is True and key_profile != profile:
-            logger.warning("Plugin interrupt refused: plugin=%s session %s belongs to profile %s, not %s",
-                           plugin_id, session_key, key_profile, profile)
+            logger.warning("%s refused: plugin=%s session %s belongs to profile %s, not %s",  # fork: werkbank-chat
+                           what, plugin_id, session_key, key_profile, profile)
             return False
         return True
 

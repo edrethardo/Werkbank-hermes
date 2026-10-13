@@ -338,7 +338,7 @@ async def test_base_adapter_rejects_derived_session_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_scheduler_logs_async_failure_without_callback_error():
+async def test_scheduler_logs_async_failure_without_callback_error(tmp_path):
     runner = _runner(_entry())
     loop = asyncio.get_running_loop()
     runner._gateway_loop = loop
@@ -348,16 +348,19 @@ async def test_scheduler_logs_async_failure_without_callback_error():
     runner._dispatch_plugin_message_injection = AsyncMock(
         side_effect=RuntimeError("adapter failed")
     )
+    runner.config = GatewayConfig()
 
     try:
-        assert (
-            runner._schedule_plugin_message_injection(
-                session_key="key",
-                content="wake up",
-                plugin_id="notify-plugin",
+        with patch("hermes_constants.get_routing_process_hermes_home", return_value=tmp_path):
+            assert (
+                runner._schedule_plugin_message_injection(
+                    session_key="agent:main:telegram:dm:42",
+                    content="wake up",
+                    plugin_id="notify-plugin",
+                    plugin_home=tmp_path,
+                )
+                is True
             )
-            is True
-        )
         task = next(iter(runner._background_tasks))
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0)
@@ -412,25 +415,31 @@ def test_scheduler_rejects_stopped_or_closed_gateway():
     loop.call_soon_threadsafe.assert_not_called()
 
 
-def test_scheduler_rejects_submission_failure():
+def test_scheduler_rejects_submission_failure(tmp_path):
     runner = _runner(_entry())
+    runner.config = GatewayConfig()
     loop = MagicMock()
     loop.is_closed.return_value = False
     runner._gateway_loop = loop
+    submitted = []
 
     def _reject(coro, _target_loop, **_kwargs):
+        submitted.append(coro)
         coro.close()
         return None
 
-    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_reject):
+    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_reject), \
+            patch("hermes_constants.get_routing_process_hermes_home", return_value=tmp_path):
         assert (
             runner._schedule_plugin_message_injection(
-                session_key="key",
+                session_key="agent:main:telegram:dm:42",
                 content="wake up",
                 plugin_id="notify-plugin",
+                plugin_home=tmp_path,
             )
             is False
         )
+    assert len(submitted) == 1  # refused by the submission, not by the profile check
 
 
 def test_install_and_clear_gateway_injector_preserves_newer_owner():
@@ -700,3 +709,91 @@ async def test_plugin_interrupt_session_without_running_turn_is_false(tmp_path):
         assert runner._schedule_plugin_session_interrupt(
             session_key=entry.session_key, plugin_id="werkbank", plugin_home=tmp_path) is False
     assert runner._background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_plugin_inject_message_refuses_other_profiles_sessions(tmp_path, monkeypatch):
+    """Security (WB-1127 review): inject_message(session_key=...) reaches only sessions of the
+    plugin's own profile — same rule as interrupt_session."""
+    import gateway.run as gateway_run
+
+    coder_home, other_home = tmp_path / "coder", tmp_path / "other"
+    coder_home.mkdir()
+    other_home.mkdir()
+    runner = _runner(_entry())
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway_run, "_multiplex_profile_homes",
+                        lambda _cfg: [("coder", coder_home), ("other", other_home)])
+    foreign, own = "agent:other:telegram:dm:42", "agent:coder:telegram:dm:42"
+
+    def _inject(key, home):
+        return runner._schedule_plugin_message_injection(
+            session_key=key, content="hallo", plugin_id="werkbank", plugin_home=home)
+
+    assert _inject(foreign, coder_home) is False
+    assert _inject("not-a-gateway-key", coder_home) is False
+    assert _inject(own, tmp_path / "unserved") is False
+    assert _inject(own, None) is False
+    await _drain(runner)
+    runner._dispatch_plugin_message_injection.assert_not_awaited()
+
+    assert _inject(own, coder_home) is True
+    await _drain(runner)
+    runner._dispatch_plugin_message_injection.assert_awaited_once()
+    assert runner._dispatch_plugin_message_injection.await_args.kwargs["session_key"] == own
+
+    # Single-profile gateway: a plugin manager of another home cannot reach its sessions.
+    runner.config = GatewayConfig()
+    runner._dispatch_plugin_message_injection.reset_mock()
+    with patch("hermes_constants.get_routing_process_hermes_home", return_value=coder_home):
+        assert _inject("agent:main:telegram:dm:42", other_home) is False
+    await _drain(runner)
+    runner._dispatch_plugin_message_injection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_photo_follow_ups_without_client_message_id_still_merge(tmp_path):
+    """Regression: without ``client_message_id`` a photo burst keeps its album semantics — both
+    photos fold into the one pending slot (run_busy._queue_or_replace_pending_event)."""
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    source = _entry().origin
+    entry = store.get_or_create_session(source)
+    adapter = _RoutingAdapter()
+    runner = _live_runner(store, adapter)
+
+    def _photo(url):
+        return MessageEvent(text="", message_type=MessageType.PHOTO, source=source,
+                            media_urls=[url], media_types=["image/jpeg"])
+
+    first, second = _photo("a.jpg"), _photo("b.jpg")
+    runner._queue_or_replace_pending_event(entry.session_key, first)
+    runner._queue_or_replace_pending_event(entry.session_key, second)
+
+    assert adapter._pending_messages[entry.session_key] is first
+    assert first.media_urls == ["a.jpg", "b.jpg"]
+    assert not runner._queued_events.get(entry.session_key)
+
+
+@pytest.mark.asyncio
+async def test_plain_stop_still_reports_stop_requested():
+    """Regression: a user's /stop (no ``hook_reason``) keeps ``agent_loop_stopped`` reason
+    'Stop requested'; only the plugin path renames it."""
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    entry = _entry()
+    runner = _stop_runner(entry)
+    agent = MagicMock()
+    runner._running_agents[entry.session_key] = agent
+    event = MessageEvent(text="/stop", message_type=MessageType.TEXT, source=entry.origin)
+
+    with patch("hermes_cli.plugins.invoke_hook") as hook:
+        await runner._busy_stop_command(event, entry.session_key, entry.origin)
+
+    assert _INTERRUPT_REASON_STOP == "Stop requested"
+    agent.interrupt.assert_called_once_with("Stop requested")
+    hook.assert_any_call(
+        "agent_loop_stopped", session_key=entry.session_key, platform="telegram",
+        reason="Stop requested", invalidation_reason="stop_command",
+    )

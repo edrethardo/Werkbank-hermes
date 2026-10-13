@@ -616,8 +616,10 @@ class PluginContext:
         ``SessionSource.to_dict()``-shaped mapping: platform, chat_id, chat_type, thread_id,
         user_id, ...) instead names a messaging chat: the gateway starts (or continues) that
         chat's session in THIS plugin's own profile and runs a turn there; the plugin cannot
-        target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
-        ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
+        target another profile. A ``session_key`` (TUI or gateway) must belong to that same
+        profile too; another profile's key is refused (``False``). Non-CLI injection needs
+        ``session_key`` or ``origin`` plus ``plugins.entries.<plugin_id>.allow_gateway_injection``
+        in the plugin's profile config.
         ``True`` means a host accepted the request, not that the turn completed.
         ``client_message_id`` (gateway only; a short single-line string) is the sender's own id for
         this message: it rides in ``MessageEvent.metadata``, keeps two messages from sharing a

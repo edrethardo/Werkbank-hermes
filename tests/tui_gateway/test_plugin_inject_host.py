@@ -116,6 +116,7 @@ def test_unknown_session_key_falls_through_to_the_gateway_slot(tmp_path, monkeyp
         session_key="agent:main:telegram:dm:42",
         content="wake telegram",
         plugin_id="notify-plugin",
+        plugin_home=manager.home_path,
     )
     assert live.get("queued_prompt") is None
 
@@ -176,3 +177,29 @@ def test_cli_injection_still_bypasses_the_tui_host(tmp_path, monkeypatch):
 
     assert pending == ["typed"]
     assert origin.get("queued_prompt") is None
+
+
+def test_tui_session_of_another_profile_is_not_injected(tmp_path, monkeypatch):
+    """Security (WB-1127): one desktop process hosts sessions of several profiles; a plugin of
+    profile A must not queue a turn in a session of profile B (fail closed, no fall-through win)."""
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    other_home = tmp_path / "other"
+    other_home.mkdir()
+    foreign = _session("ses_foreign", running=True, profile_home=str(other_home))
+    own = _session("ses_own", running=True, profile_home=str(manager.home_path))
+    launch = _session("ses_launch", running=True)  # no profile_home: the launch profile
+    monkeypatch.setattr(server, "_sessions", {"ui-f": foreign, "ui-o": own, "ui-l": launch})
+    server.install_tui_message_injector(manager)
+    try:
+        assert context.inject_message("x", session_key="ses_foreign") is False
+        assert context.inject_message("mine", session_key="ses_own") is True
+        assert context.inject_message("launch", session_key="ses_launch") is True
+    finally:
+        server.clear_tui_message_injector(manager)
+
+    assert foreign.get("queued_prompt") is None
+    assert own["queued_prompt"]["text"] == "mine"
+    assert launch["queued_prompt"]["text"] == "launch"
+    # A direct host call without the plugin's home fails closed.
+    assert server.inject_tui_session_message(session_key="ses_own", content="y", plugin_id="p") is False

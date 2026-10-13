@@ -21,7 +21,18 @@ _TUI_INJECT_OWNER = object()
 _atexit_registered = False
 
 
-def inject_tui_session_message(*, session_key: str, content: str, plugin_id: str = "") -> bool:
+def _session_in_plugin_profile(session: dict, plugin_home) -> bool:  # fork: werkbank-chat
+    """True when *session* runs in the plugin manager's profile (a session without
+    ``profile_home`` runs in the launch profile). Without a plugin home: fail closed."""
+    if not plugin_home:  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    from hermes_constants import hermes_home_key  # fork: werkbank-chat
+    home = session.get("profile_home") or _launch_home()  # fork: werkbank-chat
+    return hermes_home_key(home) == hermes_home_key(plugin_home)  # fork: werkbank-chat
+
+
+def inject_tui_session_message(*, session_key: str, content: str, plugin_id: str = "",
+                               plugin_home=None) -> bool:  # fork: werkbank-chat
     """Queue *content* on the live session whose ``session_key`` matches.
 
     Returns False when this process has no such session, so the caller can fall
@@ -46,6 +57,10 @@ def inject_tui_session_message(*, session_key: str, content: str, plugin_id: str
     if match is None:
         return False
     sid, session = match
+    if not _session_in_plugin_profile(session, plugin_home):  # fork: werkbank-chat
+        # Another profile's session in this multi-profile desktop process (WB-1127): not ours to
+        # wake. False lets the caller fall through to the gateway, which applies the same rule.
+        return False  # fork: werkbank-chat
     if session.get("lazy") or session.get("_closing") or session.get("_finalized"):
         return False
     if session.get("history_lock") is None:

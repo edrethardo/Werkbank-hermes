@@ -164,6 +164,7 @@ def test_gateway_injection_passes_host_owned_plugin_identity(tmp_path, monkeypat
         session_key="agent:main:telegram:dm:42",
         content="[system] wake up",
         plugin_id="notify-plugin",
+        plugin_home=manager.home_path,  # fork: werkbank-chat — the gateway checks the key's profile
     )
 
 
@@ -242,6 +243,7 @@ def test_published_gateway_host_reaches_existing_and_future_profile_managers(tmp
             session_key="agent:secondary:telegram:dm:42",
             content="continue",
             plugin_id="notify-plugin",
+            plugin_home=secondary_manager.home_path,  # the secondary profile, not the launch home
         )
 
         plugins_mod.clear_published_gateway_message_host(owner)
@@ -333,7 +335,7 @@ def test_gateway_injection_forwards_client_message_id(tmp_path, monkeypatch):
     ) is True
     injector.assert_called_once_with(
         session_key="agent:main:telegram:dm:42", content="hallo", plugin_id="notify-plugin",
-        client_message_id="wb-1",
+        plugin_home=manager.home_path, client_message_id="wb-1",
     )
 
 

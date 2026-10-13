@@ -53,7 +53,8 @@ def inject_plugin_message(
     # hand the same text to the gateway.
     if session_key and manager.has_tui_message_injector:
         try:
-            if manager.inject_tui_message(session_key=session_key, content=msg, plugin_id=ctx.plugin_id):
+            if manager.inject_tui_message(session_key=session_key, content=msg, plugin_id=ctx.plugin_id,
+                                          plugin_home=manager.home_path):  # fork: werkbank-chat
                 return True
         except Exception:
             logger.warning("inject_message: TUI scheduling failed for plugin %s", ctx.plugin_id, exc_info=True)
@@ -61,11 +62,13 @@ def inject_plugin_message(
     if not manager.has_gateway_message_injector:
         logger.warning("inject_message: no live gateway is available")
         return False
+    # The manager's immutable home is the plugin's profile (never the ambient HERMES_HOME of whatever
+    # thread called us): the gateway creates an origin session there or nowhere, and an existing
+    # session_key must belong to it (same rule as interrupt_session).
     if origin is None:
-        target: dict[str, Any] = {"session_key": session_key}
+        target: dict[str, Any] = {"session_key": session_key,
+                                  "plugin_home": manager.home_path}  # fork: werkbank-chat
     else:
-        # The manager's immutable home is the plugin's profile: the gateway creates the session
-        # there or nowhere (never the ambient HERMES_HOME of whatever thread called us).
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
     if client_message_id is not None:  # fork: werkbank-chat
         target["client_message_id"] = client_message_id  # fork: werkbank-chat
