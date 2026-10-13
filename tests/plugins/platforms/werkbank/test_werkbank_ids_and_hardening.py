@@ -21,19 +21,13 @@ def _users(snap):
     return [m for m in snap["messages"] if m["role"] == "user"]
 
 
-def _answers(snap):
-    return [m for m in snap["messages"] if m["role"] == "assistant"]
-
-
 def _at(event, ts):
     event["ts"] = ts
     return event
 
 
 T1 = "2026-10-13T10:00:00.000000Z"
-T2 = "2026-10-13T10:05:00.000000Z"
 S1 = 1791885600.0                        # T1 in epoch seconds
-S2 = S1 + 300                            # T2
 
 
 # ── user rows: the id rides the row (display_metadata.client_message_id), never the text ─────
@@ -48,10 +42,11 @@ def test_board_message_row_is_named_by_its_stored_client_message_id(plugin_serve
     srv.host.messages = [
         # an older board message with the same text, and a cron wake whose text ends with it
         {"id": 1, "role": "user", "content": "ja", "timestamp": 1.0,
-         "display_metadata": {"client_message_id": "cmid-alt"}},
+         "display_metadata": {"client_message_id": "cmid-alt", "hermes_plugin_id": "platforms/werkbank"}},
         {"id": 2, "role": "user", "content": "Cron-Hinweis: bitte antworte ja", "timestamp": 2.0},
         {"id": 3, "role": "user", "content": "ja", "timestamp": 3.0,
-         "display_metadata": {"client_message_id": "cmid-neu", "gateway_input_owner": "x"}},
+         "display_metadata": {"client_message_id": "cmid-neu", "hermes_plugin_id": "platforms/werkbank",
+                              "gateway_input_owner": "x"}},
     ]
     snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
     assert [(m["id"], m["client_message_id"], m["origin"]) for m in _users(snap)] == [
@@ -81,49 +76,8 @@ def test_a_platform_row_keeps_its_platform_id(plugin_server):
 # ── final answers: kept from the buffer until an answer row of THAT turn exists (order, not text) ──
 
 
-def _turn(srv, seq, turn_id, start_ts, answer):
-    srv.buffers.on_event(_at(core_event(seq, "turn.start", {}, id_=turn_id), start_ts))
-    srv.buffers.on_event(_at(core_event(seq + 1, "turn.done", {"final_response": answer}, id_=turn_id), start_ts))
-
-
-def test_same_answer_text_twice_keeps_the_newer_answer_until_its_own_row(plugin_server):
-    srv = plugin_server
-    _resolve(srv)
-    _turn(srv, 1, "turn_b", T1, "Erledigt.")
-    # the row of an EARLIER turn with the same text does not stand for turn_b's answer
-    srv.host.messages = [{"id": 1, "role": "assistant", "content": "Erledigt.", "timestamp": S1 - 600}]
-    snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
-    assert [(a["id"], a["text"]) for a in _answers(snap)] == [("db:1", "Erledigt."), ("turn_b", "Erledigt.")]
-    # turn_b's own row lands (written after its turn.start) → the buffer copy goes
-    srv.host.messages.append({"id": 2, "role": "assistant", "content": "Erledigt.", "timestamp": S1 + 10})
-    snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
-    assert [a["id"] for a in _answers(snap)] == ["db:1", "db:2"]
-
-
-def test_an_answer_row_counts_for_its_own_turn_only(plugin_server):
-    srv = plugin_server
-    _resolve(srv)
-    _turn(srv, 1, "turn_a", T1, "A fertig.")
-    _turn(srv, 3, "turn_b", T2, "B fertig.")
-    srv.host.messages = [
-        # a tool-call step of turn_a is not its answer
-        {"id": 1, "role": "assistant", "content": "", "timestamp": S1 + 1,
-         "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}]},
-        # turn_b's answer row, written after turn_b started, does not stand for turn_a
-        {"id": 2, "role": "assistant", "content": "B fertig.", "timestamp": S2 + 5},
-    ]
-    snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
-    assert [a["id"] for a in _answers(snap)] == ["db:1", "db:2", "turn_a"]
-
-
-def test_answer_with_a_different_text_than_its_row_is_not_doubled(plugin_server):
-    """The row may hold the unredacted/rewritten text: still one answer (order decides)."""
-    srv = plugin_server
-    _resolve(srv)
-    _turn(srv, 1, "turn_a", T1, "Token: ***")
-    srv.host.messages = [{"id": 1, "role": "assistant", "content": "Token: sk-abc", "timestamp": S1 + 20}]
-    snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
-    assert [a["id"] for a in _answers(snap)] == ["db:1"]
+# Which row stands for a buffered answer (row ids, message_uid; never the clock or the text):
+# test_werkbank_row_order.py.
 
 
 # ── the mirror line is plain text ─────────────────────────────────────────────────────────────
@@ -160,7 +114,7 @@ def test_mirror_line_is_capped_in_utf16_units():
 # ── connection limit, header deadline, Host check ─────────────────────────────────────────────
 
 
-def test_connections_beyond_the_limit_are_closed_before_auth(tmp_path):
+def test_when_full_the_oldest_unauthenticated_connection_goes_not_the_new_one(tmp_path):
     from plugins.platforms.werkbank import buffer, keyfile, server
 
     key = keyfile.ensure_key(tmp_path)
@@ -169,31 +123,108 @@ def test_connections_beyond_the_limit_are_closed_before_auth(tmp_path):
     held = []
     try:
         for _ in range(2):
-            s = socket.create_connection(("127.0.0.1", srv.port))
+            s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
             s.sendall(b"GET /v1/resolve HTTP/1.1\r\n")       # slow client: never finishes its headers
             held.append(s)
-        time.sleep(0.2)
-        extra = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
-        extra.sendall(b"GET /v1/resolve?session_id=x HTTP/1.0\r\n\r\n")
-        assert extra.recv(100) == b""                           # closed without an answer
-        extra.close()
-        for s in held:
-            s.close()
-        deadline = time.monotonic() + 3
-        status = None
-        while time.monotonic() < deadline:
-            try:
-                status = call(srv.port, "GET", f"/v1/resolve?session_id={SID}", key)[0]
-            except (ConnectionError, OSError):           # the slots are released a moment later
-                status = None
-            if status == 200:
-                break
             time.sleep(0.05)
-        assert status in (200, 404)                             # a slot is free again
+        time.sleep(0.2)
+        # a client with complete headers gets in at once; the OLDEST idle connection is closed
+        assert call(srv.port, "GET", f"/v1/resolve?session_id={SID}", key, timeout=2)[0] == 200
+        assert held[0].recv(100) == b""
     finally:
         for s in held:
             s.close()
         srv.stop()
+
+
+def test_a_reconnect_flood_cannot_lock_out_a_client_with_complete_headers(tmp_path):
+    """Reviewer repro (wb1128_dos.py): every slot held and re-opened as soon as it is closed."""
+    from plugins.platforms.werkbank import buffer, keyfile, server
+
+    key = keyfile.ensure_key(tmp_path)
+    srv = server.WerkbankServer(key, buffer.Buffers(), FakeHost(), port=0, max_connections=8,
+                                header_deadline=10.0).start()
+
+    def hold():
+        s = socket.create_connection(("127.0.0.1", srv.port))
+        s.sendall(b"GET / HTTP/1.1\r\n")
+        return s
+
+    socks = [hold() for _ in range(8)]
+    try:
+        time.sleep(0.2)
+        ok = 0
+        for _ in range(10):
+            for i, s in enumerate(socks):                    # the attacker refills every lost slot
+                s.setblocking(False)
+                try:
+                    if s.recv(1) == b"":
+                        s.close()
+                        socks[i] = hold()
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    s.close()
+                    socks[i] = hold()
+            try:
+                ok += call(srv.port, "GET", "/v1/resolve?session_id=x", key, timeout=1)[0] == 404
+            except OSError:
+                pass
+        assert ok == 10
+    finally:
+        for s in socks:
+            s.close()
+        srv.stop()
+
+
+def test_authenticated_connections_have_their_own_quota(tmp_path):
+    from plugins.platforms.werkbank import buffer, keyfile, server
+
+    key = keyfile.ensure_key(tmp_path)
+    host = FakeHost()
+    buffers = buffer.Buffers()
+    srv = server.WerkbankServer(key, buffers, host, port=0, max_connections=2, max_authenticated=1,
+                                header_deadline=5.0, heartbeat=0.1).start()
+    try:
+        assert call(srv.port, "GET", f"/v1/resolve?session_id={SID}", key)[0] == 200
+        got = {}
+        path = events_path(epoch=buffers.get(KEY_SESSION).epoch)          # a live stream, held open
+        t = threading.Thread(target=lambda: got.setdefault("r", sse(srv.port, key, path, 50, timeout=1.5)))
+        t.start()
+        deadline = time.monotonic() + 2
+        while srv.open_streams == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # the stream holds the one authenticated place: a second authorized request is refused
+        # politely; unauthenticated newcomers never evict the authenticated stream
+        assert call(srv.port, "GET", f"/v1/resolve?session_id={SID}", key)[0] == 503
+        for _ in range(4):
+            s = socket.create_connection(("127.0.0.1", srv.port))
+            s.sendall(b"GET / HTTP/1.1\r\n")
+            s.close()
+        t.join(5)
+        assert got["r"][0] == 200
+    finally:
+        srv.stop()
+
+
+def test_a_client_that_hangs_up_early_leaves_no_traceback(tmp_path, capfd):
+    from plugins.platforms.werkbank import buffer, keyfile, server
+
+    key = keyfile.ensure_key(tmp_path)
+    srv = server.WerkbankServer(key, buffer.Buffers(), FakeHost(), port=0, max_connections=1,
+                                header_deadline=5.0).start()
+    try:
+        for _ in range(20):
+            s = socket.create_connection(("127.0.0.1", srv.port))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+            s.sendall(b"GET /v1/resolve?session_id=x HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+            s.close()                                           # RST: the answer hits a dead socket
+        time.sleep(0.5)
+        assert call(srv.port, "GET", "/v1/resolve?session_id=x", key)[0] == 404
+    finally:
+        srv.stop()
+    err = capfd.readouterr().err
+    assert "Traceback" not in err
 
 
 def test_request_line_and_headers_have_a_total_deadline(tmp_path):

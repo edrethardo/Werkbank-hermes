@@ -14,6 +14,12 @@ emptied and ``seq`` restarts at 0 — when the plugin can no longer promise a ga
   client kept from before a restart does not match a new one.
 
 A stream client then sees exactly one ``session.epoch`` event and reloads the snapshot.
+
+Row marks. What the snapshot adds from this buffer (an announced message, a final answer) must
+not double a SessionDB row that already stands for it. The buffer never compares clocks or texts:
+it notes the highest SessionDB row id of the session (``watermark``, ``messages.id`` is
+AUTOINCREMENT and only grows) when it first observes a session id and when a ``user.message``,
+``turn.start`` or ``turn.done`` arrives. Every kept entry carries that mark and its ``session_id``.
 """
 
 from __future__ import annotations
@@ -32,7 +38,9 @@ _PENDING_IDS = 256          # client_message_ids waiting for their user.message 
 _ACCEPTED_IDS = 2048        # client_message_ids already accepted per session (409 on a repeat)
 _RECENT_USERS = 200         # user.message events kept for the snapshot (rows not yet in the DB)
 _RECENT_ANSWERS = 20        # final answers of turn.done kept for the snapshot
-_TURN_STARTS = 200          # turn.start times kept: which answer row belongs to which turn
+_TURN_STARTS = 200          # turn.start row marks kept: which answer row belongs to which turn
+_OBSERVED = 64              # session ids of one key with their observation mark
+_MARKED = ("user.message", "turn.start", "turn.done")
 
 
 def initial_epoch(now: Optional[float] = None) -> int:
@@ -59,6 +67,9 @@ class SessionBuffer:
         self.events: deque = deque(maxlen=ring)
         self.last_core_seq: Optional[int] = None
         self.known_ids = {session_id} if session_id else set()
+        # session_id -> highest row id when this plugin first saw that id (turns begun before it)
+        self.observed: "OrderedDict[str, Optional[int]]" = OrderedDict()
+        self.order = 0
         self.open_turn: Optional[str] = None
         self.subagents: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.pending_ids: deque = deque(maxlen=_PENDING_IDS)
@@ -67,8 +78,8 @@ class SessionBuffer:
         # Survive epochs: what a snapshot must show even before the SessionDB has it.
         self.recent_users: deque = deque(maxlen=_RECENT_USERS)
         self.recent_answers: deque = deque(maxlen=_RECENT_ANSWERS)
-        # turn_id -> ts of its turn.start: which history rows belong to which turn (by time, not text)
-        self.turn_starts: "OrderedDict[str, str]" = OrderedDict()
+        # turn_id -> {session_id, mark} of its turn.start, in arrival order (row ids, never the clock)
+        self.turn_starts: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.readers = 0                 # open event streams on this session (never evicted while > 0)
         self.evicted = False
         self.tool_count = 0
@@ -93,7 +104,9 @@ class Buffers:
 
     def __init__(self, *, plugin_id: str = "platforms/werkbank", ring: int = RING,
                  max_sessions: int = MAX_SESSIONS, epoch_start: Optional[int] = None,
-                 clock: Callable[[], str] = _now) -> None:
+                 clock: Callable[[], str] = _now,
+                 watermark: Optional[Callable[[str, Optional[str]], Optional[int]]] = None) -> None:
+        self._watermark = watermark
         self.plugin_id = plugin_id
         self.ring = ring
         self.max_sessions = max_sessions
@@ -102,6 +115,25 @@ class Buffers:
         self._next_epoch = initial_epoch() if epoch_start is None else epoch_start
         self._clock = clock
         self.closed = False
+
+    # -- row marks ----------------------------------------------------------------------------
+    def _mark(self, session_key: str, session_id: Optional[str]) -> Optional[int]:
+        """Highest SessionDB row id of *session_id* now; ``None`` when it cannot be read. Called
+        outside :attr:`cond` (a database read)."""
+        if self._watermark is None or not session_id:
+            return None
+        try:
+            mark = self._watermark(session_key, session_id)
+        except Exception:
+            return None
+        return mark if isinstance(mark, int) and not isinstance(mark, bool) else None
+
+    @staticmethod
+    def _observe(buf: SessionBuffer, session_id: Optional[str], mark: Optional[int]) -> None:
+        if session_id and session_id not in buf.observed:
+            buf.observed[session_id] = mark
+            while len(buf.observed) > _OBSERVED:
+                buf.observed.popitem(last=False)
 
     # -- watching -----------------------------------------------------------------------------
     def _take_epoch(self) -> int:
@@ -113,8 +145,13 @@ class Buffers:
         """Start (or keep) buffering *session_key*; a changed session id starts a new epoch."""
         with self.cond:
             buf = self._sessions.get(session_key)
+            fresh = buf is None or (session_id is not None and session_id not in buf.observed)
+        mark = self._mark(session_key, session_id) if fresh else None
+        with self.cond:
+            buf = self._sessions.get(session_key)
             if buf is None:
                 buf = SessionBuffer(session_key, session_id, platform, self._take_epoch(), self.ring)
+                self._observe(buf, session_id, mark)
                 self._sessions[session_key] = buf
                 self._evict(keep=session_key)
                 self.cond.notify_all()
@@ -126,6 +163,8 @@ class Buffers:
                     self._new_epoch(buf, "session_id")
                     buf.session_id = session_id
                     buf.known_ids.add(session_id)
+                if fresh:
+                    self._observe(buf, session_id, mark)
             return buf
 
     def _evict(self, keep: str) -> None:
@@ -223,11 +262,17 @@ class Buffers:
         key = event.get("session_key")
         if not isinstance(key, str):
             return
+        type_ = str(event.get("type") or "")
+        event_sid = str(event["session_id"]) if event.get("session_id") else None
+        with self.cond:
+            buf = self._sessions.get(key)
+            wants_mark = buf is not None and (type_ in _MARKED or (event_sid is not None
+                                                                   and event_sid not in buf.observed))
+        mark = self._mark(key, event_sid or (buf.session_id if buf else None)) if wants_mark else None
         with self.cond:
             buf = self._sessions.get(key)
             if buf is None or self.closed:
                 return                       # not asked for by the board: not buffered
-            type_ = str(event.get("type") or "")
             payload = dict(event.get("payload") or {})
             if type_ == "overflow":
                 self._new_epoch(buf, "overflow")
@@ -245,6 +290,7 @@ class Buffers:
                     self._new_epoch(buf, "session_id")
                 buf.session_id = str(session_id)
                 buf.known_ids.add(buf.session_id)
+            self._observe(buf, buf.session_id, mark)
             if event.get("platform"):
                 buf.platform = str(event["platform"])
             id_ = event.get("id")
@@ -258,21 +304,32 @@ class Buffers:
                 origin = "werkbank"          # the board's name for itself (hermes_view.js HV_ORIGINS)
             self._track(buf, type_, id_, event.get("parent_id"), payload)
             ts = event.get("ts") or self._clock()
+            sid = buf.session_id
+            if type_ in _MARKED:
+                buf.order += 1                 # arrival order of marked events (never a clock)
             if type_ == "user.message":
                 buf.recent_users.append({
                     "id": None if id_ is None else str(id_),
                     "client_message_id": payload.get("client_message_id"),
                     "message_id": payload.get("message_id"), "text": str(payload.get("text") or ""),
                     "origin": origin, "ts": ts, "delivery": payload.get("delivery"),
-                    "synthetic": payload.get("synthetic")})
+                    "synthetic": payload.get("synthetic"), "session_id": sid, "mark": mark})
             if type_ == "turn.start" and id_ is not None:
-                buf.turn_starts[str(id_)] = ts
+                buf.turn_starts[str(id_)] = {"session_id": sid, "mark": mark, "order": buf.order}
                 while len(buf.turn_starts) > _TURN_STARTS:
                     buf.turn_starts.popitem(last=False)
             elif type_ == "turn.done" and payload.get("final_response"):
-                buf.recent_answers.append({"turn_id": None if id_ is None else str(id_),
-                                           "text": str(payload["final_response"]), "ts": ts,
-                                           "started": buf.turn_starts.get(str(id_)) if id_ is not None else None})
+                start = buf.turn_starts.get(str(id_)) if id_ is not None else None
+                uid, row_id = payload.get("message_uid"), payload.get("row_id")
+                buf.recent_answers.append({
+                    "turn_id": None if id_ is None else str(id_), "text": str(payload["final_response"]),
+                    "ts": ts, "session_id": sid, "mark": mark,
+                    # the turn's own start, or None: it began before this plugin observed the session
+                    "start_mark": start["mark"] if start else None, "started": start is not None,
+                    "order": buf.order,
+                    # the core named the answer's row (gateway/session_events.end_turn): matched by it alone
+                    "message_uid": uid if isinstance(uid, str) and uid else None,
+                    "row_id": row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None})
             buf.seq += 1
             buf.events.append({
                 "v": 1, "session_key": key, "session_id": buf.session_id, "epoch": buf.epoch,
@@ -318,7 +375,8 @@ class Buffers:
                     "session_id": buf.session_id, "platform": buf.platform,
                     "recent_users": [dict(u) for u in buf.recent_users],
                     "recent_answers": [dict(a) for a in buf.recent_answers],
-                    "turn_starts": list(buf.turn_starts.values()),
+                    "turn_starts": [dict(t) for t in buf.turn_starts.values()],
+                    "observed": dict(buf.observed),
                     # counted since the board first asked for this session (this plugin process)
                     "session": {"model": buf.model, "tool_count": buf.tool_count,
                                 "errors": buf.error_count}}

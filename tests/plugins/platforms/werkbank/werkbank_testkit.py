@@ -42,6 +42,7 @@ class FakeHost:
         self.clarify: list = []
         self.outputs: dict = {}
         self.running = False
+        self.lineages: dict = {}           # session_id -> compression lineage root → tip
 
     def resolve(self, session_id):
         return self.sessions.get(session_id)
@@ -71,7 +72,14 @@ class FakeHost:
         return {}
 
     def history(self, session_key, session_id, limit):
-        return list(self.messages)
+        return list(self.messages)[-limit:]
+
+    def row_watermark(self, session_key, session_id):
+        """Highest row id written so far (the SessionDB's ids only grow: AUTOINCREMENT)."""
+        return max((m["id"] for m in self.messages if isinstance(m.get("id"), int)), default=0)
+
+    def lineage(self, session_key, session_id):
+        return list(self.lineages.get(session_id) or [session_id])
 
     def pending_approvals(self, session_key):
         return list(self.approvals)
@@ -88,7 +96,7 @@ def running_server(tmp_path, fake_host, *, ring=5000, mirror=True):
     from plugins.platforms.werkbank import buffer, keyfile, server
 
     key = keyfile.ensure_key(tmp_path)
-    buffers = buffer.Buffers(plugin_id="platforms/werkbank", ring=ring)
+    buffers = buffer.Buffers(plugin_id="platforms/werkbank", ring=ring, watermark=fake_host.row_watermark)
     srv = server.WerkbankServer(key, buffers, fake_host, port=0, heartbeat=0.1,
                                 mirror_enabled=lambda: mirror).start()
     return SimpleNamespace(server=srv, key=key, buffers=buffers, host=fake_host, port=srv.port)

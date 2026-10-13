@@ -68,20 +68,34 @@ def _tool_failed(tool_name: Any, content: Any) -> bool:
         return False
 
 
-def row_client_message_id(row: Dict[str, Any]) -> Optional[str]:
-    """The sender's own id the gateway stored on a plugin-injected user row
-    (``display_metadata.client_message_id``, ``gateway/run_plugin_injection.client_message_metadata``)."""
+def _row_meta(row: Dict[str, Any], name: str) -> Optional[str]:
     meta = row.get("display_metadata")
     if isinstance(meta, str):
         try:
             meta = json.loads(meta)
         except ValueError:
             meta = None
-    cmid = meta.get("client_message_id") if isinstance(meta, dict) else None
-    return cmid if isinstance(cmid, str) and cmid else None
+    value = meta.get(name) if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and value else None
 
 
-def message_item(row: Dict[str, Any], origin: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def row_client_message_id(row: Dict[str, Any]) -> Optional[str]:
+    """The sender's own id the gateway stored on a plugin-injected user row
+    (``display_metadata.client_message_id``, ``gateway/run_plugin_injection.client_message_metadata``)."""
+    return _row_meta(row, "client_message_id")
+
+
+def _row_origin(row: Dict[str, Any], origin: Optional[str], plugin_id: str) -> Optional[str]:
+    """``werkbank`` for a row THIS plugin injected (``display_metadata.hermes_plugin_id``), another
+    plugin's id for its rows — the names the stream uses (``Buffers.on_event``) — else *origin*."""
+    injected_by = _row_meta(row, "hermes_plugin_id")
+    if injected_by is None:
+        return origin
+    return "werkbank" if injected_by == plugin_id else injected_by
+
+
+def message_item(row: Dict[str, Any], origin: Optional[str] = None,
+                 plugin_id: str = "platforms/werkbank") -> Optional[Dict[str, Any]]:
     """One SessionDB row as the board draws it; ``None`` for rows it never shows."""
     role = row.get("role")
     if role not in ("user", "assistant", "tool"):
@@ -94,7 +108,7 @@ def message_item(row: Dict[str, Any], origin: Optional[str] = None) -> Optional[
     item: Dict[str, Any] = {"id": client_message_id or platform_id or f"db:{db_id}",
                             "client_message_id": client_message_id, "message_id": platform_id,
                             "db_id": db_id, "role": role, "ts": row.get("timestamp"),
-                            "origin": "werkbank" if client_message_id else origin,
+                            "origin": _row_origin(row, origin, plugin_id) if role == "user" else origin,
                             "tool_call_id": None, "tool_name": None,
                             "is_error": False, "truncated": False}
     raw = _text(row.get("content"))
@@ -113,16 +127,9 @@ def message_item(row: Dict[str, Any], origin: Optional[str] = None) -> Optional[
     return item
 
 
-def _epoch_seconds(ts: Any) -> Optional[float]:
-    if isinstance(ts, (int, float)):
-        return float(ts)
-    if isinstance(ts, str) and ts:
-        from datetime import datetime
-        try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-    return None
+def _row_id(row: Dict[str, Any]) -> Optional[int]:
+    rid = row.get("id")
+    return rid if isinstance(rid, int) and not isinstance(rid, bool) else None
 
 
 def _is_answer_row(row: Dict[str, Any]) -> bool:
@@ -131,31 +138,56 @@ def _is_answer_row(row: Dict[str, Any]) -> bool:
             and bool(_text(row.get("content")).strip()))
 
 
+def _row_uids(rows: List[Dict[str, Any]]) -> set:
+    """Every ``message_uid`` the history rows stand for, the ones a merge folded into them included."""
+    uids = set()
+    for row in rows:
+        if isinstance(row.get("message_uid"), str) and row["message_uid"]:
+            uids.add(row["message_uid"])
+        absorbed = row.get("absorbed_message_uids")
+        if isinstance(absorbed, str):
+            try:
+                absorbed = json.loads(absorbed)
+            except ValueError:
+                absorbed = None
+        if isinstance(absorbed, list):
+            uids.update(u for u in absorbed if isinstance(u, str) and u)
+    return uids
+
+
 def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: Dict[str, Any],
-              window_full: bool) -> None:
-    """Make the snapshot complete up to its ``seq`` (contract, PROTOCOL.md "Snapshot"):
+              window_full: bool, lineage: List[str]) -> None:
+    """Make the snapshot complete up to its ``seq`` (contract, PROTOCOL.md "Snapshot").
 
-    * a ``user.message`` the stream already announced (accepted, steered, queued) whose SessionDB
-      row is not there yet is added from the plugin buffer, under the stream's id. A row stands
-      for it only by that id (``client_message_id`` stored on the row, or the platform id) —
-      never by its text or its time: an unnamed row and the buffered message are both shown;
+    Only entries of the session shown count: its own id or, after a compression, an id of its
+    compression lineage (*lineage*) — never those of a session ``/new`` left behind.
+
+    * a ``user.message`` the stream already announced whose SessionDB row is not there yet is
+      added from the plugin buffer, under the stream's id. A row stands for it only by that id
+      (``client_message_id`` stored on the row, or the platform id) — never by text or time;
     * the final answer of a ``turn.done`` is added from the plugin buffer (id = the turn id) until
-      an answer row of THAT turn exists: an assistant text row written after the turn's
-      ``turn.start`` and before the next ``turn.start`` (row timestamps, never the text).
+      its row is in the history:
+        - the core named the row (``turn.done`` ``message_uid``): only a row with that uid counts;
+        - else by row ids (they only grow): the answer row of a turn is an assistant text row with
+          an id above the turn's mark — the highest row id at its ``turn.start``, or, for a turn
+          begun before the plugin observed the session, at that observation — and not above the
+          mark of the next ``turn.start``. Never the wall clock, never the text.
 
-    Entries older than the history window are left out when the window is full.
+    With a full history window, entries whose row would lie before the window's first row are
+    left out (decided by row ids too).
     """
-    oldest = _epoch_seconds(rows[0].get("timestamp")) if rows and window_full else None
+    allowed = set(lineage)
+    first_row = next((rid for rid in (_row_id(r) for r in rows) if rid is not None), None)
+    low = first_row if window_full else None
     have_ids = {m["id"] for m in messages}
-
-    def too_old(ts) -> bool:
-        seconds = _epoch_seconds(ts)
-        return oldest is not None and seconds is not None and seconds < oldest
 
     for user in pos.get("recent_users") or []:
         board_id = user.get("client_message_id") or user.get("id") or user.get("message_id")
-        if not board_id or str(board_id) in have_ids or too_old(user.get("ts")):
+        if user.get("session_id") not in allowed or not board_id or str(board_id) in have_ids:
             continue
+        mark = user.get("mark")
+        if low is not None and isinstance(mark, int) and mark < low:
+            continue                                       # its row may lie before the window
         messages.append({"id": str(board_id), "client_message_id": user.get("client_message_id"),
                          "message_id": user.get("message_id"), "db_id": None, "role": "user",
                          "text": user.get("text") or "", "ts": user.get("ts"), "origin": user.get("origin"),
@@ -164,22 +196,46 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
                          "from_buffer": True})
         have_ids.add(str(board_id))
 
-    answer_times = [t for t in (_epoch_seconds(r.get("timestamp")) for r in rows if _is_answer_row(r))
-                    if t is not None]
-    starts = sorted(t for t in (_epoch_seconds(s) for s in pos.get("turn_starts") or []) if t is not None)
+    answer_ids = [rid for rid in (_row_id(r) for r in rows if _is_answer_row(r)) if rid is not None]
+    uids = _row_uids(rows)
+    starts = sorted(pos.get("turn_starts") or [], key=lambda t: t.get("order") or 0)
+    observed = pos.get("observed") or {}
     for answer in pos.get("recent_answers") or []:
-        if not (answer.get("text") or "").strip() or too_old(answer.get("ts")):
+        if answer.get("session_id") not in allowed or not (answer.get("text") or "").strip():
             continue
-        started = _epoch_seconds(answer.get("started"))
-        if started is not None:
-            following = next((t for t in starts if t > started), None)
-            if any(t >= started and (following is None or t < following) for t in answer_times):
+        if answer.get("message_uid"):
+            if answer["message_uid"] in uids:
+                continue                                   # its own row is in the history
+            row_id = answer.get("row_id")
+            if low is not None and isinstance(row_id, int) and row_id < low:
+                continue                                   # its row lies before the window
+        else:
+            above = answer.get("start_mark") if answer.get("started") else observed.get(answer.get("session_id"))
+            above = above if isinstance(above, int) else -1
+            following = next((t.get("mark") for t in starts if (t.get("order") or 0) > (answer.get("order") or 0)
+                              and isinstance(t.get("mark"), int)), None)
+            if any(rid > above and (following is None or rid <= following) for rid in answer_ids):
                 continue                                   # this turn's answer row is in the history
+            if low is not None and following is not None and following < low:
+                continue                                   # its row lies before the window
         answer_id = answer.get("turn_id") or f"turn:{len(messages)}"
         messages.append({"id": str(answer_id), "client_message_id": None, "message_id": None, "db_id": None,
                          "role": "assistant", "text": answer.get("text"), "ts": answer.get("ts"),
                          "origin": None, "tool_call_id": None, "tool_name": None, "is_error": False,
                          "truncated": False, "from_buffer": True})
+
+
+def _lineage(host, session_key: str, session_id: Optional[str]) -> List[str]:
+    """*session_id* and its compression ancestors (``SessionDB`` resume lineage), never a session
+    that ``/new`` replaced."""
+    ids = [session_id] if session_id else []
+    lineage = getattr(host, "lineage", None)
+    if callable(lineage) and session_id:
+        try:
+            ids += [str(s) for s in lineage(session_key, session_id) or [] if s]
+        except Exception:
+            pass
+    return ids
 
 
 def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
@@ -195,10 +251,10 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
     rows = [r for r in host.history(session_key, session_id, HISTORY_LIMIT) or [] if isinstance(r, dict)]
     messages: List[Dict[str, Any]] = []
     for row in rows:
-        item = message_item(row, pos["platform"])
+        item = message_item(row, pos["platform"], buffers.plugin_id)
         if item is not None:
             messages.append(item)
-    _complete(messages, rows, pos, len(rows) >= HISTORY_LIMIT)
+    _complete(messages, rows, pos, len(rows) >= HISTORY_LIMIT, _lineage(host, session_key, session_id))
     running = bool(pos["turn_id"]) or bool(host.is_running(session_key))
     session = dict(pos["session"])
     session.setdefault("context_percent", None)

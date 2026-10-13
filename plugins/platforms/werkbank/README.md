@@ -46,7 +46,8 @@ Which SessionDB row is which board message needs no plugin file: the gateway sto
   `interrupt_session`, which refuse other profiles' sessions (WB-1127).
 * Chat, prompt and tool texts stay in memory (ring buffer, 5000 events per session); nothing of
   them is logged, the HTTP handler writes no access log.
-* Before auth: at most 64 connections, 10 s for request line + headers, `Host` must be loopback (`421`).
+* Before auth: at most 64 connections (when full the oldest unauthenticated one is closed, not the
+  new one; authenticated ones have an own quota of 48), 10 s for request line + headers, `Host` must be loopback (`421`).
 * The mirror line is plain text: the board text goes into a literal code block, without control,
   bidi or zero-width characters, capped at 3500 UTF-16 units.
 * Freigaben/Rückfragen (`approvals`, `clarify`) answer `501` until WB-1129.

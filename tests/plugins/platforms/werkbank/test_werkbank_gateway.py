@@ -137,8 +137,8 @@ def _start(tmp_path, ctx, *, mirror=True):
     from plugins.platforms.werkbank.host import GatewayHost
 
     key = keyfile.ensure_key(tmp_path)
-    buffers = buffer.Buffers(plugin_id=PLUGIN_ID)
     host = GatewayHost(ctx, tmp_path)
+    buffers = buffer.Buffers(plugin_id=PLUGIN_ID, watermark=host.row_watermark)
     srv = server.WerkbankServer(key, buffers, host, port=0, heartbeat=0.1, mirror_enabled=lambda: mirror).start()
     return SimpleNamespace(server=srv, key=key, buffers=buffers, host=host, port=srv.port)
 
@@ -469,3 +469,28 @@ def test_core_gate_key_is_the_plugin_id_platforms_werkbank(tmp_path):
                          "    platforms/werkbank:\n      allow_gateway_injection: true\n")
     assert manifest_key(manifest) == PLUGIN_ID
     assert _plugin_settings_entry(cfg, manifest_key(manifest))["allow_gateway_injection"] is True
+
+
+def test_host_row_marks_and_lineage_come_from_the_real_sessiondb(tmp_path):
+    """Row ids only grow (AUTOINCREMENT); the lineage follows compression, never ``/new``."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id=SID, source="telegram")
+    owner = FakeOwner(db)
+    try:
+        from plugins.platforms.werkbank.host import GatewayHost
+
+        host = GatewayHost(Ctx127(owner), tmp_path)
+        assert host.row_watermark(KEY_SESSION, SID) == 0
+        first = db.append_message(SID, "user", "a")
+        db.append_message(SID, "assistant", "b")
+        assert host.row_watermark(KEY_SESSION, SID) > first
+        child, fresh = "20261013_130000_cccccc", "20261013_140000_ffffff"
+        db.end_session(SID, "compression")
+        db.create_session(session_id=child, source="telegram", parent_session_id=SID)
+        db.create_session(session_id=fresh, source="telegram")
+        assert host.lineage(KEY_SESSION, child) == [SID, child]
+        assert host.lineage(KEY_SESSION, fresh) == [fresh]
+    finally:
+        owner.close()

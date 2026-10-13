@@ -542,6 +542,30 @@ def begin_turn(ctx: Any) -> Optional[TurnScope]:
     return scope
 
 
+def _answer_row(messages: Any) -> Dict[str, Any]:
+    """``{message_uid, row_id}`` of the SessionDB row holding this turn's final answer: the
+    trailing assistant message without tool calls (after the turn's last user/tool row), once persisted
+    (``hermes_state_messages._insert_message_rows`` stamps both on the live dict). ``{}`` when the
+    turn wrote no such message or it is not persisted yet — never an earlier turn's row."""
+    if not isinstance(messages, list):
+        return {}
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role in ("user", "tool") or msg.get("tool_calls"):
+            return {}                    # the final answer comes after every tool step of its turn
+        if role == "assistant":
+            uid, row_id = msg.get("message_uid"), msg.get("_row_id")
+            ref: Dict[str, Any] = {}
+            if isinstance(uid, str) and uid:
+                ref["message_uid"] = uid
+                if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0:
+                    ref["row_id"] = row_id
+            return ref
+    return {}
+
+
 def end_turn(scope: Optional[TurnScope], *, result: Any = None, error: Optional[BaseException] = None) -> None:
     """Exactly one terminal event per turn: ``turn.done`` | ``turn.stopped`` | ``error``."""
     if scope is None:
@@ -567,6 +591,7 @@ def end_turn(scope: Optional[TurnScope], *, result: Any = None, error: Optional[
             payload["message"] = _capped(res.get("error") or "", 1024)[0]
             scope.emit("error", scope.turn_id, None, payload)
         else:
+            payload.update(_answer_row(res.get("messages")))  # names the answer's row: no clock, no text
             scope.emit("turn.done", scope.turn_id, None, payload)
     except Exception:
         logger.debug("turn end emit failed", exc_info=True)

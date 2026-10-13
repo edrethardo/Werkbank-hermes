@@ -16,6 +16,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
@@ -29,7 +30,8 @@ HEARTBEAT_S = 15.0
 MAX_BODY = 512 * 1024
 MAX_TEXT = 200_000
 MAX_STREAMS = 32
-MAX_CONNECTIONS = 64                 # open connections; beyond it a new one is closed before auth
+MAX_CONNECTIONS = 64                 # connections not authenticated yet; beyond it the OLDEST one goes
+MAX_AUTHENTICATED = MAX_STREAMS + 16 # authenticated connections (streams + requests): an own quota
 HEADER_DEADLINE_S = 10.0             # request line + headers (+ POST body) must arrive within this
 MIRROR_PREFIX = "aus Werkbank:"
 MIRROR_MAX = 3500                    # UTF-16 units of the quoted text (a Telegram message holds 4096)
@@ -87,27 +89,75 @@ def _loopback_host(header: Optional[str], port: int) -> bool:
     return host in _LOOPBACK_HOSTS and given in ("", str(port))
 
 
+def _hang_up(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)          # its handler thread reads EOF and ends at once
+    except OSError:
+        pass
+
+
 class _Server(ThreadingHTTPServer):
+    """Two quotas, so a local flood cannot lock the board out:
+
+    * connections that have not authenticated yet: at most ``max_pending``. When full, the OLDEST
+      of them is hung up — never the new one — so a client that sends its headers at once always
+      gets through, however fast an attacker reconnects;
+    * authenticated connections: at most ``max_authenticated``, untouched by the first quota (a
+      request beyond it gets 503).
+    """
+
     daemon_threads = True
     allow_reuse_address = True
-    connection_slots: threading.BoundedSemaphore
+    max_pending = MAX_CONNECTIONS
+    max_authenticated = MAX_AUTHENTICATED
+
+    def __init__(self, *args, **kwargs):
+        self._conn_lock = threading.Lock()
+        self._pending: "OrderedDict[Any, None]" = OrderedDict()
+        self._authed: set = set()
+        super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
-        # Bounded before anything is read: a flood of idle connections cannot pile up threads.
-        if not self.connection_slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
+        with self._conn_lock:
+            victims = []
+            while self._pending and len(self._pending) >= self.max_pending:
+                victims.append(self._pending.popitem(last=False)[0])
+            self._pending[request] = None
+        for victim in victims:
+            _hang_up(victim)
         try:
             super().process_request(request, client_address)
         except Exception:
-            self.connection_slots.release()
+            self._forget(request)
             raise
+
+    def authenticate(self, request) -> bool:
+        """Move *request* from the pending to the authenticated quota; False when that is full or
+        the connection was already hung up."""
+        with self._conn_lock:
+            if request not in self._pending or len(self._authed) >= self.max_authenticated:
+                return False
+            del self._pending[request]
+            self._authed.add(request)
+            return True
+
+    def _forget(self, request) -> None:
+        with self._conn_lock:
+            self._pending.pop(request, None)
+            self._authed.discard(request)
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.connection_slots.release()
+            self._forget(request)
+
+    def handle_error(self, request, client_address):
+        # A client that hangs up (or was hung up) mid-answer is normal here: no traceback flood.
+        import sys
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, OSError):
+            logger.warning("werkbank: request failed (%s)", type(exc).__name__)
 
 
 class WerkbankServer:
@@ -115,7 +165,8 @@ class WerkbankServer:
 
     def __init__(self, key: str, buffers, host, port: int = DEFAULT_PORT, *, heartbeat: float = HEARTBEAT_S,
                  mirror_enabled: Callable[[], bool] = lambda: True, max_streams: int = MAX_STREAMS,
-                 max_connections: int = MAX_CONNECTIONS, header_deadline: float = HEADER_DEADLINE_S) -> None:
+                 max_connections: int = MAX_CONNECTIONS, max_authenticated: int = MAX_AUTHENTICATED,
+                 header_deadline: float = HEADER_DEADLINE_S) -> None:
         if not key or any(c.isspace() for c in key):
             raise ValueError("unusable key")
         self._wanted = ("Bearer " + key).encode("utf-8")
@@ -126,6 +177,7 @@ class WerkbankServer:
         self.mirror_enabled = mirror_enabled
         self.max_streams = max_streams
         self.max_connections = max_connections
+        self.max_authenticated = max_authenticated
         self.header_deadline = header_deadline
         self.open_streams = 0
         self._streams_lock = threading.Lock()
@@ -144,7 +196,8 @@ class WerkbankServer:
 
     def start(self) -> "WerkbankServer":
         self._httpd = _Server((HOST, self.requested_port), _handler(self))
-        self._httpd.connection_slots = threading.BoundedSemaphore(self.max_connections)
+        self._httpd.max_pending = self.max_connections
+        self._httpd.max_authenticated = self.max_authenticated
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="werkbank-plugin-http",
                                         daemon=True)
         self._thread.start()
@@ -211,9 +264,18 @@ def _handler(app: WerkbankServer):
         def _in_time(self) -> None:
             self._deadline.cancel()
 
+        def handle(self):
+            try:
+                super().handle()
+            except OSError:                       # BrokenPipe, reset, hung up by the quota: no traceback
+                self.close_connection = True
+
         def finish(self):
             self._deadline.cancel()
-            super().finish()
+            try:
+                super().finish()
+            except OSError:
+                pass
 
         def parse_request(self):
             ok = super().parse_request()
@@ -238,10 +300,14 @@ def _handler(app: WerkbankServer):
             if not _loopback_host(self.headers.get("Host"), app.port):
                 self._json(421, {"error": "misdirected request"})
                 return False
-            if app.authorized(self.headers.get("Authorization")):
-                return True
-            self._json(401, {"error": "unauthorized"})
-            return False
+            if not app.authorized(self.headers.get("Authorization")):
+                self._json(401, {"error": "unauthorized"})
+                return False
+            httpd = app._httpd
+            if httpd is not None and not httpd.authenticate(self.connection):
+                self._json(503, {"error": "busy", "grund": "Zu viele offene Verbindungen zum Hermes-Plugin."})
+                return False
+            return True
 
         def _session(self, parts) -> Optional[str]:
             key = urllib.parse.unquote(parts[2])

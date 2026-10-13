@@ -5777,7 +5777,8 @@ def is_compaction_summary_message(message: Any) -> bool:
 
 # Display metadata that survives projection; other metadata may describe synthetic events and must
 # not look human.
-SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions",)
+# fork: werkbank-chat — a plugin sender's own message id (and its plugin) names the row across compression.
+SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions", "client_message_id", "hermes_plugin_id")  # fork: werkbank-chat
 
 
 def _handoff_only_content(content: Any) -> Any:

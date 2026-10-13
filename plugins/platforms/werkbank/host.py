@@ -151,6 +151,34 @@ class GatewayHost:
             logger.info("werkbank: history not readable for the snapshot")
             return []
 
+    def row_watermark(self, session_key: str, session_id: Optional[str]) -> Optional[int]:
+        """Highest SessionDB row id of *session_id* (rewound rows included), ``0`` for none.
+
+        ``messages.id`` is AUTOINCREMENT: every row written later has a higher id, whatever the
+        clock does. ``None`` when the store cannot be read."""
+        db = self._db(session_key)
+        get = getattr(db, "get_messages", None)
+        if not session_id or get is None:
+            return None
+        try:
+            rows = list(get(session_id, include_inactive=True, latest=True, limit=1))
+        except Exception:
+            return None
+        rid = rows[-1].get("id") if rows and isinstance(rows[-1], dict) else 0
+        return rid if isinstance(rid, int) and not isinstance(rid, bool) else None
+
+    def lineage(self, session_key: str, session_id: Optional[str]) -> List[str]:
+        """*session_id*'s compression lineage (``SessionDB.get_compression_lineage``, root → tip) —
+        never across ``/new``, ``/branch`` or a fork; ``[session_id]`` when the store cannot tell."""
+        db = self._db(session_key)
+        walk = getattr(db, "get_compression_lineage", None)
+        if not session_id or not callable(walk):
+            return [session_id] if session_id else []
+        try:
+            return [str(s) for s in walk(session_id) if s] or [session_id]
+        except Exception:
+            return [session_id]
+
     def tool_output(self, session_key: str, session_id: Optional[str], tool_call_id: str) -> Optional[str]:
         for row in reversed(self.history(session_key, session_id, _TOOL_SCAN)):
             if row.get("role") == "tool" and row.get("tool_call_id") == tool_call_id:

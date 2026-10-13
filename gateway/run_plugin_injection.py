@@ -28,17 +28,20 @@ def _client_message_id_meta(client_message_id: Optional[str]) -> dict:  # fork: 
 
 
 def client_message_metadata(event: Any) -> dict:  # fork: werkbank-chat
-    """``{"client_message_id": …}`` for a plugin-injected event that carries one, else ``{}``.
+    """``{"client_message_id": …, "hermes_plugin_id": …}`` for a plugin-injected event that carries
+    a client id, else ``{}``.
 
     Merged into ``persist_user_display_metadata`` so the turn's SessionDB user row names its
-    message exactly. Only internal plugin injections qualify: a human message never does, and
-    ``message_id`` (reply anchor, ledger key) is never touched."""
+    message and the plugin that sent it exactly. Only internal plugin injections qualify: a human
+    message never does, and ``message_id`` (reply anchor, ledger key) is never touched."""
     meta = getattr(event, "metadata", None) or {}  # fork: werkbank-chat
     cmid = meta.get("client_message_id")  # fork: werkbank-chat
     if (not getattr(event, "internal", False) or meta.get("hermes_plugin_injection") is not True  # fork: werkbank-chat
             or not isinstance(cmid, str) or not cmid):  # fork: werkbank-chat
         return {}  # fork: werkbank-chat
-    return {"client_message_id": cmid}  # fork: werkbank-chat
+    plugin_id = meta.get("hermes_plugin_id")  # fork: werkbank-chat
+    return {"client_message_id": cmid,  # fork: werkbank-chat
+            **({"hermes_plugin_id": plugin_id} if isinstance(plugin_id, str) and plugin_id else {})}  # fork: werkbank-chat
 
 
 def _session_key_profile(session_key: str) -> Optional[str]:  # fork: werkbank-chat

@@ -40,7 +40,8 @@ def _telegram_event():
 
 
 def test_client_message_metadata_only_for_plugin_injections():
-    assert client_message_metadata(_plugin_event()) == {"client_message_id": "wb-1"}
+    assert client_message_metadata(_plugin_event()) == {"client_message_id": "wb-1",
+                                                        "hermes_plugin_id": "platforms/werkbank"}
     assert client_message_metadata(_plugin_event(cmid=None)) == {}
     assert client_message_metadata(_telegram_event()) == {}
     internal_no_plugin = MessageEvent(text="wake", source=_source(), internal=True,
@@ -117,3 +118,61 @@ async def test_queued_followup_persists_the_client_message_id(monkeypatch, tmp_p
     kwargs = runner._run_agent.await_args.kwargs
     assert kwargs["persist_user_display_metadata"]["client_message_id"] == "wb-2"
     assert kwargs["inbound_message_id"] is None
+
+
+# ── turn.done names the row of its final answer (WB-1128 review 3) ─────────────────────────────
+
+
+def _done_payload(result):
+    from gateway import session_events
+
+    sent = []
+    scope = session_events.TurnScope(session_key=KEY, session_id="s1", platform="telegram", turn_id="turn_x")
+    scope.emit = lambda type_, id_=None, parent_id=None, payload=None: sent.append((type_, payload))
+    session_events.end_turn(scope, result=result)
+    assert [t for t, _ in sent] == ["turn.done"]
+    return sent[0][1]
+
+
+def test_turn_done_carries_the_message_uid_and_row_id_of_the_answer_row(tmp_path):
+    from contextlib import closing
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+
+    with closing(SessionDB(db_path=Path(tmp_path) / "state.db")) as db:
+        db.create_session("s1", "telegram", model="test/model")
+        messages = [{"role": "user", "content": "frage"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+                    {"role": "tool", "content": "ok", "tool_call_id": "c1"},
+                    {"role": "assistant", "content": "Antwort"}]
+        db.append_messages_batch("s1", messages)
+        row = [r for r in db.get_messages("s1") if r["role"] == "assistant" and r["content"] == "Antwort"][0]
+    payload = _done_payload({"final_response": "Antwort", "messages": messages})
+    assert payload["message_uid"] == row["message_uid"] and payload["row_id"] == row["id"]
+
+
+def test_turn_done_names_no_row_when_the_turn_wrote_no_answer():
+    # the last assistant text belongs to an EARLIER turn: never borrowed
+    history = [{"role": "assistant", "content": "alt", "message_uid": "u-alt", "_row_id": 3},
+               {"role": "user", "content": "neu", "message_uid": "u-neu", "_row_id": 4}]
+    payload = _done_payload({"final_response": "x", "messages": history})
+    assert "message_uid" not in payload and "row_id" not in payload
+    # not persisted yet: no uid on the dict, nothing named
+    payload = _done_payload({"final_response": "x", "messages": [{"role": "assistant", "content": "x"}]})
+    assert "message_uid" not in payload and "row_id" not in payload
+
+
+# ── compression keeps the sender's id on a carried user turn ───────────────────────────────────
+
+
+def test_compression_live_projection_keeps_client_message_id_and_plugin_id():
+    from agent.context_compressor import user_originated_turn_view
+    from tests.agent.test_reference_handoff_active_turn import _composite_handoff
+
+    carrier = _composite_handoff()
+    carrier["display_metadata"] = {"client_message_id": "wb-7", "hermes_plugin_id": "platforms/werkbank",
+                                   "gateway_input_owner": "x"}
+    live = user_originated_turn_view(carrier)
+    assert live["display_metadata"] == {"client_message_id": "wb-7", "hermes_plugin_id": "platforms/werkbank"}

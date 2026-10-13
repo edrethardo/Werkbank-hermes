@@ -48,8 +48,9 @@ def start(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[in
     except (OSError, keyfile.KeyFileError) as exc:
         logger.warning("werkbank: key file not usable (%s)", type(exc).__name__)
         return None
-    buffers = buffer.Buffers(plugin_id=getattr(ctx, "plugin_id", "platforms/werkbank"))
     host = host or GatewayHost(ctx, home)
+    buffers = buffer.Buffers(plugin_id=getattr(ctx, "plugin_id", "platforms/werkbank"),
+                             watermark=getattr(host, "row_watermark", None))
     mirror = bool(settings.mirror_to_telegram)
     try:
         srv = server.WerkbankServer(key, buffers, host, settings.port if port is None else port,
