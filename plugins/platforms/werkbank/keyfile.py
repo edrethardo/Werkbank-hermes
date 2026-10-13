@@ -1,8 +1,8 @@
 """The shared secret between this plugin and the Werkbank board.
 
 ``<profile home>/plugin-data/werkbank/key``: directory 0700, file 0600, created once on the first
-start and reused afterwards (the board reads it from there — same user, same machine). The key
-never appears in a log line or an HTTP answer.
+start and reused afterwards (the board reads it from there — same user, same machine). A key
+shorter than ``MIN_KEY_CHARS`` is replaced by a new one. The key never appears in a log line or an HTTP answer.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import stat
 from pathlib import Path
 
 KEY_BYTES = 32
+MIN_KEY_CHARS = 32          # a shorter (hand-written, truncated) key is replaced by a new one
 
 
 def key_dir(home: Path) -> Path:
@@ -59,7 +60,7 @@ def ensure_key(home: Path) -> str:
         key = _read(path)
     except FileNotFoundError:
         key = ""
-    if key and not any(c.isspace() for c in key):
+    if len(key) >= MIN_KEY_CHARS and not any(c.isspace() for c in key):
         return key
     key = secrets.token_urlsafe(KEY_BYTES)
     tmp = directory / f".key.{os.getpid()}.{secrets.token_hex(4)}"

@@ -32,6 +32,7 @@ _PENDING_IDS = 256          # client_message_ids waiting for their user.message 
 _ACCEPTED_IDS = 2048        # client_message_ids already accepted per session (409 on a repeat)
 _RECENT_USERS = 200         # user.message events kept for the snapshot (rows not yet in the DB)
 _RECENT_ANSWERS = 20        # final answers of turn.done kept for the snapshot
+_TURN_STARTS = 200          # turn.start times kept: which answer row belongs to which turn
 
 
 def initial_epoch(now: Optional[float] = None) -> int:
@@ -66,6 +67,10 @@ class SessionBuffer:
         # Survive epochs: what a snapshot must show even before the SessionDB has it.
         self.recent_users: deque = deque(maxlen=_RECENT_USERS)
         self.recent_answers: deque = deque(maxlen=_RECENT_ANSWERS)
+        # turn_id -> ts of its turn.start: which history rows belong to which turn (by time, not text)
+        self.turn_starts: "OrderedDict[str, str]" = OrderedDict()
+        self.readers = 0                 # open event streams on this session (never evicted while > 0)
+        self.evicted = False
         self.tool_count = 0
         self.error_count = 0
 
@@ -111,8 +116,7 @@ class Buffers:
             if buf is None:
                 buf = SessionBuffer(session_key, session_id, platform, self._take_epoch(), self.ring)
                 self._sessions[session_key] = buf
-                while len(self._sessions) > self.max_sessions:
-                    self._sessions.popitem(last=False)
+                self._evict(keep=session_key)
                 self.cond.notify_all()
             else:
                 self._sessions.move_to_end(session_key)
@@ -123,6 +127,23 @@ class Buffers:
                     buf.session_id = session_id
                     buf.known_ids.add(session_id)
             return buf
+
+    def _evict(self, keep: str) -> None:
+        """Drop least recently used sessions beyond ``max_sessions``: first those nobody streams;
+        a streamed one only when nothing else is left — its stream then ends with ``session.epoch``."""
+        while len(self._sessions) > self.max_sessions:
+            idle = [k for k, b in self._sessions.items() if k != keep and b.readers <= 0]
+            victims = idle or [k for k in self._sessions if k != keep]
+            if not victims:
+                return
+            self._sessions.pop(victims[0]).evicted = True
+
+    def reader(self, delta: int, session_key: str) -> None:
+        """Count an event stream opening (+1) or closing (-1) on *session_key*."""
+        with self.cond:
+            buf = self._sessions.get(session_key)
+            if buf is not None:
+                buf.readers = max(0, buf.readers + delta)
 
     def get(self, session_key: str) -> Optional[SessionBuffer]:
         with self.cond:
@@ -244,9 +265,14 @@ class Buffers:
                     "message_id": payload.get("message_id"), "text": str(payload.get("text") or ""),
                     "origin": origin, "ts": ts, "delivery": payload.get("delivery"),
                     "synthetic": payload.get("synthetic")})
+            if type_ == "turn.start" and id_ is not None:
+                buf.turn_starts[str(id_)] = ts
+                while len(buf.turn_starts) > _TURN_STARTS:
+                    buf.turn_starts.popitem(last=False)
             elif type_ == "turn.done" and payload.get("final_response"):
                 buf.recent_answers.append({"turn_id": None if id_ is None else str(id_),
-                                           "text": str(payload["final_response"]), "ts": ts})
+                                           "text": str(payload["final_response"]), "ts": ts,
+                                           "started": buf.turn_starts.get(str(id_)) if id_ is not None else None})
             buf.seq += 1
             buf.events.append({
                 "v": 1, "session_key": key, "session_id": buf.session_id, "epoch": buf.epoch,
@@ -292,6 +318,7 @@ class Buffers:
                     "session_id": buf.session_id, "platform": buf.platform,
                     "recent_users": [dict(u) for u in buf.recent_users],
                     "recent_answers": [dict(a) for a in buf.recent_answers],
+                    "turn_starts": list(buf.turn_starts.values()),
                     # counted since the board first asked for this session (this plugin process)
                     "session": {"model": buf.model, "tool_count": buf.tool_count,
                                 "errors": buf.error_count}}

@@ -11,8 +11,10 @@ import hmac
 import json
 import logging
 import re
+import socket
 import threading
 import time
+import unicodedata
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
@@ -27,22 +29,85 @@ HEARTBEAT_S = 15.0
 MAX_BODY = 512 * 1024
 MAX_TEXT = 200_000
 MAX_STREAMS = 32
-MIRROR_PREFIX = "aus Werkbank: "
-MIRROR_MAX = 3500                    # a Telegram message holds 4096 characters
+MAX_CONNECTIONS = 64                 # open connections; beyond it a new one is closed before auth
+HEADER_DEADLINE_S = 10.0             # request line + headers (+ POST body) must arrive within this
+MIRROR_PREFIX = "aus Werkbank:"
+MIRROR_MAX = 3500                    # UTF-16 units of the quoted text (a Telegram message holds 4096)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")      # = the board's bruecke.ID_RE
 _KEY_MAX = 512
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+_FENCE_RUN = re.compile(r"`{3,}")
+
+
+def _plain(text: str) -> str:
+    """*text* without control, format (bidi, zero-width) or separator characters; tabs become
+    spaces, line breaks stay ``\n``."""
+    out = []
+    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
+        if ch == "\n":
+            out.append(ch)
+        elif ch == "\t":
+            out.append(" ")
+        elif unicodedata.category(ch) in ("Zl", "Zp"):
+            out.append("\n")
+        elif unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            out.append(ch)
+    return "".join(out)
+
+
+def _utf16_cap(text: str, limit: int) -> str:
+    if len(text.encode("utf-16-le")) // 2 <= limit:
+        return text
+    used, cut = 0, 0
+    for i, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > limit:
+            cut = i
+            break
+    return text[:cut].rstrip() + " …"
 
 
 def mirror_line(text: str) -> str:
-    body = text.strip()
-    if len(body) > MIRROR_MAX:
-        body = body[:MIRROR_MAX].rstrip() + " …"
-    return MIRROR_PREFIX + body
+    """The line posted into the session's own chat: a fixed prefix, then the board text as a literal
+    code block — never rendered as Markdown, no control/bidi characters, capped. A run of three
+    backticks in the text is broken up so it cannot close the block."""
+    body = _plain(text).strip("\n ")
+    body = _FENCE_RUN.sub(lambda m: "`\u2009" * (len(m.group()) - 1) + "`", body)
+    body = _utf16_cap(body, MIRROR_MAX)
+    return f"{MIRROR_PREFIX}\n```\n{body}\n```"
+
+
+def _loopback_host(header: Optional[str], port: int) -> bool:
+    """``Host`` names this loopback server (DNS-rebinding defense in depth)."""
+    if not header:
+        return False
+    host, _, given = header.strip().lower().rpartition(":")
+    if not host or not given.isdigit():
+        host, given = header.strip().lower(), ""
+    return host in _LOOPBACK_HOSTS and given in ("", str(port))
 
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    connection_slots: threading.BoundedSemaphore
+
+    def process_request(self, request, client_address):
+        # Bounded before anything is read: a flood of idle connections cannot pile up threads.
+        if not self.connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
 
 
 class WerkbankServer:
@@ -50,7 +115,7 @@ class WerkbankServer:
 
     def __init__(self, key: str, buffers, host, port: int = DEFAULT_PORT, *, heartbeat: float = HEARTBEAT_S,
                  mirror_enabled: Callable[[], bool] = lambda: True, max_streams: int = MAX_STREAMS,
-                 idmap=None) -> None:
+                 max_connections: int = MAX_CONNECTIONS, header_deadline: float = HEADER_DEADLINE_S) -> None:
         if not key or any(c.isspace() for c in key):
             raise ValueError("unusable key")
         self._wanted = ("Bearer " + key).encode("utf-8")
@@ -60,10 +125,8 @@ class WerkbankServer:
         self.heartbeat = heartbeat
         self.mirror_enabled = mirror_enabled
         self.max_streams = max_streams
-        if idmap is None:
-            from .idmap import IdMap
-            idmap = IdMap()
-        self.idmap = idmap
+        self.max_connections = max_connections
+        self.header_deadline = header_deadline
         self.open_streams = 0
         self._streams_lock = threading.Lock()
         self._httpd: Optional[_Server] = None
@@ -81,6 +144,7 @@ class WerkbankServer:
 
     def start(self) -> "WerkbankServer":
         self._httpd = _Server((HOST, self.requested_port), _handler(self))
+        self._httpd.connection_slots = threading.BoundedSemaphore(self.max_connections)
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="werkbank-plugin-http",
                                         daemon=True)
         self._thread.start()
@@ -131,6 +195,32 @@ def _handler(app: WerkbankServer):
         def log_error(self, fmt, *args):
             pass
 
+        # -- total deadline for request line + headers (slowloris) ------------------------------
+        def setup(self):
+            super().setup()
+            self._deadline = threading.Timer(app.header_deadline, self._expire)
+            self._deadline.daemon = True
+            self._deadline.start()
+
+        def _expire(self):
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def _in_time(self) -> None:
+            self._deadline.cancel()
+
+        def finish(self):
+            self._deadline.cancel()
+            super().finish()
+
+        def parse_request(self):
+            ok = super().parse_request()
+            if ok and self.command != "POST":
+                self._in_time()                  # a POST body still runs under the deadline
+            return ok
+
         # -- answers --------------------------------------------------------------------------
         def _json(self, code: int, body: Dict[str, Any]) -> None:
             data = json.dumps(body).encode("utf-8")
@@ -145,6 +235,9 @@ def _handler(app: WerkbankServer):
             self._json(code, {"error": error, "grund": grund, **extra})
 
         def _auth(self) -> bool:
+            if not _loopback_host(self.headers.get("Host"), app.port):
+                self._json(421, {"error": "misdirected request"})
+                return False
             if app.authorized(self.headers.get("Authorization")):
                 return True
             self._json(401, {"error": "unauthorized"})
@@ -184,7 +277,7 @@ def _handler(app: WerkbankServer):
                     return
                 what = parts[3:]
                 if what == ["snapshot"]:
-                    body = snapshot.build(app.buffers, app.host, key, app.idmap)
+                    body = snapshot.build(app.buffers, app.host, key)
                     if body is None:
                         return self._refuse(404, "unknown session", "Diese Sitzung ist nicht (mehr) aufgelöst.")
                     return self._json(200, body)
@@ -233,11 +326,13 @@ def _handler(app: WerkbankServer):
                 return self._refuse(400, "bad epoch/after", "epoch und after müssen Zahlen sein.")
             if not app.take_stream():
                 return self._refuse(429, "too many streams", "Zu viele offene Ereignisströme.")
+            app.buffers.reader(+1, key)
             try:
                 self._stream(key, epoch, after)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
+                app.buffers.reader(-1, key)
                 app.give_stream()
 
         def _frame(self, event) -> None:
@@ -250,24 +345,30 @@ def _handler(app: WerkbankServer):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
-            with buffers.cond:
+            with buffers.cond:                   # decide under the lock, write outside it
                 buf = buffers.get(key)
-                pending = None if buf is None or epoch != buf.epoch else buf.after(after)
                 if buf is None:
                     return
-                if pending is None:
-                    self._frame(buffers.epoch_event(buf, "epoch" if epoch != buf.epoch else "after"))
-                    self.wfile.flush()
-                    return
+                pending = None if epoch != buf.epoch else buf.after(after)
+                first = (buffers.epoch_event(buf, "epoch" if epoch != buf.epoch else "after")
+                         if pending is None else None)
                 current = buf.epoch
+            if first is not None:
+                self._frame(first)
+                self.wfile.flush()
+                return
             sent = after
             last = time.monotonic()
             while not app.closing:
                 with buffers.cond:
                     end = None
-                    if buffers.get(key) is not buf or buffers.closed:
+                    if buffers.closed:
                         return
-                    if buf.epoch != current:
+                    if buf.evicted or buffers.get(key) is not buf:
+                        # dropped from the buffers (LRU): the client reloads, re-resolves
+                        end = buffers.epoch_event(buf, "neu")
+                        pending = []
+                    elif buf.epoch != current:
                         end = buffers.epoch_event(buf, "neu")
                         pending = []
                     else:
@@ -301,6 +402,7 @@ def _handler(app: WerkbankServer):
             if length < 0 or length > MAX_BODY:
                 return self._refuse(413, "too large", "Die Anfrage ist zu groß.")
             raw = self.rfile.read(length) if length else b""
+            self._in_time()
             try:
                 body = json.loads(raw.decode("utf-8")) if raw else {}
             except (ValueError, UnicodeDecodeError):
@@ -348,14 +450,12 @@ def _handler(app: WerkbankServer):
             if not app.buffers.accept_id(key, cmid, awaits_event=awaits):
                 return self._refuse(409, "duplicate", "Diese Nachricht wurde schon angenommen.",
                                     accepted=False)
-            app.idmap.remember(key, text, cmid)       # before the turn can persist its row
             try:
                 accepted, _ = app.host.inject(key, text, cmid)
             except Exception:
                 accepted = False
             if not accepted:
                 app.buffers.release_id(key, cmid)
-                app.idmap.forget(key, cmid)
                 logger.info("werkbank: message refused by the gateway (session known, text not logged)")
                 return self._refuse(503, "not accepted",
                                     "Hermes hat die Nachricht nicht angenommen (Gateway nicht bereit oder "

@@ -42,7 +42,6 @@ def start(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[in
     """Key file, buffers, hook, server. Returns the server, or ``None`` (logged, no text)."""
     from . import buffer, keyfile, server
     from .host import GatewayHost
-    from .idmap import IdMap
 
     try:
         key = keyfile.ensure_key(home)
@@ -54,8 +53,7 @@ def start(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[in
     mirror = bool(settings.mirror_to_telegram)
     try:
         srv = server.WerkbankServer(key, buffers, host, settings.port if port is None else port,
-                                    mirror_enabled=lambda: mirror,
-                                    idmap=IdMap(keyfile.key_dir(home) / "messages.json", secret=key)).start()
+                                    mirror_enabled=lambda: mirror).start()
     except OSError as exc:
         logger.warning("werkbank: cannot listen on 127.0.0.1:%s (%s)", settings.port, type(exc).__name__)
         return None

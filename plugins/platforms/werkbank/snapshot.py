@@ -68,20 +68,34 @@ def _tool_failed(tool_name: Any, content: Any) -> bool:
         return False
 
 
-def message_item(row: Dict[str, Any], origin: Optional[str] = None,
-                 client_message_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def row_client_message_id(row: Dict[str, Any]) -> Optional[str]:
+    """The sender's own id the gateway stored on a plugin-injected user row
+    (``display_metadata.client_message_id``, ``gateway/run_plugin_injection.client_message_metadata``)."""
+    meta = row.get("display_metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = None
+    cmid = meta.get("client_message_id") if isinstance(meta, dict) else None
+    return cmid if isinstance(cmid, str) and cmid else None
+
+
+def message_item(row: Dict[str, Any], origin: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """One SessionDB row as the board draws it; ``None`` for rows it never shows."""
     role = row.get("role")
     if role not in ("user", "assistant", "tool"):
         return None
     db_id = row.get("id")
     platform_id = str(row["platform_message_id"]) if row.get("platform_message_id") else None
+    client_message_id = row_client_message_id(row) if role == "user" else None
     # The same id the stream gives this message (session_events._message_ref): the sender's own
     # id, else the platform's, and only when both are missing the row id as "db:<id>".
     item: Dict[str, Any] = {"id": client_message_id or platform_id or f"db:{db_id}",
                             "client_message_id": client_message_id, "message_id": platform_id,
                             "db_id": db_id, "role": role, "ts": row.get("timestamp"),
-                            "origin": origin, "tool_call_id": None, "tool_name": None,
+                            "origin": "werkbank" if client_message_id else origin,
+                            "tool_call_id": None, "tool_name": None,
                             "is_error": False, "truncated": False}
     raw = _text(row.get("content"))
     if role == "tool":
@@ -111,12 +125,10 @@ def _epoch_seconds(ts: Any) -> Optional[float]:
     return None
 
 
-def _redacted(text: str) -> str:
-    try:
-        from gateway.session_events import _redact
-        return _redact(text)
-    except Exception:
-        return text
+def _is_answer_row(row: Dict[str, Any]) -> bool:
+    """An assistant row that can be a turn's final answer (text, no tool calls)."""
+    return (row.get("role") == "assistant" and not row.get("tool_calls")
+            and bool(_text(row.get("content")).strip()))
 
 
 def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: Dict[str, Any],
@@ -124,24 +136,17 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
     """Make the snapshot complete up to its ``seq`` (contract, PROTOCOL.md "Snapshot"):
 
     * a ``user.message`` the stream already announced (accepted, steered, queued) whose SessionDB
-      row is not written yet is added from the plugin buffer, under the stream's id;
-    * the final answer of a ``turn.done`` whose assistant row is not in the SessionDB yet is added
-      from the plugin buffer (id = the turn id), so the re-sync after ``turn.done`` shows it.
+      row is not there yet is added from the plugin buffer, under the stream's id. A row stands
+      for it only by that id (``client_message_id`` stored on the row, or the platform id) —
+      never by its text or its time: an unnamed row and the buffered message are both shown;
+    * the final answer of a ``turn.done`` is added from the plugin buffer (id = the turn id) until
+      an answer row of THAT turn exists: an assistant text row written after the turn's
+      ``turn.start`` and before the next ``turn.start`` (row timestamps, never the text).
 
-    A row that is already there (same id; or an unnamed row whose text ends with the announced text)
-    is not doubled.
     Entries older than the history window are left out when the window is full.
     """
     oldest = _epoch_seconds(rows[0].get("timestamp")) if rows and window_full else None
     have_ids = {m["id"] for m in messages}
-    # Rows the id map could not name ("db:<n>") may still be an announced message (a prefixed text);
-    # each such row stands for at most one announced message, newest rows first.
-    # Only a message without a platform id can have such a row (a platform id is stored with it),
-    # and only a row written after the message was announced (60 s clock slack).
-    unnamed = [((m.get("text") or "").strip(), _epoch_seconds(m.get("ts"))) for m in messages
-               if m["role"] == "user" and str(m["id"]).startswith("db:")]
-    answer_texts = {_redacted((m.get("text") or "")).strip() for m in messages if m["role"] == "assistant"}
-    answer_texts |= {(m.get("text") or "").strip() for m in messages if m["role"] == "assistant"}
 
     def too_old(ts) -> bool:
         seconds = _epoch_seconds(ts)
@@ -149,16 +154,7 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
 
     for user in pos.get("recent_users") or []:
         board_id = user.get("client_message_id") or user.get("id") or user.get("message_id")
-        text = (user.get("text") or "").strip()
-        if not board_id or board_id in have_ids or too_old(user.get("ts")):
-            continue
-        announced = _epoch_seconds(user.get("ts"))
-        hit = None if user.get("message_id") else next(
-            (i for i in range(len(unnamed) - 1, -1, -1)
-             if text and unnamed[i][0].endswith(text)
-             and (announced is None or unnamed[i][1] is None or unnamed[i][1] >= announced - 60)), None)
-        if hit is not None:
-            del unnamed[hit]
+        if not board_id or str(board_id) in have_ids or too_old(user.get("ts")):
             continue
         messages.append({"id": str(board_id), "client_message_id": user.get("client_message_id"),
                          "message_id": user.get("message_id"), "db_id": None, "role": "user",
@@ -167,19 +163,26 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
                          "tool_call_id": None, "tool_name": None, "is_error": False, "truncated": False,
                          "from_buffer": True})
         have_ids.add(str(board_id))
+
+    answer_times = [t for t in (_epoch_seconds(r.get("timestamp")) for r in rows if _is_answer_row(r))
+                    if t is not None]
+    starts = sorted(t for t in (_epoch_seconds(s) for s in pos.get("turn_starts") or []) if t is not None)
     for answer in pos.get("recent_answers") or []:
-        text = (answer.get("text") or "").strip()
-        if not text or text in answer_texts or too_old(answer.get("ts")):
+        if not (answer.get("text") or "").strip() or too_old(answer.get("ts")):
             continue
+        started = _epoch_seconds(answer.get("started"))
+        if started is not None:
+            following = next((t for t in starts if t > started), None)
+            if any(t >= started and (following is None or t < following) for t in answer_times):
+                continue                                   # this turn's answer row is in the history
         answer_id = answer.get("turn_id") or f"turn:{len(messages)}"
         messages.append({"id": str(answer_id), "client_message_id": None, "message_id": None, "db_id": None,
                          "role": "assistant", "text": answer.get("text"), "ts": answer.get("ts"),
                          "origin": None, "tool_call_id": None, "tool_name": None, "is_error": False,
                          "truncated": False, "from_buffer": True})
-        answer_texts.add(text)
 
 
-def build(buffers, host, session_key: str, idmap=None) -> Optional[Dict[str, Any]]:
+def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
     if buffers.get(session_key) is None:
         return None
     current = host.current_session_id(session_key)
@@ -190,16 +193,10 @@ def build(buffers, host, session_key: str, idmap=None) -> Optional[Dict[str, Any
         return None
     session_id = pos["session_id"]
     rows = [r for r in host.history(session_key, session_id, HISTORY_LIMIT) or [] if isinstance(r, dict)]
-    # Board messages have no platform id in the DB: the plugin's id map names them (idmap.py).
-    users = [r for r in rows if r.get("role") == "user" and not r.get("platform_message_id")]
-    ids = idmap.assign(session_key, [_text(r.get("content")) for r in users]) if idmap else []
-    by_row = {id(r): cmid for r, cmid in zip(users, ids) if cmid}
     messages: List[Dict[str, Any]] = []
     for row in rows:
-        item = message_item(row, pos["platform"], by_row.get(id(row)))
+        item = message_item(row, pos["platform"])
         if item is not None:
-            if item["role"] == "user" and item["client_message_id"]:
-                item["origin"] = "werkbank"
             messages.append(item)
     _complete(messages, rows, pos, len(rows) >= HISTORY_LIMIT)
     running = bool(pos["turn_id"]) or bool(host.is_running(session_key))

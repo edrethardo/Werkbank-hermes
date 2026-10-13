@@ -244,7 +244,7 @@ def test_mirror_line_follows_the_switch(tmp_path, mirror):
     try:
         _resolve(srv)
         call(srv.port, "POST", session_path("messages"), srv.key, {"text": "Deploy?", "client_message_id": "m1"})
-        assert srv.host.mirrored == ([(KEY_SESSION, "aus Werkbank: Deploy?")] if mirror else [])
+        assert srv.host.mirrored == ([(KEY_SESSION, "aus Werkbank:\n```\nDeploy?\n```")] if mirror else [])
     finally:
         srv.server.stop()
 
@@ -253,7 +253,7 @@ def test_mirror_line_is_capped_for_telegram():
     from plugins.platforms.werkbank.server import mirror_line
 
     line = mirror_line("a" * 10_000)
-    assert line.startswith("aus Werkbank: ") and len(line) < 4096 and line.endswith("…")
+    assert line.startswith("aus Werkbank:\n```\n") and len(line) < 4096 and line.endswith("…\n```")
 
 
 def test_stop_uses_interrupt_session_or_answers_501(plugin_server):
@@ -324,10 +324,11 @@ def test_snapshot_holds_an_announced_message_before_its_db_row_exists(plugin_ser
     assert snap["seq"] == 1
     assert [(m["id"], m["client_message_id"], m["origin"], m["delivery"]) for m in _users(snap)] == [
         ("wb-9", "wb-9", "werkbank", "eingereiht")]
-    # the row arrives (the id map does not know it here: matched by its text) → still ONE message
-    srv.host.messages = [{"id": 5, "role": "user", "content": "[Werkbank] später bitte", "timestamp": 2e9}]
+    # the row arrives carrying the id the gateway stored on it → still ONE message, the row
+    srv.host.messages = [{"id": 5, "role": "user", "content": "[Werkbank] später bitte", "timestamp": 2e9,
+                          "display_metadata": {"client_message_id": "wb-9"}}]
     status, snap = call(srv.port, "GET", session_path("snapshot"), srv.key)
-    assert [m["id"] for m in _users(snap)] == ["db:5"]
+    assert [(m["id"], m["db_id"]) for m in _users(snap)] == [("wb-9", 5)]
 
 
 def test_same_text_twice_is_not_hidden_by_an_older_row(plugin_server):

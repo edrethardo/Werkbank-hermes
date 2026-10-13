@@ -8,6 +8,14 @@
           mirror_to_telegram: true   # default true: "aus Werkbank: …" line in the topic
 
 The Werkbank board reads the same ``port`` (``bruecke.read_port``). Keep it a plain number.
+
+Sending and stopping need a SECOND entry, the core's gate under the plugin's id (a bundled
+platform plugin's id is its path, ``platforms/werkbank``); this module does not read it::
+
+    plugins:
+      entries:
+        platforms/werkbank:
+          allow_gateway_injection: true
 """
 
 from __future__ import annotations

@@ -135,13 +135,11 @@ def _injected_event(call_):
 def _start(tmp_path, ctx, *, mirror=True):
     from plugins.platforms.werkbank import buffer, keyfile, server
     from plugins.platforms.werkbank.host import GatewayHost
-    from plugins.platforms.werkbank.idmap import IdMap
 
     key = keyfile.ensure_key(tmp_path)
     buffers = buffer.Buffers(plugin_id=PLUGIN_ID)
     host = GatewayHost(ctx, tmp_path)
-    srv = server.WerkbankServer(key, buffers, host, port=0, heartbeat=0.1, mirror_enabled=lambda: mirror,
-                                idmap=IdMap(keyfile.key_dir(tmp_path) / "messages.json", secret=key)).start()
+    srv = server.WerkbankServer(key, buffers, host, port=0, heartbeat=0.1, mirror_enabled=lambda: mirror).start()
     return SimpleNamespace(server=srv, key=key, buffers=buffers, host=host, port=srv.port)
 
 
@@ -266,7 +264,7 @@ def test_werkbank_message_is_mirrored_into_the_topic_when_switched_on(tmp_path, 
         while mirror and not owner.adapter.sent and time.monotonic() < deadline:
             time.sleep(0.02)
         time.sleep(0.1)
-        assert owner.adapter.sent == ([("4711", "aus Werkbank: Deploy jetzt?", {"thread_id": "51"})]
+        assert owner.adapter.sent == ([("4711", "aus Werkbank:\n```\nDeploy jetzt?\n```", {"thread_id": "51"})]
                                       if mirror else [])
     finally:
         srv.server.stop()
@@ -304,16 +302,19 @@ def test_snapshot_and_stream_name_a_message_by_the_same_board_key(tmp_path, monk
         text = "Bitte die Tests laufen lassen"
         assert call(srv.port, "POST", session_path("messages"), srv.key,
                     {"text": text, "client_message_id": "wb-42"})[0] == 200
-        # What the gateway does with it: announce it, persist the user row (no platform id), answer.
-        session_events.user_message(KEY_SESSION, _injected_event(ctx.injected[-1]), "turn")
-        db.append_message(SID, "user", text)
+        # What the gateway does with it: announce it, persist the user row with the id the turn
+        # stores on it (gateway.run_plugin_injection.client_message_metadata), answer.
+        from gateway.run_plugin_injection import client_message_metadata
+        injected = _injected_event(ctx.injected[-1])
+        session_events.user_message(KEY_SESSION, injected, "turn")
+        db.append_message(SID, "user", text, display_metadata=client_message_metadata(injected))
         telegram = MessageEvent(text="und aus Telegram", message_id="tg-7", source=_source(), metadata={})
         session_events.user_message(KEY_SESSION, telegram, "turn", session_id=SID)
         db.append_message(SID, "user", "und aus Telegram", platform_message_id="tg-7")
         db.append_message(SID, "assistant", "Mache ich.")
         _settle(lambda: srv.buffers.get(KEY_SESSION).seq >= 2)
 
-        if restart:                                  # the id map survives a plugin restart
+        if restart:                                  # the id is in the row: survives a plugin restart
             srv.server.stop()
             srv = _start(tmp_path, ctx)
             call(srv.port, "GET", f"/v1/resolve?session_id={SID}", srv.key)
@@ -326,8 +327,7 @@ def test_snapshot_and_stream_name_a_message_by_the_same_board_key(tmp_path, monk
         answer = [m for m in snap["messages"] if m["role"] == "assistant"][0]
         assert answer["id"] == f"db:{answer['db_id']}"
         assert users[0]["origin"] == "werkbank"
-        idfile = tmp_path / "plugin-data" / "werkbank" / "messages.json"
-        assert oct(idfile.stat().st_mode & 0o777) == "0o600" and text not in idfile.read_text()
+        assert not (tmp_path / "plugin-data" / "werkbank" / "messages.json").exists()   # no text map
 
         if not restart:
             status, events = sse(srv.port, srv.key, events_path(epoch=epoch), 2)

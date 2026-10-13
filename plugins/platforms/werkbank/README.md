@@ -33,8 +33,10 @@ Keep `port` a plain number (the board reads it without a YAML library). A change
 
 * `<profile home>/plugin-data/werkbank/key` — the shared key (dir 0700, file 0600). The board reads
   it from there (same user).
-* `<profile home>/plugin-data/werkbank/messages.json` — which SessionDB row is which board message
-  (HMAC of the text keyed with the plugin key, the `client_message_id`; no text; 0600).
+
+Which SessionDB row is which board message needs no plugin file: the gateway stores the
+`client_message_id` on the turn's own user row (`display_metadata`, core change marked
+`# fork: werkbank-chat` in `gateway/run_plugin_injection.py` / `gateway/run_turn.py`).
 
 ## Security notes
 
@@ -44,12 +46,19 @@ Keep `port` a plain number (the board reads it without a YAML library). A change
   `interrupt_session`, which refuse other profiles' sessions (WB-1127).
 * Chat, prompt and tool texts stay in memory (ring buffer, 5000 events per session); nothing of
   them is logged, the HTTP handler writes no access log.
+* Before auth: at most 64 connections, 10 s for request line + headers, `Host` must be loopback (`421`).
+* The mirror line is plain text: the board text goes into a literal code block, without control,
+  bidi or zero-width characters, capped at 3500 UTF-16 units.
 * Freigaben/Rückfragen (`approvals`, `clarify`) answer `501` until WB-1129.
+* **Known residual risk on multi-user hosts:** any local user can connect to `127.0.0.1:<port>`
+  (the key stops them), and while the gateway is down another local user could bind the port
+  first and receive the board's requests — including the key in `Authorization`. On a shared host
+  keep the port firewalled per user or wait for a Unix-socket transport (not built).
 
 ## Modules
 
 `__init__.py` (gateway-only start), `config.py`, `keyfile.py`, `buffer.py` (ring buffer, epochs),
 `resolve.py` (`session_id → session_key`), `host.py` (gateway access, feature detection for
-WB-1127), `snapshot.py`, `idmap.py`, `server.py`. Tests: `tests/plugins/platforms/werkbank/`
+WB-1127), `snapshot.py`, `server.py`. Tests: `tests/plugins/platforms/werkbank/`
 (`scripts/run_tests.sh tests/plugins/platforms/werkbank/`); the interop tests use the board's
 `bruecke.py` and `hermes_view.js` from `WERKBANK_REPO` (default `/data/projects/agent_ticket`).

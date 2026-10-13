@@ -12,6 +12,9 @@ WB-1126 event types, the WB-1132 field names and snapshot obligations). The boar
 * Every request: `Authorization: Bearer <key>`. Key file `<profile home>/plugin-data/werkbank/key`
   (directory 0700, file 0600, created on the first start, reused after). Compared with
   `hmac.compare_digest`; missing or wrong → `401 {"error": "unauthorized"}` before anything else.
+* Before auth: at most 64 open connections (more are closed without an answer); request line and
+  headers (a POST body too) must arrive within 10 s; `Host` must be `127.0.0.1` or `localhost`
+  (with or without this port), else `421` (DNS-rebinding defense in depth).
 * Errors are JSON `{"error": "<code>", "grund": "<short German reason>"}`. No answer and no log line
   carries the key, a chat text, a tool text or a request body.
 
@@ -69,7 +72,8 @@ produced; its fields are in the snapshot's `session`.
   session. Wrong `E`, or `N` before the oldest kept event or beyond the newest → exactly ONE
   `session.epoch`, then the stream ends. Otherwise every event with `seq > N`, then live; a
   heartbeat comment `: hb` every 15 s; an epoch change ends the stream with `session.epoch`
-  (`grund: neu`). At most 32 open streams (`429`).
+  (`grund: neu`), so does dropping the session from the buffers (only when every buffered session
+  has an open stream). At most 32 open streams (`429`).
 * `POST /v1/s/{key}/messages {text, client_message_id}` → `{accepted: true}`. `400` bad text
   (empty, > 200 000 chars) or id (`[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`); `409` this id was already
   accepted; `503` the gateway refused (not running, `allow_gateway_injection` missing, foreign
@@ -79,7 +83,8 @@ produced; its fields are in the snapshot's `session`.
   WB-1127 the plugin assigns it to the next `user.message` it injected. While a turn runs the
   gateway steers or queues it (`delivery: nachgeschoben|eingereiht`).
   With `mirror_to_telegram` (default on) the session's chat (the Telegram topic) gets the line
-  `aus Werkbank: <text>` (≤ 3500 chars).
+  `aus Werkbank:` followed by the text as a literal code block (never rendered as Markdown;
+  control, bidi and zero-width characters removed; ≤ 3500 UTF-16 units).
 * `POST /v1/s/{key}/stop` → `{stopped: bool}` via `ctx.interrupt_session(key)` (`false`: nothing
   running or refused). Without that API (core before WB-1127): `501` with `grund`.
 * `POST /v1/s/{key}/approvals/{request_id}`, `POST /v1/s/{key}/clarify/{clarify_id}` → **`501`**
@@ -105,19 +110,22 @@ produced; its fields are in the snapshot's `session`.
   the board de-duplicates by id.
 * **Message ids = stream ids.** `id` is the id the stream uses for the same message:
   `client_message_id`, else the platform message id (`platform_message_id` of the row), only when
-  both are missing `db:<row id>`. `db_id` is the row id. A board message has no platform id in the
-  SessionDB, so the plugin remembers `(session_key, HMAC-SHA256 of the text keyed with the plugin key + its length) → client_message_id`
-  in `plugin-data/werkbank/messages.json` (0600, keyed hashes only, 4000 entries, survives restarts) and
-  names the row with it (a row may carry a gateway prefix: its tail counts).
+  both are missing `db:<row id>`. `db_id` is the row id. A board message's row carries its id
+  itself: the gateway stores `client_message_id` in the row's `display_metadata`
+  (`gateway/run_plugin_injection.client_message_metadata`). Rows are never matched by text or time.
 * **Complete up to `seq`:** every `user.message` announced at or before `seq` (accepted, steered,
   queued) is in `messages` even when its SessionDB row is not written yet (`from_buffer: true`,
   with `delivery`); a steered message that never gets an own row stays there while the plugin
   keeps it (200 per session). Messages accepted but not announced yet arrive later as
-  `user.message` with a higher `seq`.
+  `user.message` with a higher `seq`. A buffered message counts as written only when a row with its
+  id exists — a row without an id (e.g. a turn that failed before the agent persisted) and the
+  buffered message are BOTH shown rather than paired by guesswork.
 * **Final answer after `turn.done`:** the board re-syncs once after `turn.done`. When the turn's
   assistant row is not in the SessionDB yet, the snapshot carries the `final_response` of that
-  `turn.done` as an assistant message (`id` = turn id, `from_buffer: true`); once the row is there
-  it is shown once (as `db:<id>`).
+  `turn.done` as an assistant message (`id` = turn id, `from_buffer: true`) until an answer row of
+  THAT turn exists: an assistant text row (no tool calls) written after the turn's `turn.start` and
+  before the next `turn.start` (row timestamps; never the text — the same answer twice stays twice).
+  Then it is shown once (as `db:<id>`).
 * History: newest 200 SessionDB rows via the store's read API (`get_messages`), tool output capped
   at 4 KB like `tool.end` (`truncated`). `pending_approvals` from `list_gateway_approvals`, commands
   redacted like the event; `pending_clarify` from `get_pending_for_session` (the oldest open one).

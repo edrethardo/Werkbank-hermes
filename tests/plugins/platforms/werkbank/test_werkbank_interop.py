@@ -143,7 +143,7 @@ def test_bridge_speaks_with_the_real_plugin_server(live):
     deadline = time.monotonic() + 3
     while not live.owner.adapter.sent and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert live.owner.adapter.sent[0][1] == "aus Werkbank: Bitte prüfen"
+    assert live.owner.adapter.sent[0][1] == "aus Werkbank:\n```\nBitte prüfen\n```"
 
 
 # ── the chat view (hermes_view.js, WB-1132) reads a real snapshot ──────────────────────────
@@ -205,7 +205,8 @@ def test_chat_view_reads_a_real_plugin_snapshot_and_dedupes_by_the_same_id(live,
     text = "Bitte die Tests laufen lassen"
     assert client.call("POST", client.session_path(key, "messages"),
                        {"text": text, "client_message_id": "wb-42"})[1] == {"accepted": True}
-    live.db.append_message(SID, "user", text)                      # the gateway persisted the turn
+    live.db.append_message(SID, "user", text,                      # the gateway persisted the turn
+                           display_metadata={"client_message_id": "wb-42"})   # with its id on the row
     live.db.append_message(SID, "user", "und aus Telegram", platform_message_id="tg-7")
     live.db.append_message(SID, "assistant", None, tool_calls=[{"id": "call_1", "type": "function",
                                                                  "function": {"name": "terminal"}}])
