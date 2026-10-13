@@ -173,7 +173,10 @@ def unregister_gateway_notify(session_key: str) -> None:
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,  # fork: werkbank-chat
+                             # fork: werkbank-chat — decided_by names the answering surface ("telegram", "werkbank")
+                             # fork: werkbank-chat — for the session event stream; None keeps old callers as-is.
+                             decided_by: Optional[str] = None) -> int:  # fork: werkbank-chat
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
@@ -203,6 +206,8 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry.result = choice
             if reason:
                 entry.reason = reason
+            if decided_by and hasattr(entry, "decided_by"):  # fork: werkbank-chat
+                entry.decided_by = str(decided_by)  # fork: werkbank-chat
             entry.event.set()
     return len(targets)
 

@@ -55,7 +55,16 @@ def register(clarify_id: str, session_key: str, question: str, choices: Optional
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
+    _session_event(entry, "clarify.request", question=str(question or ""),  # fork: werkbank-chat
+                   choices=list(entry.choices or []), multi_select=entry.multi_select)  # fork: werkbank-chat
     return entry
+
+
+def _session_event(entry: "_ClarifyEntry", type_: str, **payload) -> None:  # fork: werkbank-chat
+    # fork: werkbank-chat — clarify.request|resolved|expired keyed by clarify_id; no-op without a subscriber.
+    from gateway import session_events  # fork: werkbank-chat
+    session_events.emit(entry.session_key, None, None, type_, entry.clarify_id, None,  # fork: werkbank-chat
+                        {"clarify_id": entry.clarify_id, **payload})  # fork: werkbank-chat
 
 
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
@@ -87,6 +96,12 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             ids.remove(clarify_id)
             if not ids:
                 _session_index.pop(entry.session_key, None)
+    if entry.response is None or entry.response == CANCELLED:  # fork: werkbank-chat
+        _session_event(entry, "clarify.expired",  # fork: werkbank-chat
+                       reason="timeout" if entry.response is None else "cancelled")  # fork: werkbank-chat
+    else:  # fork: werkbank-chat
+        _session_event(entry, "clarify.resolved", answer="" if entry.response == SKIPPED else entry.response,  # fork: werkbank-chat
+                       skipped=entry.response == SKIPPED)  # fork: werkbank-chat
     return entry.response
 
 

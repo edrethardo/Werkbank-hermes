@@ -24,7 +24,8 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "cancelled")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "cancelled",  # fork: werkbank-chat
+                 "decided_by")  # fork: werkbank-chat
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -40,6 +41,7 @@ class _ApprovalEntry:
         # Why the prompt was withdrawn with nobody answering (interrupt cause, session teardown);
         # followers and teardown read it so a withdrawn prompt never renders as a user deny.
         self.cancelled: str | None = None
+        self.decided_by: str | None = None  # fork: werkbank-chat — surface that answered (telegram, werkbank, …)
 
 
 def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str) -> str:
@@ -130,6 +132,31 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     return _finish(payload, resolved, choice, getattr(leader, "reason", None), coalesced=True, **extra)
 
 
+def _session_event_request(session_key: str, entry, surface: str) -> None:  # fork: werkbank-chat
+    # fork: werkbank-chat — approval.request with the resolver's exact request_id; the command is scrubbed
+    # fork: werkbank-chat — like the Telegram card. No-op without an on_gateway_session_event subscriber.
+    from gateway import session_events  # fork: werkbank-chat
+    if not session_events.enabled():  # fork: werkbank-chat
+        return  # fork: werkbank-chat
+    data = entry.data  # fork: werkbank-chat
+    rid = data.get("request_id")  # fork: werkbank-chat
+    session_events.emit(session_key, None, None, "approval.request", rid, None, {  # fork: werkbank-chat
+        "request_id": rid, "command": session_events.redact_command(data.get("command")),  # fork: werkbank-chat
+        "description": session_events.redact_command(data.get("description")),  # fork: werkbank-chat
+        "pattern_key": data.get("pattern_key", ""), "pattern_keys": list(data.get("pattern_keys") or []),  # fork: werkbank-chat
+        "allow_permanent": data.get("allow_permanent", True), "allow_session": data.get("allow_session", True),  # fork: werkbank-chat
+        "smart_denied": bool(data.get("smart_denied", False)), "surface": surface,  # fork: werkbank-chat
+        "delegated_child": session_events.is_delegated_child(),  # fork: werkbank-chat
+    })  # fork: werkbank-chat
+
+
+def _session_event_end(session_key: str, entry, type_: str, **payload) -> None:  # fork: werkbank-chat
+    # fork: werkbank-chat — approval.resolved (choice, decided_by) | approval.expired | approval.cancelled (cause).
+    from gateway import session_events  # fork: werkbank-chat
+    rid = entry.data.get("request_id")  # fork: werkbank-chat
+    session_events.emit(session_key, None, None, type_, rid, None, {"request_id": rid, **payload})  # fork: werkbank-chat
+
+
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway") -> dict:
     """Enqueue *approval_data*, notify the user, and block until resolved or timed
     out. Shared by the terminal command guard, the execute_code guard, the plugin
@@ -204,6 +231,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     with human_input_request("approval", prompt=payload["command"], session_key=session_key) as human:
         # Plugins hear about the request before the gateway does (real-time observers).
         _ctx._fire_approval_hook("pre_approval_request", **payload)
+        _session_event_request(session_key, entry, surface)  # fork: werkbank-chat
         # Bridges sync agent thread → async gateway.
         try:
             notify_cb(dict(entry.data))
@@ -217,6 +245,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             _drop_entry("notify_failed")
             _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
             human.outcome = "notify_failed"
+            _session_event_end(session_key, entry, "approval.cancelled", cause="notify_failed")  # fork: werkbank-chat
             return {"resolved": False, "choice": None, "notify_failed": True}
 
         state = _poll_event(entry.event, session_key,
@@ -238,4 +267,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                         entry.data.get("request_id"), session_key, cancelled or "timeout")
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
+        if cancelled:  # fork: werkbank-chat
+            _session_event_end(session_key, entry, "approval.cancelled", cause=cancelled)  # fork: werkbank-chat
+        elif not resolved:  # fork: werkbank-chat
+            _session_event_end(session_key, entry, "approval.expired")  # fork: werkbank-chat
+        else:  # fork: werkbank-chat
+            _session_event_end(session_key, entry, "approval.resolved", choice=choice,  # fork: werkbank-chat
+                               decided_by=entry.decided_by)  # fork: werkbank-chat
         return _finish(payload, resolved, choice, entry.reason, **extra)

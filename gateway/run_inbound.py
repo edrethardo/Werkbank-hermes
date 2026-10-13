@@ -1364,6 +1364,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)
                 if _consumed:
                     return _consumer_reply
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.user_message(_quick_key, event, "turn")  # fork: werkbank-chat
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:

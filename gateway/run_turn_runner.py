@@ -1314,6 +1314,8 @@ class TurnRunner:
         # processes are outside this baseline and remain alive.
         agent._gateway_turn_process_task_id, agent._gateway_turn_process_baseline = ctx.process_task_id, ctx.process_baseline
         ctx.tools_holder[0] = getattr(agent, "tools", None)  # transcript logging
+        from gateway import session_events  # fork: werkbank-chat
+        session_events.wire_agent(getattr(self, "_session_turn", None), agent)  # fork: werkbank-chat
 
     # ── blocking prompts from the agent thread (approval / clarify) ─────────────────────────
 
@@ -1886,6 +1888,19 @@ class TurnRunner:
         return final_response + "\n" + "\n".join(unique_tags)
 
     def run_sync(self):
+        # fork: werkbank-chat — the turn body inside its session-event scope: turn.start, then exactly one of
+        # fork: werkbank-chat — turn.done / turn.stopped / error. No subscriber: begin_turn is None, nothing emitted.
+        from gateway import session_events  # fork: werkbank-chat
+        self._session_turn = session_events.begin_turn(self._ctx)  # fork: werkbank-chat
+        try:  # fork: werkbank-chat
+            result = self._run_sync_body()  # fork: werkbank-chat
+        except BaseException as exc:  # fork: werkbank-chat
+            session_events.end_turn(self._session_turn, error=exc)  # fork: werkbank-chat
+            raise  # fork: werkbank-chat
+        session_events.end_turn(self._session_turn, result=result)  # fork: werkbank-chat
+        return result  # fork: werkbank-chat
+
+    def _run_sync_body(self):  # fork: werkbank-chat
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees

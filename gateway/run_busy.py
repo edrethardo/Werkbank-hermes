@@ -413,6 +413,8 @@ class GatewayBusySessionMixin:
                 merge_text=event.message_type == MessageType.TEXT,
             )
             event._gateway_accepted = True
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.user_message(session_key, event, "eingereiht")  # fork: werkbank-chat
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
@@ -423,6 +425,8 @@ class GatewayBusySessionMixin:
             return
 
         self._enqueue_fifo(session_key, event, adapter)
+        from gateway import session_events  # fork: werkbank-chat
+        session_events.user_message(session_key, event, "eingereiht")  # fork: werkbank-chat
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -679,6 +683,8 @@ class GatewayBusySessionMixin:
         """The running turn now answers *event* too (steer, redirect): if *event* was addressed to
         the bot, a bare silence marker must not end the turn. Returns the turn, or None when a newer
         turn already owns the slot."""
+        from gateway import session_events  # fork: werkbank-chat
+        session_events.user_message(session_key, event, "nachgeschoben")  # fork: werkbank-chat
         turn = self._session_state(session_key).turn
         if turn.agent is not running_agent:
             return None

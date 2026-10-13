@@ -145,6 +145,9 @@ VALID_HOOKS: Set[str] = {
     # pattern_keys, session_key, surface ("cli"|"gateway"|"smart"|"mcp-elicitation/<server>"|"mcp-trust/<server>"|
     # "vault-payment"); post_approval_response adds choice/decided_by. on_human_input_*: tools/human_input_hooks.py.
     "pre_approval_request", "post_approval_response", "on_human_input_request", "on_human_input_resolved",
+    # on_gateway_session_event: every gateway turn's events, one gap-free core_seq per session_key, queued  # fork: werkbank-chat
+    # per subscriber off the hot path (overflow is reported, never silent). See gateway/session_events.py.  # fork: werkbank-chat
+    "on_gateway_session_event",  # fork: werkbank-chat
     # on_room_member_activity: a hosted Group Chat member's live runtime events (tool.started/completed,
     # request.opened, message.delta, reasoning.delta, turn.error, ...) stamped with room_id, thread_id,
     # member_id, turn_id, task_id, execution_generation. Observer, queued per consumer off the token
