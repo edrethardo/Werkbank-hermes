@@ -8,10 +8,26 @@ They call :func:`emit`, which stamps each event with a per-``session_key`` core 
 plugin code never runs on the agent or event-loop thread.
 
 Back-pressure is explicit, never silent: a subscriber queue holds at most :data:`QUEUE_CAP`
-events. Events that arrive while it is full are counted per session and, as soon as there is room
-again, replaced by ONE ``overflow`` event ``{dropped, first_seq, last_seq}`` that is delivered
-before anything that came after the gap. The subscriber sees the hole in ``core_seq`` and the
-reason for it, and re-syncs (the Werkbank plugin raises its epoch).
+events. Events that arrive while it is full (or that could not be handed to it at all) are
+counted per session and, as soon as there is room again, replaced by ONE ``overflow`` event
+``{dropped, first_seq, last_seq, queue_cap}`` that is delivered before anything that came after
+the gap. The subscriber sees the hole in ``core_seq`` and the reason for it, and re-syncs (the
+Werkbank plugin raises its epoch). An ``overflow`` event itself has ``core_seq: None``: it is not
+part of the session's sequence, it describes a span of it (``first_seq..last_seq``, inclusive).
+
+A subscriber's worker survives a callback that raises ``Exception`` or ``SystemExit`` (same
+isolation as ``invoke_hook``). If the worker thread dies anyway (``KeyboardInterrupt`` raised by
+plugin code, or the thread could not be started), the next :func:`emit` starts a new worker on
+the SAME queue: nothing that was queued is dropped.
+
+``user.message`` is emitted exactly once per inbound ``MessageEvent`` object, at the first place
+that admits it (``turn``), steers it into the running turn (``nachgeschoben``) or parks it for a
+later turn (``eingereiht``). Every writer of the adapter's pending slot / FIFO announces through
+:func:`user_message`, which marks the event so a later stage (the queued message finally running
+as a turn) does not announce it again; the turn that runs it carries its id in
+``turn.start.payload.message_id``. Messages merged into one pending turn (Telegram grace window,
+photo bursts) each keep their own ``user.message``; the ones folded into an already queued head
+carry ``merged_into`` = the head's id.
 
 Without a subscriber the cost is one ``has_hook`` lookup per fire site: no payload is built, no
 sequence is advanced, no thread exists.
@@ -80,6 +96,8 @@ def _callbacks() -> tuple:
 class _Subscriber:
     """One callback's bounded FIFO + worker. ``offer`` never blocks and never drops silently."""
 
+    _thread_factory = threading.Thread  # seam for tests (thread start failure)
+
     def __init__(self, callback: Callable[..., Any]) -> None:
         self.callback = callback
         self.cond = threading.Condition()
@@ -87,25 +105,51 @@ class _Subscriber:
         self.missed: Dict[str, Dict[str, Any]] = {}  # session_key -> overflow accounting
         self.busy = False
         self.stopped = False
-        self.thread = threading.Thread(target=self._run, daemon=True,
-                                       name=f"gateway-session-events:{getattr(callback, '__name__', 'cb')}")
-        self.thread.start()
+        self.thread: Optional[threading.Thread] = None
+        self.ensure_running()
+
+    def alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def ensure_running(self) -> None:
+        """(Re)start the worker on this queue; a failed start leaves the queue intact for the next try."""
+        if self.alive() or self.stopped:
+            return
+        with self.cond:
+            self.busy = False
+        try:
+            thread = self._thread_factory(target=self._run, daemon=True,
+                                          name=f"gateway-session-events:{getattr(self.callback, '__name__', 'cb')}")
+            thread.start()
+        except Exception:
+            logger.debug("session event worker could not start; queue kept for the next emit", exc_info=True)
+            return
+        self.thread = thread
 
     def offer(self, context: contextvars.Context, event: Dict[str, Any]) -> None:
         with self.cond:
             self._flush_missed_locked(context)
             if len(self.items) >= QUEUE_CAP or self.missed.get(event["session_key"]):
-                miss = self.missed.setdefault(event["session_key"], {
-                    "dropped": 0, "first_seq": event["core_seq"], "session_id": event["session_id"],
-                    "platform": event["platform"], "origin": event["origin"],
-                })
-                miss["dropped"] += 1
-                miss["last_seq"] = event["core_seq"]
+                self.note_missed_locked(event)
                 return
             self.items.append((context, event))
             self.cond.notify()
 
+    def note_missed(self, event: Dict[str, Any]) -> None:
+        """Account *event* as lost (→ one ``overflow`` later) when it could not be queued."""
+        with self.cond:
+            self.note_missed_locked(event)
+
+    def note_missed_locked(self, event: Dict[str, Any]) -> None:
+        miss = self.missed.setdefault(event["session_key"], {
+            "dropped": 0, "first_seq": event["core_seq"], "session_id": event["session_id"],
+            "platform": event["platform"], "origin": event["origin"],
+        })
+        miss["dropped"] += 1
+        miss["last_seq"] = event["core_seq"]
+
     def _flush_missed_locked(self, context: contextvars.Context) -> None:
+        # ``overflow`` carries ``core_seq=None``: it is outside the sequence and names the lost span.
         while self.missed and len(self.items) < QUEUE_CAP:
             key = next(iter(self.missed))
             miss = self.missed.pop(key)
@@ -141,7 +185,7 @@ class _Subscriber:
             "core_seq", "ts")}}
         try:
             manager._invoke_hook_callback(self.callback, kwargs)
-        except Exception as exc:  # isolated: one broken plugin never stalls another
+        except (Exception, SystemExit) as exc:  # isolated like invoke_hook: never ends this worker
             try:
                 manager._report_hook_failure(HOOK, self.callback, kwargs, exc)
             except Exception:
@@ -149,7 +193,7 @@ class _Subscriber:
 
     def idle(self) -> bool:
         with self.cond:
-            return not self.items and not self.missed and not self.busy
+            return not self.items and not self.missed and not (self.busy and self.alive())
 
     def stop(self) -> None:
         with self.cond:
@@ -176,8 +220,12 @@ def _subscribers_for(callbacks: tuple) -> list:
     out = []
     for key, cb in wanted.items():
         sub = _subscribers.get(key)
-        if sub is None or sub.callback is not cb or not sub.thread.is_alive():
+        if sub is None or sub.callback is not cb:  # new callback (or a recycled id): fresh queue
+            if sub is not None:
+                sub.stop()
             sub = _subscribers[key] = _Subscriber(cb)
+        else:
+            sub.ensure_running()  # a dead worker is replaced on the SAME queue: nothing queued is lost
         out.append(sub)
     return out
 
@@ -210,17 +258,26 @@ def emit(session_key: Optional[str], session_id: Optional[str], platform: Option
             return None
         context = contextvars.copy_context()
         with _lock:
+            subs = _subscribers_for(callbacks)
             info = _sessions.setdefault(session_key, _SessionInfo())
             if session_id:
                 info.session_id = str(session_id)
             if platform:
                 info.platform = str(platform)
-            info.seq += 1
-            event = _envelope(session_key, info.session_id, info.platform, origin, info.seq,
+            # Build first, then commit the number: a failure up to here consumes no core_seq.
+            event = _envelope(session_key, info.session_id, info.platform, origin, info.seq + 1,
                               type, None if id is None else str(id),
                               None if parent_id is None else str(parent_id), payload)
-            for sub in _subscribers_for(callbacks):
-                sub.offer(context, event)
+            info.seq += 1
+            for sub in subs:
+                try:
+                    sub.offer(context, event)
+                except Exception:  # numbered but not queued: report it as overflow, never a silent gap
+                    logger.debug("session event hand-off failed", exc_info=True)
+                    try:
+                        sub.note_missed(event)
+                    except Exception:
+                        logger.debug("session event overflow accounting failed", exc_info=True)
             return info.seq
     except Exception:
         logger.debug("session event emit failed (type=%s)", type, exc_info=True)
@@ -246,7 +303,8 @@ def _reset_for_tests() -> None:
         _sessions.clear()
     for sub in subs:
         sub.stop()
-        sub.thread.join(timeout=1.0)
+        if sub.thread is not None:
+            sub.thread.join(timeout=1.0)
 
 
 # ── payload helpers (redaction + size caps) ─────────────────────────────────────────────────
@@ -271,6 +329,13 @@ def redact_command(command: Any) -> str:
 
 
 def _capped(value: Any, limit: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
+    """Redacted text of at most *limit* UTF-8 bytes, and whether anything was cut.
+
+    Only a ~2x *limit* prefix is redacted (a multi-MB tool output never runs through the
+    redaction regexes). The token the pre-cut splits is dropped before redaction: redaction can
+    shrink the text and pull that boundary into view, and a secret cut in half is no longer
+    recognised by the redactor.
+    """
     if value is None:
         return "", False
     if not isinstance(value, str):
@@ -278,10 +343,16 @@ def _capped(value: Any, limit: int = TEXT_CAP_BYTES) -> tuple[str, bool]:
             value = json.dumps(value, ensure_ascii=False, default=str)
         except Exception:
             value = str(value)
+    precut = len(value) > 2 * limit
+    if precut:
+        head = value[: 2 * limit]
+        if not value[2 * limit].isspace():
+            head = head[: max(i for i in (head.rfind(" "), head.rfind("\n"), head.rfind("\t"), 0))]
+        value = head
     text = _redact(value)
     raw = text.encode("utf-8")
     if len(raw) <= limit:
-        return text, False
+        return text, precut
     return raw[:limit].decode("utf-8", errors="ignore"), True
 
 
@@ -301,27 +372,76 @@ def event_origin(event: Any) -> Optional[str]:
 # ── fire-site helpers ───────────────────────────────────────────────────────────────────────
 
 
-def user_message(session_key: Optional[str], event: Any, delivery: str, *, session_id: Optional[str] = None) -> None:
-    """``user.message`` for an admitted (``turn``), steered (``nachgeschoben``) or queued (``eingereiht``) message."""
+_ANNOUNCED_ATTR = "_hm_session_event_announced"
+
+
+def _message_ref(event: Any) -> Optional[str]:
+    """The id a ``user.message`` is published under: the sender's own id, else the platform id."""
+    if event is None:
+        return None
+    meta = getattr(event, "metadata", None) or {}
+    ref = meta.get("client_message_id") or getattr(event, "message_id", None)
+    return None if ref is None else str(ref)
+
+
+def user_message(session_key: Optional[str], event: Any, delivery: str, *, session_id: Optional[str] = None,
+                 source_event: Any = None, merged_into: Any = None, interrupt: bool = False) -> None:
+    """``user.message`` for an admitted (``turn``), steered (``nachgeschoben``) or queued (``eingereiht``) message.
+
+    Exactly once per message: the event (and *source_event*, the command it was built from, e.g.
+    ``/queue …``) is marked, later calls for it are no-ops. *source_event* supplies sender ids and
+    origin when *event* is a re-built copy; *merged_into* is the pending head *event* was folded
+    into; *interrupt* marks a message delivered by interrupting the running turn.
+    """
     if not session_key or not enabled():
         return
     try:
-        meta = getattr(event, "metadata", None) or {}
+        if any(getattr(e, _ANNOUNCED_ATTR, False) for e in (event, source_event) if e is not None):
+            return
+        for e in (event, source_event):
+            if e is not None:
+                try:
+                    setattr(e, _ANNOUNCED_ATTR, True)
+                except Exception:
+                    pass
+        sender = source_event if source_event is not None else event
+        meta = getattr(sender, "metadata", None) or {}
         text = getattr(event, "text", None) or ""
         if delivery == "nachgeschoben" and str(text).lstrip().startswith("/steer"):
             text = event.get_command_args()
         client_message_id = meta.get("client_message_id")
-        message_id = getattr(event, "message_id", None)
-        emit(session_key, session_id or meta.get("gateway_session_id"), _source_platform(getattr(event, "source", None)),
-             "user.message", client_message_id or message_id, None, {
-                 "delivery": delivery, "text": str(text),
-                 "client_message_id": client_message_id,
-                 "message_id": None if message_id is None else str(message_id),
-                 "internal": bool(getattr(event, "internal", False)),
-                 "media_count": len(getattr(event, "media_urls", None) or []),
-             }, origin=event_origin(event))
+        message_id = getattr(sender, "message_id", None)
+        if message_id is None:
+            message_id = getattr(event, "message_id", None)
+        payload = {
+            "delivery": delivery, "text": str(text),
+            "client_message_id": client_message_id,
+            "message_id": None if message_id is None else str(message_id),
+            "internal": bool(getattr(event, "internal", False)),
+            "media_count": len(getattr(event, "media_urls", None) or []),
+        }
+        head = _message_ref(merged_into) if merged_into is not None and merged_into is not event else None
+        if head is not None:
+            payload["merged_into"] = head
+        if interrupt:
+            payload["interrupt"] = True
+        emit(session_key, session_id or meta.get("gateway_session_id"), _source_platform(getattr(sender, "source", None)),
+             "user.message", client_message_id or message_id, None, payload, origin=event_origin(sender))
     except Exception:
         logger.debug("user.message emit failed", exc_info=True)
+
+
+def queued_into_slot(session_key: Optional[str], event: Any, head: Any, slot: Any) -> None:
+    """``eingereiht`` after *event* was written into an adapter's pending slot that held *head* before.
+
+    ``merged_into`` is set when the slot still holds *head* (the event was folded into it)."""
+    if not session_key or not enabled():
+        return
+    try:
+        merged = head is not None and head is not event and isinstance(slot, dict) and slot.get(session_key) is head
+    except Exception:
+        merged = False
+    user_message(session_key, event, "eingereiht", merged_into=head if merged else None)
 
 
 @dataclass

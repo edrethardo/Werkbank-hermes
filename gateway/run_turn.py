@@ -3718,8 +3718,8 @@ class GatewayTurnMixin:
                 steer_event = MessageEvent(
                     text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
                 )
-                if session_key:
-                    self._enqueue_fifo(session_key, steer_event, adapter)
+                if session_key:  # already announced as nachgeschoben when it was steered  # fork: werkbank-chat
+                    self._enqueue_fifo(session_key, steer_event, adapter, announce=False)  # fork: werkbank-chat
                 logger.debug(
                     "Enqueued leftover /steer behind pending message for session %s: '%s...'",
                     session_key or "?", leftover_steer[:40],

@@ -262,6 +262,185 @@ def test_plugin_injected_message_carries_its_origin(tmp_path, monkeypatch):
     assert seen[0]["id"] == "wb-77" and seen[0]["session_id"] == "sess-9"
 
 
+# ── every enqueue path announces the message exactly once (review WB-1126) ───────────────
+
+
+def _busy_runner(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    runner = GatewayRunner(config=GatewayConfig())
+    adapter = SimpleNamespace(_pending_messages={})
+    runner._delivery_adapter_for = lambda _s: adapter
+    return runner, adapter
+
+
+def _announced(seen):
+    return [(e["payload"]["delivery"], e["id"], e["payload"]["text"]) for e in seen if e["type"] == "user.message"]
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "queue"])
+def test_telegram_grace_window_followups_each_announced_once(tmp_path, monkeypatch, mode):
+    """Merge decision: every merged message keeps its OWN user.message; a message folded into an
+    already queued one names that head in ``merged_into`` (both run as one turn)."""
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    runner._session_state("key").turn.started_ts = time.time()
+    first, second = _tg_event("one", "tg-a", client_message_id="cm-a"), _tg_event("two", "tg-b")
+
+    assert runner._hm_busy_telegram_grace_queue(first, first.source, "key", mode)
+    assert runner._hm_busy_telegram_grace_queue(second, second.source, "key", mode)
+    _settle(seen, lambda s: len(s) >= 2)
+
+    assert _announced(seen) == [("eingereiht", "cm-a", "one"), ("eingereiht", "tg-b", "two")]
+    merged = [e["payload"].get("merged_into") for e in seen]
+    assert merged == ([None, "cm-a"] if mode == "interrupt" else [None, None])
+
+
+def test_photo_followup_is_announced(tmp_path, monkeypatch):
+    import asyncio
+
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    photo = _tg_event("look", "tg-p")
+    photo.message_type = MessageType.PHOTO
+    photo.media_urls, photo.media_types = ["/tmp/p.jpg"], ["image/jpeg"]
+
+    handled, _ = asyncio.run(runner._hm_busy_slash_or_photo(photo, photo.source, "key"))
+    assert handled
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-p", "look")]
+    assert seen[0]["payload"]["media_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_message_while_agent_still_starting_is_announced(tmp_path, monkeypatch):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    runner._session_state("key").turn.agent = _AGENT_PENDING_SENTINEL
+    event = _tg_event("hurry", "tg-s")
+
+    assert await runner._hm_handle_running_session_message(event, event.source, "key") is None
+    assert adapter._pending_messages["key"] is event
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-s", "hurry")]
+
+
+@pytest.mark.asyncio
+async def test_queue_command_announces_the_queued_text_with_the_senders_id(tmp_path, monkeypatch):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    event = _tg_event("/queue after that, tests", "tg-q", client_message_id="cm-q")
+
+    await runner._busy_queue_command(event, "key", event.source)
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "cm-q", "after that, tests")]
+    assert seen[0]["payload"]["message_id"] == "tg-q"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent", ["starting", "none"])
+async def test_steer_queue_fallback_is_announced(tmp_path, monkeypatch, agent):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    if agent == "starting":
+        runner._session_state("key").turn.agent = _AGENT_PENDING_SENTINEL
+    event = _tg_event("/steer also the db", "tg-st")
+
+    await runner._busy_steer_command(event, "key", event.source)
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-st", "also the db")]
+
+
+@pytest.mark.asyncio
+async def test_media_interrupt_without_redirect_is_announced(tmp_path, monkeypatch):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    event = _tg_event("read this", "tg-doc")
+    event.message_type = MessageType.DOCUMENT
+    event.media_urls, event.media_types = ["/tmp/a.pdf"], ["application/pdf"]
+    agent = SimpleNamespace(interrupt=MagicMock())
+
+    await runner._hm_busy_interrupt(event, event.source, agent, "key")
+    agent.interrupt.assert_called_once()
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-doc", "read this")]
+    assert seen[0]["payload"]["interrupt"] is True
+
+
+@pytest.mark.asyncio
+async def test_queue_mode_text_left_to_the_adapter_is_announced(tmp_path, monkeypatch):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    runner._is_user_authorized_for_source = lambda _s: True
+    runner._admit_bot_message_for_source = lambda _s: True
+    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
+    runner._effective_busy_input_mode = lambda _s: "queue"
+    runner._effective_busy_text_mode = lambda _s: "queue"
+    event = _tg_event("and then", "tg-qm")
+
+    assert await runner._handle_active_session_busy_message(event, "key") is False
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == [("eingereiht", "tg-qm", "and then")]
+
+
+@pytest.mark.parametrize("kind", ["text", "photo"])
+def test_queue_or_replace_announces_exactly_once(tmp_path, monkeypatch, kind):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    head = _tg_event("first", "tg-1")
+    adapter._pending_messages["key"] = head
+    event = _tg_event("second", "tg-2")
+    if kind == "photo":
+        event.message_type = MessageType.PHOTO
+        event.media_urls, event.media_types = ["/tmp/p.jpg"], ["image/jpeg"]
+
+    runner._queue_or_replace_pending_event("key", event)
+    session_events.emit("key", None, "telegram", "status", None, None, {})  # barrier
+    _settle(seen, lambda s: len(s) >= 2)
+    assert _announced(seen) == [("eingereiht", "tg-2", "second")]
+    assert seen[0]["payload"].get("merged_into") == ("tg-1" if kind == "photo" else None)
+
+
+def test_a_message_is_announced_once_even_when_it_later_runs_as_a_turn():
+    seen = _subscribe()
+    event = _tg_event("orphan", "tg-o")
+    session_events.user_message("key", event, "eingereiht")
+    session_events.user_message("key", event, "turn")  # rescued orphan admitted later
+    session_events.emit("key", None, "telegram", "status", None, None, {})  # barrier
+    _settle(seen, lambda s: len(s) >= 2)
+    assert _announced(seen) == [("eingereiht", "tg-o", "orphan")]
+
+
+def test_enqueue_without_announce_stays_silent(tmp_path, monkeypatch):
+    """The leftover /steer re-staged by the drain was already announced as ``nachgeschoben``."""
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    runner._enqueue_fifo("key", _tg_event("left over", None), adapter, announce=False)
+    session_events.emit("key", None, "telegram", "status", None, None, {})  # barrier
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == []
+
+
+@pytest.mark.asyncio
+async def test_leftover_steer_restaged_by_the_drain_is_not_announced_again(tmp_path, monkeypatch):
+    runner, adapter = _busy_runner(tmp_path, monkeypatch)
+    seen = _subscribe()
+    source = _tg_event("x", None).source
+    adapter.get_pending_message = lambda key: adapter._pending_messages.pop(key, None)
+    result = {"interrupted": True, "interrupt_message": "new direction", "pending_steer": "and the db"}
+
+    await runner._run_agent_drain_pending(result, adapter, source, "key")
+    assert getattr(adapter._pending_messages.get("key"), "text", None) == "and the db"
+    session_events.emit("key", None, "telegram", "status", None, None, {})  # barrier
+    _settle(seen, lambda s: len(s) >= 1)
+    assert _announced(seen) == []
+
+
 # ── approvals: exact request id, decided_by, redaction ──────────────────────────────────────
 
 
@@ -442,3 +621,105 @@ def test_without_subscriber_nothing_is_built_or_wired(monkeypatch):
     session_events.wire_agent(None, agent)
     assert vars(agent) == before
     assert not any(t.name.startswith("gateway-session-events") for t in threading.enumerate())
+
+
+# ── subscriber worker robustness (review WB-1126) ──────────────────────────────────────────
+
+
+def test_subscriber_raising_systemexit_keeps_its_worker():
+    calls = []
+
+    def exits(event, **_kw):
+        calls.append(event["core_seq"])
+        if len(calls) == 1:
+            raise SystemExit(3)
+
+    _subscribe(exits)
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    assert session_events.wait_idle(5)
+    worker = next(iter(session_events._subscribers.values())).thread
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    assert session_events.wait_idle(5)
+    assert calls == [1, 2]
+    assert worker.is_alive() and next(iter(session_events._subscribers.values())).thread is worker
+
+
+def test_dead_worker_is_restarted_without_losing_its_queue(monkeypatch):
+    monkeypatch.setattr(threading, "excepthook", lambda _args: None)
+    entered, release = threading.Event(), threading.Event()
+    got = []
+
+    def dies_once(event, **_kw):
+        got.append(event["core_seq"])
+        if len(got) == 1:
+            entered.set()
+            release.wait(5)
+            raise KeyboardInterrupt  # not swallowed: the worker thread dies with 2 events queued
+
+    _subscribe(dies_once)
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    assert entered.wait(5)
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    old = next(iter(session_events._subscribers.values())).thread
+    release.set()
+    old.join(5)
+    assert not old.is_alive()
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    deadline = time.monotonic() + 5
+    while len(got) < 4 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert got == [1, 2, 3, 4]
+
+
+def test_worker_start_failure_is_not_a_silent_gap(monkeypatch):
+    real = session_events._Subscriber._thread_factory
+    fail = {"on": True}
+
+    def factory(*a, **kw):
+        if fail["on"]:
+            raise RuntimeError("can't start new thread")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(session_events._Subscriber, "_thread_factory", staticmethod(factory))
+    seen = _subscribe()
+    assert session_events.emit("k", None, "telegram", "status", None, None, {}) == 1
+    assert session_events.emit("k", None, "telegram", "status", None, None, {}) == 2
+    fail["on"] = False
+    assert session_events.emit("k", None, "telegram", "status", None, None, {}) == 3
+    _settle(seen, lambda s: len(s) >= 3)
+    assert [e["core_seq"] for e in seen] == [1, 2, 3]
+
+
+def test_offer_failure_becomes_overflow_not_a_gap(monkeypatch):
+    seen = _subscribe()
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    _settle(seen, lambda s: len(s) >= 1)
+    sub = next(iter(session_events._subscribers.values()))
+    real_offer = sub.offer
+    monkeypatch.setattr(sub, "offer", lambda *_a: (_ for _ in ()).throw(RuntimeError("boom")))
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    monkeypatch.setattr(sub, "offer", real_offer)
+    session_events.emit("k", None, "telegram", "status", None, None, {})
+    _settle(seen, lambda s: len(s) >= 3)
+    assert [(e["type"], e["core_seq"]) for e in seen] == [("status", 1), ("overflow", None), ("status", 3)]
+    assert seen[1]["payload"]["first_seq"] == seen[1]["payload"]["last_seq"] == 2
+
+
+def test_capped_redacts_only_a_bounded_prefix(monkeypatch):
+    lengths = []
+    monkeypatch.setattr(session_events, "_redact", lambda text: lengths.append(len(text)) or text)
+    text, truncated = session_events._capped("a" * 1_000_000, 100)
+    assert truncated and len(text.encode()) <= 100
+    assert lengths and max(lengths) <= 200
+
+
+def test_capped_never_leaks_a_secret_cut_at_the_prefix_boundary():
+    # Two full secrets shrink to ~14 chars each when redacted, which pulls the text that sits at
+    # the 2x-limit pre-cut boundary into the visible window. The secret cut there is only a
+    # fragment ("sk-proj-Z9Z") that the redactor no longer recognises: it must not be shown.
+    secret = "sk-proj-" + "Z9" * 40
+    raw = (secret + " ") * 2 + "y" * 10 + " " + secret
+    assert raw.index(secret, 180) < 200 < raw.index(secret, 180) + len(secret)
+    text, truncated = session_events._capped(raw, 100)
+    assert truncated and "sk-proj-" not in text

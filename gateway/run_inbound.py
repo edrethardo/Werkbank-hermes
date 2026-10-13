@@ -587,7 +587,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
+            _head = adapter._pending_messages.get(_quick_key)  # fork: werkbank-chat
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.queued_into_slot(_quick_key, event, _head, adapter._pending_messages)  # fork: werkbank-chat
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -688,6 +691,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             _interrupt_text = _build_media_placeholder(event)
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
+        from gateway import session_events  # fork: werkbank-chat
+        session_events.user_message(_quick_key, event, "eingereiht", interrupt=True)  # next turn  # fork: werkbank-chat
         running_agent.interrupt(_interrupt_text)
 
     async def _hm_handle_running_session_message(

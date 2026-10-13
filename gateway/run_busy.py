@@ -102,8 +102,14 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
-        """Append a /queue event to the FIFO chain for a session."""
+    def _enqueue_fifo(
+        self, session_key: str, queued_event: "MessageEvent", adapter: Any, *,
+        announce: bool = True, announce_from: Optional["MessageEvent"] = None,  # fork: werkbank-chat
+    ) -> None:
+        """Append a /queue event to the FIFO chain for a session.
+
+        Announces it once as ``user.message`` (``eingereiht``); ``announce_from`` is the command
+        event it was rebuilt from, ``announce=False`` re-stages an already announced message."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
@@ -112,6 +118,9 @@ class GatewayBusySessionMixin:
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
+        if announce:  # fork: werkbank-chat
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.user_message(session_key, queued_event, "eingereiht", source_event=announce_from)  # fork: werkbank-chat
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -414,7 +423,7 @@ class GatewayBusySessionMixin:
             )
             event._gateway_accepted = True
             from gateway import session_events  # fork: werkbank-chat
-            session_events.user_message(session_key, event, "eingereiht")  # fork: werkbank-chat
+            session_events.queued_into_slot(session_key, event, existing, adapter._pending_messages)  # fork: werkbank-chat
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
@@ -424,9 +433,7 @@ class GatewayBusySessionMixin:
             )
             return
 
-        self._enqueue_fifo(session_key, event, adapter)
-        from gateway import session_events  # fork: werkbank-chat
-        session_events.user_message(session_key, event, "eingereiht")  # fork: werkbank-chat
+        self._enqueue_fifo(session_key, event, adapter)  # announces user.message once  # fork: werkbank-chat
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -818,6 +825,8 @@ class GatewayBusySessionMixin:
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.user_message(session_key, event, "eingereiht")  # base adapter parks it  # fork: werkbank-chat
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads
@@ -857,6 +866,8 @@ class GatewayBusySessionMixin:
             and self._effective_busy_text_mode(event.source) == "queue"
             and effective_mode != "steer"
         ):
+            from gateway import session_events  # fork: werkbank-chat
+            session_events.user_message(session_key, event, "eingereiht")  # base adapter debounces + parks it  # fork: werkbank-chat
             return False
 
         _busy_state = self._peek_session_state(session_key)
@@ -1062,7 +1073,7 @@ class GatewayBusySessionMixin:
                 reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt, channel_context=event.channel_context,
                 internal=event.internal, timestamp=event.timestamp,
-            ), adapter)
+            ), adapter, announce_from=event)  # fork: werkbank-chat
         depth = self._queue_depth(quick_key, adapter=adapter)
         return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
 
@@ -1084,7 +1095,7 @@ class GatewayBusySessionMixin:
                     text=steer_text, message_type=MessageType.TEXT, source=event.source,
                     message_id=event.message_id, channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
-                ), adapter)
+                ), adapter, announce_from=event)  # fork: werkbank-chat
             return reply
 
         if running_agent is _AGENT_PENDING_SENTINEL:
