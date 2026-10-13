@@ -228,6 +228,7 @@ def approval_payload(data: Dict[str, Any], redact) -> Dict[str, Any]:
         "smart_denied": bool(data.get("smart_denied", False)), "surface": data.get("surface"),
         "delegated_child": bool(data.get("delegated_child", False)),
         "subagent_id": data.get("subagent_id"),
+        "child_session_id": data.get("child_session_id"),
     }
 
 

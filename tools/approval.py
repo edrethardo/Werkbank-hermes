@@ -208,8 +208,32 @@ def resolve_gateway_approval(session_key: str, choice: str,
                 entry.reason = reason
             if decided_by and hasattr(entry, "decided_by"):  # fork: werkbank-chat
                 entry.decided_by = str(decided_by)  # fork: werkbank-chat
+            _note_decision(session_key, entry, choice, decided_by)  # fork: werkbank-chat
             entry.event.set()
     return len(targets)
+
+
+# fork: werkbank-chat — the outcome of recently answered requests, so the surface that lost a race
+# fork: werkbank-chat — (Telegram tap vs. Werkbank) can show what actually happened instead of "expired".
+from collections import OrderedDict  # noqa: E402  # fork: werkbank-chat
+_recent_decisions: "OrderedDict[tuple, dict]" = OrderedDict()  # fork: werkbank-chat
+_RECENT_DECISIONS_MAX = 512  # fork: werkbank-chat
+
+
+def _note_decision(session_key: str, entry, choice: str, decided_by: Optional[str]) -> None:  # fork: werkbank-chat
+    rid = entry.data.get("request_id")  # fork: werkbank-chat — caller holds _lock
+    if not rid:  # fork: werkbank-chat
+        return  # fork: werkbank-chat
+    _recent_decisions[(session_key, rid)] = {"choice": choice, "decided_by": decided_by or None}  # fork: werkbank-chat
+    while len(_recent_decisions) > _RECENT_DECISIONS_MAX:  # fork: werkbank-chat
+        _recent_decisions.popitem(last=False)  # fork: werkbank-chat
+
+
+def gateway_approval_decision(session_key: str, request_id: str) -> Optional[dict]:  # fork: werkbank-chat
+    """``{choice, decided_by}`` of an answered request of *session_key*, else None."""  # fork: werkbank-chat
+    with _lock:  # fork: werkbank-chat
+        found = _recent_decisions.get((session_key, request_id))  # fork: werkbank-chat
+        return dict(found) if found else None  # fork: werkbank-chat
 
 
 def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> bool:

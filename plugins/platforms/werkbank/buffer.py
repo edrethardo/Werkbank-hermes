@@ -344,6 +344,10 @@ class Buffers:
             if origin == self.plugin_id:
                 origin = "werkbank"          # the board's name for itself (hermes_view.js HV_ORIGINS)
             self._track(buf, type_, id_, event.get("parent_id"), payload)
+            if type_ == "approval.request" and not payload.get("subagent_id"):
+                sub = self._subagent_of(buf, payload.get("child_session_id"))
+                if sub is not None:             # WB-1129: the board names the child on its card
+                    payload["subagent_id"] = sub
             ts = event.get("ts") or self._clock()
             sid = buf.session_id
             if type_ in _MARKED:
@@ -415,6 +419,21 @@ class Buffers:
                 buf.subagents.popitem(last=False)
         elif type_ == "subagent.end" and id_ is not None:
             buf.subagents.pop(str(id_), None)
+
+    @staticmethod
+    def _subagent_of(buf: SessionBuffer, child_session_id: Any) -> Optional[str]:
+        """The subagent id (``subagent.start``) whose child session asked, else None."""
+        if not isinstance(child_session_id, str) or not child_session_id:
+            return None
+        for sub in reversed(buf.subagents.values()):
+            if sub.get("child_session_id") == child_session_id:
+                return sub["id"]
+        return None
+
+    def subagent_for(self, session_key: str, child_session_id: Any) -> Optional[str]:
+        with self.cond:
+            buf = self._sessions.get(session_key)
+            return None if buf is None else self._subagent_of(buf, child_session_id)
 
     # -- for the snapshot -----------------------------------------------------------------------
     def position(self, session_key: str) -> Optional[Dict[str, Any]]:

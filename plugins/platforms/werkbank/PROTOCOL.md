@@ -51,7 +51,7 @@ WB-1126 event types, the WB-1132 field names and snapshot obligations). The boar
 | `tool.end` | tool call id | `tool_name`, `output` (≤ 4 KB, redacted), `truncated`, `is_error` |
 | `subagent.start\|progress\|end` | subagent id (parent = turn/parent) | `goal`, `status`, `depth`, `model`, `child_session_id`, … |
 | `status` | – | `kind`, `message` |
-| `approval.request` | request id | `request_id`, `command`/`description` (redacted like the Telegram card), `pattern_key(s)`, `allow_permanent`, `allow_session`, `smart_denied`, `surface`, `delegated_child` |
+| `approval.request` | request id | `request_id`, `command`/`description` (redacted like the Telegram card), `pattern_key(s)`, `allow_permanent`, `allow_session`, `smart_denied`, `surface`, `delegated_child`, for a child `child_session_id` and (plugin, from `subagent.start`) `subagent_id` |
 | `approval.resolved\|expired\|cancelled` | request id | `request_id`, `choice`, `decided_by` / `cause` |
 | `clarify.request\|resolved\|expired` | clarify id | `clarify_id`, `question`, `choices`, `multi_select` / `answer`, `decided_by` |
 | `turn.done` | turn id | `final_response` (redacted), `completed`, `api_calls`, `model`, `session_id`; `message_uid`, `row_id` of the answer's SessionDB row once it is written |
@@ -89,8 +89,20 @@ produced; its fields are in the snapshot's `session`.
   control, bidi and zero-width characters removed; ≤ 3500 UTF-16 units).
 * `POST /v1/s/{key}/stop` → `{stopped: bool}` via `ctx.interrupt_session(key)` (`false`: nothing
   running or refused). Without that API (core before WB-1127): `501` with `grund`.
-* `POST /v1/s/{key}/approvals/{request_id}`, `POST /v1/s/{key}/clarify/{clarify_id}` → **`501`**
-  until WB-1129.
+* `POST /v1/s/{key}/approvals/{request_id} {choice: once|session|always|deny}` →
+  `{resolved: 1|0, choice, decided_by}` (WB-1129, `approvals.py`). Only a `request_id` pending in
+  THIS session (`list_gateway_approvals(key)`) — a foreign or invented id is `404` and resolves
+  nothing (an id this session answered a moment ago gives `200 {resolved: 0}` with the outcome).
+  Resolved with the exact id (`resolve_gateway_approval(…, request_id=…, decided_by="werkbank")`):
+  of a Telegram tap and a board click exactly one wins; the loser gets `resolved: 0` plus the
+  winner's `choice`/`decided_by`, the Telegram card shows the same outcome. `400` for a scope the
+  Telegram card does not offer (the flags `allow_session`, `allow_permanent`, `smart_denied`) and
+  for `session`/`always` on a subagent's request (`delegated_child`): a child is `once`/`deny` only,
+  and answering the parent's id never frees a child's request.
+* `POST /v1/s/{key}/clarify/{clarify_id} {answer}` → `{resolved: bool}`. Only a `clarify_id` of
+  THIS session (else `404`); the answer is read like a typed Telegram reply (number or label of a
+  choice, free text for an open prompt, `skip`), else `400`. `resolved: false` when it was answered
+  already. `clarify.resolved` carries `decided_by`.
 * `GET /v1/s/{key}/tools/{tool_call_id}/output` → `{tool_call_id, output}` (full text, redacted,
   ≤ 1 MB) from the SessionDB; `404` when unknown.
 

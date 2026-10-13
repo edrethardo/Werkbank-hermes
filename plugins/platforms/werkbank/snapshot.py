@@ -276,6 +276,15 @@ def _lineage(host, session_key: str, session_id: Optional[str]) -> List[str]:
     return ids
 
 
+def _with_subagent(buffers, session_key: str, pending: Dict[str, Any]) -> Dict[str, Any]:
+    """A child's open approval names its subagent (WB-1129), like ``approval.request`` in the stream."""
+    if not isinstance(pending, dict) or pending.get("subagent_id"):
+        return pending
+    find = getattr(buffers, "subagent_for", None)
+    sub = find(session_key, pending.get("child_session_id")) if callable(find) else None
+    return {**pending, "subagent_id": sub} if sub else pending
+
+
 def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
     if buffers.get(session_key) is None:
         return None
@@ -304,7 +313,8 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
         "epoch": pos["epoch"], "seq": pos["seq"], "session_key": session_key, "session_id": session_id,
         "state": STATE_RUNNING if running else STATE_IDLE, "turn_id": pos["turn_id"],
         "messages": messages,
-        "pending_approvals": list(host.pending_approvals(session_key) or []),
+        "pending_approvals": [_with_subagent(buffers, session_key, p)
+                              for p in host.pending_approvals(session_key) or []],
         "pending_clarify": list(host.pending_clarify(session_key) or []),
         "subagents": pos["subagents"],
         "session": session,

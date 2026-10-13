@@ -27,6 +27,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    decided_by: Optional[str] = None  # fork: werkbank-chat — surface that answered (telegram, werkbank, …)
 
 
 _lock = threading.RLock()
@@ -101,17 +102,24 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
                        reason="timeout" if entry.response is None else "cancelled")  # fork: werkbank-chat
     else:  # fork: werkbank-chat
         _session_event(entry, "clarify.resolved", answer="" if entry.response == SKIPPED else entry.response,  # fork: werkbank-chat
-                       skipped=entry.response == SKIPPED)  # fork: werkbank-chat
+                       skipped=entry.response == SKIPPED, decided_by=entry.decided_by)  # fork: werkbank-chat
     return entry.response
 
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
-    """Unblock the waiter on ``clarify_id``; False if already resolved/expired/unknown."""
+def resolve_gateway_clarify(clarify_id: str, response: str,
+                            decided_by: Optional[str] = None,  # fork: werkbank-chat
+                            session_key: Optional[str] = None) -> bool:  # fork: werkbank-chat
+    """Unblock the waiter on ``clarify_id``; False if already resolved/expired/unknown — or, with
+    *session_key*, when the prompt belongs to another session. *decided_by* names the answering
+    surface on ``clarify.resolved``."""
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None or entry.event.is_set():
             return False
+        if session_key is not None and entry.session_key != session_key:  # fork: werkbank-chat
+            return False  # fork: werkbank-chat
         entry.response = str(response) if response is not None else ""
+        entry.decided_by = str(decided_by) if decided_by else None  # fork: werkbank-chat
         entry.event.set()
         return True
 

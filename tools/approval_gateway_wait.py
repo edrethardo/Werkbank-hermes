@@ -146,8 +146,20 @@ def _session_event_request(session_key: str, entry, surface: str) -> None:  # fo
         "pattern_key": data.get("pattern_key", ""), "pattern_keys": list(data.get("pattern_keys") or []),  # fork: werkbank-chat
         "allow_permanent": data.get("allow_permanent", True), "allow_session": data.get("allow_session", True),  # fork: werkbank-chat
         "smart_denied": bool(data.get("smart_denied", False)), "surface": surface,  # fork: werkbank-chat
-        "delegated_child": session_events.is_delegated_child(),  # fork: werkbank-chat
+        "delegated_child": bool(data.get("delegated_child")) or session_events.is_delegated_child(),  # fork: werkbank-chat
+        **({"child_session_id": data["child_session_id"]} if data.get("child_session_id") else {}),  # fork: werkbank-chat
     })  # fork: werkbank-chat
+
+
+def _child_identity() -> dict:  # fork: werkbank-chat
+    # fork: werkbank-chat — a delegate_task child asks under its parent's session_key; mark its request so
+    # fork: werkbank-chat — a surface can tell it apart (Werkbank: once/deny only) and name the child session.
+    from agent.delegation_context import is_delegated_child_context  # fork: werkbank-chat
+    if not is_delegated_child_context():  # fork: werkbank-chat
+        return {}  # fork: werkbank-chat
+    from gateway.session_context import get_session_env  # fork: werkbank-chat
+    sid = get_session_env("HERMES_SESSION_ID", "")  # fork: werkbank-chat — the child's own id (scoped)
+    return {"delegated_child": True, **({"child_session_id": sid} if sid else {})}  # fork: werkbank-chat
 
 
 def _session_event_end(session_key: str, entry, type_: str, **payload) -> None:  # fork: werkbank-chat
@@ -194,7 +206,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         if adopted is not None:
             return adopted
 
-    entry = _ApprovalEntry(approval_data)
+    entry = _ApprovalEntry({**approval_data, **_child_identity()})  # fork: werkbank-chat
     with _approval._lock:
         register_prepared_approval(session_key, entry)
         _approval._gateway_queues.setdefault(session_key, []).append(entry)

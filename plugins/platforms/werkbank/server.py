@@ -20,7 +20,7 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
-from . import snapshot
+from . import approvals, snapshot
 
 logger = logging.getLogger("plugins.platforms.werkbank")
 
@@ -499,10 +499,19 @@ def _handler(app: WerkbankServer):
             if what == ["stop"]:
                 return self._stop(key)
             if len(what) == 2 and what[0] in ("approvals", "clarify"):
-                # WB-1129 (plan: Kind 4) answers these; the contract route exists already.
-                return self._refuse(501, "not implemented",
-                                    "Freigaben und Rückfragen aus der Werkbank kommen mit WB-1129.")
+                return self._answer(key, what[0], urllib.parse.unquote(what[1]), body)
             self._refuse(404, "not found", "Unbekannter Pfad.")
+
+        def _answer(self, key: str, kind: str, item_id: str, body: Dict[str, Any]):
+            """WB-1129: one approval / clarify prompt of THIS session, by its exact id."""
+            if not ID_RE.fullmatch(item_id or ""):
+                return self._refuse(400, "bad id", "Ungültige Anfrage-ID.")
+            answer = approvals.answer_approval if kind == "approvals" else approvals.answer_clarify
+            status, payload = answer(key, item_id, body)
+            if status == 200:
+                logger.info("werkbank: %s answered from the board (resolved=%s)", kind,
+                            payload.get("resolved"))
+            self._json(status, payload)
 
         def _message(self, key: str, body: Dict[str, Any]):
             text = body.get("text")

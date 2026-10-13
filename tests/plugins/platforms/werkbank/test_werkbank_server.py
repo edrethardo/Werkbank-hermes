@@ -267,13 +267,14 @@ def test_stop_uses_interrupt_session_or_answers_501(plugin_server):
     assert status == 501 and "interrupt_session" in answer["grund"]
 
 
-def test_approvals_and_clarify_answer_501_until_wb_1129(plugin_server):
+def test_approvals_and_clarify_of_nothing_pending_are_404(plugin_server):
+    """WB-1129 answers them (test_werkbank_approvals.py); an id nothing waits on is 404."""
     srv = plugin_server
     _resolve(srv)
     for path, body in ((session_path("approvals", "req1"), {"choice": "once"}),
                        (session_path("clarify", "c1"), {"answer": "ja"})):
         status, answer = call(srv.port, "POST", path, srv.key, body)
-        assert status == 501 and "WB-1129" in answer["grund"]
+        assert status == 404 and isinstance(answer["grund"], str)
 
 
 def test_tool_output_from_the_history(plugin_server):

@@ -50,7 +50,10 @@ Which SessionDB row is which board message needs no plugin file: the gateway sto
   new one; authenticated ones have an own quota of 48), 10 s for request line + headers, `Host` must be loopback (`421`).
 * The mirror line is plain text: the board text goes into a literal code block, without control,
   bidi or zero-width characters, capped at 3500 UTF-16 units.
-* Freigaben/Rückfragen (`approvals`, `clarify`) answer `501` until WB-1129.
+* Freigaben/Rückfragen (`approvals`, `clarify`, WB-1129, `approvals.py`): only the exact id pending in
+  that session (else `404`, nothing resolved); a subagent's request `once`/`deny` only. A Telegram card
+  answered from the board is edited to „erledigt in der Werkbank: …“ — the Telegram plugin subscribes
+  to the session stream only while this plugin is enabled. Needs a gateway restart.
 * **Known residual risk on multi-user hosts:** any local user can connect to `127.0.0.1:<port>`
   (the key stops them), and while the gateway is down another local user could bind the port
   first and receive the board's requests — including the key in `Authorization`. On a shared host

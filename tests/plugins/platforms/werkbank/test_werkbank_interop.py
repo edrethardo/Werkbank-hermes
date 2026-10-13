@@ -135,7 +135,19 @@ def test_bridge_speaks_with_the_real_plugin_server(live):
 
     assert client.call("POST", client.session_path(key, "stop"), {}) == (200, {"stopped": True})
     status, _ = client.call("POST", client.session_path(key, "approvals", "req-1"), {"choice": "once"})
-    assert status == 501
+    assert status == 404                     # WB-1129: nothing waits on req-1 in this session
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+    waiting = _ApprovalEntry({"request_id": "req-2", "command": "rm -rf /tmp/x"})
+    with approval._lock:
+        approval._gateway_queues.setdefault(KEY_SESSION, []).append(waiting)
+    try:
+        status, answer = client.call("POST", client.session_path(key, "approvals", "req-2"), {"choice": "once"})
+        assert (status, answer["resolved"]) == (200, 1)      # the shape bruecke/chat.py freigabe reads
+        assert waiting.result == "once" and waiting.decided_by == "werkbank"
+    finally:
+        with approval._lock:
+            approval._gateway_queues.pop(KEY_SESSION, None)
 
     wrong = bruecke.Hermes(live.port, "falsch")
     with pytest.raises(bruecke.HermesAus):

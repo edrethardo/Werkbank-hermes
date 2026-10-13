@@ -703,6 +703,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._approval_state: Dict[str, dict] = {}  # random card token → exact request and delivered message
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
+        self._approval_settled: Dict[str, str] = {}  # fork: werkbank-chat — card token → outcome answered elsewhere
+        self._clarify_cards: Dict[str, dict] = {}  # fork: werkbank-chat — clarify_id → delivered card (chat, message)
+        self._clarify_settled: Dict[str, str] = {}  # fork: werkbank-chat — clarify_id → outcome answered elsewhere
+        self._card_loop: Optional[asyncio.AbstractEventLoop] = None  # fork: werkbank-chat — loop the cards live on
+        _LIVE_ADAPTERS.add(self)  # fork: werkbank-chat — reached by on_gateway_session_event
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -4240,8 +4245,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             approval_id = secrets.token_hex(16)
             buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{approval_id}")
                        for label, choice, _ in prompt.actions]
-            return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), (
-                lambda msg: self._approval_state.__setitem__(approval_id, {
+            def on_sent(msg) -> None:
+                self._remember_card_loop()  # fork: werkbank-chat
+                self._approval_state[approval_id] = {
                     "session_key": prompt.session_key,
                     "request_id": (prompt.metadata or {}).get("approval_request_id"),
                     "choices": {choice for _, choice, _ in prompt.actions},
@@ -4249,7 +4255,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     "thread_id": (str(msg.message_thread_id)
                                   if getattr(msg, "message_thread_id", None) is not None else None),
                     "message_id": str(msg.message_id),
-                }))
+                }
+            return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), on_sent
         return await self._send_prompt(
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
             thread_id=self._metadata_thread_id(prompt.metadata), reply_to_mode=self._reply_to_mode)
@@ -4287,7 +4294,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
                 rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
-            return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
+            def on_sent(msg) -> None:
+                self._clarify_state[clarify_id] = session_key
+                self._remember_card_loop()  # fork: werkbank-chat
+                self._clarify_cards[clarify_id] = {  # fork: werkbank-chat
+                    "session_key": session_key, "chat_id": str(chat_id), "message_id": str(msg.message_id),  # fork: werkbank-chat
+                    "question": str(question or "")}  # fork: werkbank-chat
+            return text, keyboard, on_sent
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
 
@@ -4778,7 +4791,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 or str(cb.get("chat_id")) != pending.get("chat_id")
                 or callback_thread != pending.get("thread_id")
                 or message_id is None or str(message_id) != pending.get("message_id")):
-            await query.answer(text=t("platform.telegram.approval.expired"))
+            settled = self._approval_settled.get(approval_id) if pending is None else None  # fork: werkbank-chat
+            await query.answer(text=(settled or t("platform.telegram.approval.expired"))[:_TOAST_LIMIT])  # fork: werkbank-chat
             return
         self._approval_state.pop(approval_id, None)
         session_key = pending["session_key"]
@@ -4802,6 +4816,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 choice, "resolved_generic")
             label = t(f"platform.telegram.approval.{label_key}")
             edit_text = t("platform.telegram.approval.resolved_by_user", label=label, user=user_display)
+        elif (elsewhere := _decided_elsewhere(session_key, request_id)) is not None:  # fork: werkbank-chat
+            label = edit_text = elsewhere  # fork: werkbank-chat — the other surface won: show ITS outcome
         else:
             label = t("platform.telegram.approval.expired")
             edit_text = t("platform.telegram.approval.expired_detail", label=label)
@@ -4810,6 +4826,67 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
             self.resume_typing_for_chat(str(cb["chat_id"]))
+
+    # ── fork: werkbank-chat — a card answered on another surface (WB-1129) ──────────────────────────
+
+    def _remember_card_loop(self) -> None:  # fork: werkbank-chat
+        with contextlib.suppress(RuntimeError):  # fork: werkbank-chat
+            self._card_loop = asyncio.get_running_loop()  # fork: werkbank-chat
+
+    def on_session_event(self, event: Dict[str, Any]) -> bool:  # fork: werkbank-chat
+        """``approval.resolved`` / ``clarify.resolved`` answered elsewhere (``decided_by`` set and not
+        ``telegram``): edit THIS adapter's card for exactly that request, drop its buttons, forget it.
+        Runs on the session-event worker thread; the edit is scheduled on the adapter's loop."""
+        payload = event.get("payload") or {}
+        decided_by = payload.get("decided_by")
+        if not decided_by or decided_by == "telegram":
+            return False
+        key = event.get("session_key")
+        if event.get("type") == "approval.resolved":
+            rid = payload.get("request_id")
+            text = _settled_text(payload.get("choice"), decided_by)
+            tokens = [tok for tok, st in list(self._approval_state.items())
+                      if isinstance(st, dict) and st.get("session_key") == key and rid and st.get("request_id") == rid]
+            cards = []
+            for tok in tokens:
+                st = self._approval_state.pop(tok, None)
+                if st is not None:
+                    self._approval_settled[tok] = text
+                    cards.append((st["chat_id"], st["message_id"], _html.escape(text)))
+            _cap(self._approval_settled)
+        elif event.get("type") == "clarify.resolved":
+            cid = payload.get("clarify_id")
+            card = self._clarify_cards.get(cid) if cid else None
+            if card is None or card.get("session_key") != key:
+                return False
+            self._clarify_cards.pop(cid, None)
+            self._clarify_state.pop(cid, None)
+            answer = "übersprungen" if payload.get("skipped") else str(payload.get("answer") or "")
+            text = f"{_settled_where(decided_by)}: {answer[:500]}"
+            self._clarify_settled[cid] = f"✅ {text}"
+            _cap(self._clarify_settled)
+            cards = [(card["chat_id"], card["message_id"],
+                      f"❓ {_html.escape(card['question'])}\n\n<b>✅ {_html.escape(_settled_where(decided_by))}:</b> "
+                      f"{_html.escape(answer[:500])}")]
+        else:
+            return False
+        loop = self._card_loop
+        if not cards or loop is None or loop.is_closed():
+            return bool(cards)
+        for chat_id, message_id, html_text in cards:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(self._settle_card(chat_id, message_id, html_text), loop)
+        return True
+
+    async def _settle_card(self, chat_id: str, message_id: str, html_text: str) -> None:  # fork: werkbank-chat
+        if not self._bot:
+            return
+        try:
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id,
+                message_id=int(message_id), text=html_text, parse_mode=ParseMode.HTML, reply_markup=None)
+        except Exception as exc:
+            logger.info("[%s] card answered elsewhere not edited: %s", self.name, _redact_telegram_error_text(exc))
 
     async def _handle_slash_confirm_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``sc:<choice>:<confirm_id>`` — resolve a slash-command confirmation."""
@@ -4867,7 +4944,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         choice_token = parts[2]
         session_key = await self._claim_callback_state(
             query, cb, self._clarify_state, clarify_id, _unauthorized(),
-            _toast("platform.telegram.slash_confirm.already_resolved"), pop=False)
+            (self._clarify_settled.get(clarify_id) or _toast("platform.telegram.slash_confirm.already_resolved"))[:_TOAST_LIMIT],  # fork: werkbank-chat
+            pop=False)
         if not session_key:
             return
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
@@ -4911,7 +4989,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._clarify_state.pop(clarify_id, None)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
-            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+            resolved = resolve_gateway_clarify(clarify_id, resolved_text, decided_by="telegram")  # fork: werkbank-chat
         except Exception as exc:
             logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
             resolved = False
@@ -4920,6 +4998,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             await self._edit_html_quiet(
                 query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
+        elif (settled := self._clarify_settled.get(clarify_id)) is not None:  # fork: werkbank-chat
+            with contextlib.suppress(Exception):  # fork: werkbank-chat
+                await query.answer(text=settled[:_TOAST_LIMIT])  # fork: werkbank-chat
         else:
             # Entry evicted / gateway restarted between ask and tap.
             await self._notify_clarify_expired(query, user_display)
@@ -7360,8 +7441,67 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     return extras or None
 
 
+# ── fork: werkbank-chat — Telegram cards answered in the Werkbank (WB-1129) ──────────────────────
+import weakref  # noqa: E402  # fork: werkbank-chat
+
+_LIVE_ADAPTERS: "weakref.WeakSet[TelegramAdapter]" = weakref.WeakSet()  # fork: werkbank-chat
+_SETTLED_MAX = 256  # fork: werkbank-chat
+_CHOICE_WORDS = {"once": "einmal erlaubt", "session": "für die Sitzung erlaubt",  # fork: werkbank-chat
+                 "always": "immer erlaubt", "deny": "abgelehnt"}  # fork: werkbank-chat
+_SURFACE_WORDS = {"werkbank": "in der Werkbank"}  # fork: werkbank-chat
+
+
+def _settled_where(decided_by: str) -> str:  # fork: werkbank-chat
+    return "erledigt " + _SURFACE_WORDS.get(str(decided_by), "über " + str(decided_by)[:40])  # fork: werkbank-chat
+
+
+def _settled_text(choice: Any, decided_by: str) -> str:  # fork: werkbank-chat
+    icon = "❌" if choice == "deny" else "✅"  # fork: werkbank-chat
+    return f"{icon} {_settled_where(decided_by)}: {_CHOICE_WORDS.get(str(choice), str(choice))}"  # fork: werkbank-chat
+
+
+def _decided_elsewhere(session_key: str, request_id: str) -> Optional[str]:  # fork: werkbank-chat
+    """The outcome text when another surface answered this request first, else None."""  # fork: werkbank-chat
+    try:  # fork: werkbank-chat
+        from tools.approval import gateway_approval_decision  # fork: werkbank-chat
+        decided = gateway_approval_decision(session_key, request_id)  # fork: werkbank-chat
+    except Exception:  # fork: werkbank-chat
+        return None  # fork: werkbank-chat
+    if not decided or not decided.get("decided_by") or decided["decided_by"] == "telegram":  # fork: werkbank-chat
+        return None  # fork: werkbank-chat
+    return _settled_text(decided.get("choice"), decided["decided_by"])  # fork: werkbank-chat
+
+
+def _cap(table: Dict[str, Any]) -> None:  # fork: werkbank-chat
+    while len(table) > _SETTLED_MAX:  # fork: werkbank-chat
+        table.pop(next(iter(table)))  # fork: werkbank-chat
+
+
+def on_gateway_session_event(event=None, **_kw) -> None:  # fork: werkbank-chat
+    """``on_gateway_session_event`` subscriber: hand an answer from another surface to every live adapter."""  # fork: werkbank-chat
+    if not isinstance(event, dict) or event.get("type") not in ("approval.resolved", "clarify.resolved"):  # fork: werkbank-chat
+        return  # fork: werkbank-chat
+    for adapter in list(_LIVE_ADAPTERS):  # fork: werkbank-chat
+        try:  # fork: werkbank-chat
+            adapter.on_session_event(event)  # fork: werkbank-chat
+        except Exception:  # fork: werkbank-chat
+            logger.debug("telegram: card settle failed", exc_info=True)  # fork: werkbank-chat
+
+
+def _werkbank_answers_enabled(ctx) -> bool:  # fork: werkbank-chat
+    """Subscribe to the session stream only with the Werkbank plugin on: without a subscriber the core
+    builds no events at all, and only the Werkbank answers a Telegram card from outside."""  # fork: werkbank-chat
+    try:  # fork: werkbank-chat
+        from plugins.platforms.werkbank import config as wb_config, plugin_home  # fork: werkbank-chat
+        return bool(wb_config.read(plugin_home(ctx)).enabled)  # fork: werkbank-chat
+    except Exception:  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    if _werkbank_answers_enabled(ctx):  # fork: werkbank-chat
+        ctx.register_hook("on_gateway_session_event", on_gateway_session_event)  # fork: werkbank-chat
     ctx.register_platform(
         name="telegram", label="Telegram", adapter_factory=_build_adapter, check_fn=telegram_deps_present,
         ensure_deps_fn=check_telegram_requirements, is_connected=_is_connected, required_env=["TELEGRAM_BOT_TOKEN"],
