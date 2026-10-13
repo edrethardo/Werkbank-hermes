@@ -89,9 +89,11 @@ def test_an_answer_row_counts_for_its_own_turn_only(env):
                           "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}]})
     buffers.on_event(_ev(2, "turn.done", {"final_response": "A fertig."}, id_="t_a"))   # row not written
     buffers.on_event(_ev(3, "turn.start", {}, id_="t_b"))
-    host.messages.append(_answer(2, "B fertig."))
-    buffers.on_event(_ev(4, "turn.done", {"final_response": "B fertig."}, id_="t_b"))
+    host.messages.append(_answer(2, "B fertig."))                  # t_b's row: not t_a's answer
     assert [m["id"] for m in _snap(host, buffers)["messages"]] == ["db:1", "db:2", "t_a"]
+    buffers.on_event(_ev(4, "turn.done", {"final_response": "B fertig."}, id_="t_b"))
+    # review 4: once a later answer is confirmed, the older never-written one is dropped (no revival)
+    assert [m["id"] for m in _snap(host, buffers)["messages"]] == ["db:1", "db:2"]
 
 
 # ── the core names the answer's row: then only that id counts ─────────────────────────────────

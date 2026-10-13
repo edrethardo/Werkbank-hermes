@@ -30,6 +30,7 @@ HISTORY_LIMIT = 200          # newest messages in a snapshot
 TOOL_TEXT_CAP = 4096         # tool output in the history, like tool.end (full text: tools/{id}/output)
 STATE_RUNNING = "arbeitet"   # hvSnapshot: state === "arbeitet" marks a running turn
 STATE_IDLE = "wartet"
+BOARD_ID_PREFIX = "wb-"      # client_message_id the board mints (hermes_view.js hvNewId: "wb-" + uuid)
 
 
 def _capped(value: Any, limit: int = TOOL_TEXT_CAP):
@@ -90,7 +91,9 @@ def _row_origin(row: Dict[str, Any], origin: Optional[str], plugin_id: str) -> O
     plugin's id for its rows — the names the stream uses (``Buffers.on_event``) — else *origin*."""
     injected_by = _row_meta(row, "hermes_plugin_id")
     if injected_by is None:
-        return origin
+        # a row of a core before hermes_plugin_id: the board's own ids (hermes_view.js hvNewId)
+        cmid = row_client_message_id(row)
+        return "werkbank" if cmid is not None and cmid.startswith(BOARD_ID_PREFIX) else origin
     return "werkbank" if injected_by == plugin_id else injected_by
 
 
@@ -139,9 +142,12 @@ def _is_answer_row(row: Dict[str, Any]) -> bool:
 
 
 def _row_uids(rows: List[Dict[str, Any]]) -> set:
-    """Every ``message_uid`` the history rows stand for, the ones a merge folded into them included."""
+    """Every ``message_uid`` the visible history rows stand for, the ones a merge folded into them
+    included. A row without visible text (an empty assistant row) stands for nothing."""
     uids = set()
     for row in rows:
+        if not _text(row.get("content")).strip():
+            continue
         if isinstance(row.get("message_uid"), str) and row["message_uid"]:
             uids.add(row["message_uid"])
         absorbed = row.get("absorbed_message_uids")
@@ -155,39 +161,60 @@ def _row_uids(rows: List[Dict[str, Any]]) -> set:
     return uids
 
 
-def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: Dict[str, Any],
-              window_full: bool, lineage: List[str]) -> None:
-    """Make the snapshot complete up to its ``seq`` (contract, PROTOCOL.md "Snapshot").
+def _int(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    Only entries of the session shown count: its own id or, after a compression, an id of its
-    compression lineage (*lineage*) — never those of a session ``/new`` left behind.
+
+def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: Dict[str, Any],
+              lineage: List[str]) -> Dict[str, List[int]]:
+    """Make the snapshot complete up to its ``seq`` (contract, PROTOCOL.md "Snapshot"); returns the
+    arrival orders of the buffered entries whose rows the history holds (``{"users", "answers"}``) —
+    the caller drops them from the buffer for good (:meth:`buffer.Buffers.confirm`).
+
+    Buffered entries only bridge the time until their SessionDB row exists. Only entries of the
+    session shown count: its own id or, after a compression, an id of its compression lineage
+    (*lineage*) — never those of a session ``/new`` left behind.
 
     * a ``user.message`` the stream already announced whose SessionDB row is not there yet is
       added from the plugin buffer, under the stream's id. A row stands for it only by that id
       (``client_message_id`` stored on the row, or the platform id) — never by text or time;
     * the final answer of a ``turn.done`` is added from the plugin buffer (id = the turn id) until
       its row is in the history:
-        - the core named the row (``turn.done`` ``message_uid``): only a row with that uid counts;
+        - the core named the row (``turn.done`` ``message_uid``): only a visible row with that uid
+          counts;
         - else by row ids (they only grow): the answer row of a turn is an assistant text row with
           an id above the turn's mark — the highest row id at its ``turn.start``, or, for a turn
           begun before the plugin observed the session, at that observation — and not above the
           mark of the next ``turn.start``. Never the wall clock, never the text.
-
-    With a full history window, entries whose row would lie before the window's first row are
-    left out (decided by row ids too).
+    * an entry whose row (``row_id``) or mark (> 0) lies below the first row of the active history is
+      left out — whether the window is full or a compression / ``/undo`` replaced the rows: row
+      ids only grow, so its row is no longer part of what the history shows;
+    * only answers of turns after the newest confirmed answer are shown.
     """
     allowed = set(lineage)
-    first_row = next((rid for rid in (_row_id(r) for r in rows) if rid is not None), None)
-    low = first_row if window_full else None
-    have_ids = {m["id"] for m in messages}
+    low = min((rid for rid in (_row_id(r) for r in rows) if rid is not None), default=None)
+
+    def below(value: Any) -> bool:
+        # a mark of 0 (the session had no row yet) says nothing: its rows may all lie above any row
+        value = _int(value)
+        return low is not None and value is not None and 0 < value < low
+
+    row_ids = {m["id"] for m in messages}                  # ids the history rows stand for
+    have_ids = set(row_ids)
+    confirmed: Dict[str, List[int]] = {"users": [], "answers": []}
 
     for user in pos.get("recent_users") or []:
         board_id = user.get("client_message_id") or user.get("id") or user.get("message_id")
-        if user.get("session_id") not in allowed or not board_id or str(board_id) in have_ids:
+        if user.get("session_id") not in allowed or not board_id:
             continue
-        mark = user.get("mark")
-        if low is not None and isinstance(mark, int) and mark < low:
-            continue                                       # its row may lie before the window
+        if str(board_id) in row_ids:
+            if _int(user.get("order")) is not None:
+                confirmed["users"].append(user["order"])   # its row is there: done for good
+            continue
+        if str(board_id) in have_ids:
+            continue
+        if below(user.get("mark")):
+            continue                                       # its row lies before the active history
         messages.append({"id": str(board_id), "client_message_id": user.get("client_message_id"),
                          "message_id": user.get("message_id"), "db_id": None, "role": "user",
                          "text": user.get("text") or "", "ts": user.get("ts"), "origin": user.get("origin"),
@@ -200,29 +227,40 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
     uids = _row_uids(rows)
     starts = sorted(pos.get("turn_starts") or [], key=lambda t: t.get("order") or 0)
     observed = pos.get("observed") or {}
+    confirmed_order = _int(pos.get("confirmed_order")) or 0
+    shown: List[tuple] = []
     for answer in pos.get("recent_answers") or []:
-        if answer.get("session_id") not in allowed or not (answer.get("text") or "").strip():
+        order = _int(answer.get("order")) or 0
+        if (answer.get("session_id") not in allowed or not (answer.get("text") or "").strip()
+                or order <= confirmed_order):
             continue
         if answer.get("message_uid"):
             if answer["message_uid"] in uids:
-                continue                                   # its own row is in the history
-            row_id = answer.get("row_id")
-            if low is not None and isinstance(row_id, int) and row_id < low:
-                continue                                   # its row lies before the window
+                confirmed["answers"].append(order)       # its own row is in the history
+                continue
+            if below(answer.get("row_id") if _int(answer.get("row_id")) is not None else answer.get("mark")):
+                continue                                   # its row lies before the active history
         else:
             above = answer.get("start_mark") if answer.get("started") else observed.get(answer.get("session_id"))
             above = above if isinstance(above, int) else -1
-            following = next((t.get("mark") for t in starts if (t.get("order") or 0) > (answer.get("order") or 0)
+            following = next((t.get("mark") for t in starts if (t.get("order") or 0) > order
                               and isinstance(t.get("mark"), int)), None)
             if any(rid > above and (following is None or rid <= following) for rid in answer_ids):
-                continue                                   # this turn's answer row is in the history
-            if low is not None and following is not None and following < low:
-                continue                                   # its row lies before the window
-        answer_id = answer.get("turn_id") or f"turn:{len(messages)}"
+                confirmed["answers"].append(order)       # this turn's answer row is in the history
+                continue
+            if below(answer.get("mark") if (_int(answer.get("mark")) or 0) > 0 else following):
+                continue                                   # its row lies before the active history
+        shown.append((order, answer))
+    newest = max(confirmed["answers"], default=0)          # older unconfirmed answers: not shown either
+    for order, answer in shown:
+        if order <= newest:
+            continue
+        answer_id = answer.get("turn_id") or f"turn:{order}"
         messages.append({"id": str(answer_id), "client_message_id": None, "message_id": None, "db_id": None,
                          "role": "assistant", "text": answer.get("text"), "ts": answer.get("ts"),
                          "origin": None, "tool_call_id": None, "tool_name": None, "is_error": False,
                          "truncated": False, "from_buffer": True})
+    return confirmed
 
 
 def _lineage(host, session_key: str, session_id: Optional[str]) -> List[str]:
@@ -254,7 +292,8 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
         item = message_item(row, pos["platform"], buffers.plugin_id)
         if item is not None:
             messages.append(item)
-    _complete(messages, rows, pos, len(rows) >= HISTORY_LIMIT, _lineage(host, session_key, session_id))
+    confirmed = _complete(messages, rows, pos, _lineage(host, session_key, session_id))
+    buffers.confirm(session_key, answers=confirmed["answers"], users=confirmed["users"])
     running = bool(pos["turn_id"]) or bool(host.is_running(session_key))
     session = dict(pos["session"])
     session.setdefault("context_percent", None)

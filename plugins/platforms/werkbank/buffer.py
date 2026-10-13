@@ -20,6 +20,13 @@ not double a SessionDB row that already stands for it. The buffer never compares
 it notes the highest SessionDB row id of the session (``watermark``, ``messages.id`` is
 AUTOINCREMENT and only grows) when it first observes a session id and when a ``user.message``,
 ``turn.start`` or ``turn.done`` arrives. Every kept entry carries that mark and its ``session_id``.
+
+Buffered messages and answers only bridge the time until their SessionDB row exists. Once a row was
+seen for an entry (:meth:`Buffers.confirm`, called by the snapshot) or the core reported the
+answer's row as written (``turn.done`` ``row_id`` at or below the session's highest row id), the
+entry leaves the buffer for good — a later compression or ``/undo`` that takes the row out of the
+active history never brings the buffered copy back. A confirmed answer also drops every older
+unconfirmed one (its turn ended before), and a new session id drops the answers of the old one.
 """
 
 from __future__ import annotations
@@ -80,6 +87,7 @@ class SessionBuffer:
         self.recent_answers: deque = deque(maxlen=_RECENT_ANSWERS)
         # turn_id -> {session_id, mark} of its turn.start, in arrival order (row ids, never the clock)
         self.turn_starts: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.confirmed_order = 0         # order of the newest answer whose row was confirmed
         self.readers = 0                 # open event streams on this session (never evicted while > 0)
         self.evicted = False
         self.tool_count = 0
@@ -135,6 +143,37 @@ class Buffers:
             while len(buf.observed) > _OBSERVED:
                 buf.observed.popitem(last=False)
 
+    # -- confirmed entries leave for good -------------------------------------------------------
+    @staticmethod
+    def _keep_answers(buf: SessionBuffer, keep: Callable[[Dict[str, Any]], bool]) -> None:
+        kept = [a for a in buf.recent_answers if keep(a)]
+        if len(kept) != len(buf.recent_answers):
+            buf.recent_answers = deque(kept, maxlen=_RECENT_ANSWERS)
+
+    def _answer_confirmed(self, buf: SessionBuffer, order: int) -> None:
+        """The answer of arrival *order* has its row: it and every older answer leave the buffer."""
+        buf.confirmed_order = max(buf.confirmed_order, order)
+        self._keep_answers(buf, lambda a: (a.get("order") or 0) > buf.confirmed_order)
+
+    def _session_changed(self, buf: SessionBuffer) -> None:
+        """A new session id (compression rotation, ``/new``): answers of the old id are history."""
+        self._keep_answers(buf, lambda a: a.get("session_id") == buf.session_id)
+
+    def confirm(self, session_key: str, *, answers: Iterable[int] = (), users: Iterable[int] = ()) -> None:
+        """The snapshot saw the rows of these entries (by arrival ``order``): drop them for good."""
+        answers, users = set(answers), set(users)
+        if not answers and not users:
+            return
+        with self.cond:
+            buf = self._sessions.get(session_key)
+            if buf is None:
+                return
+            if users:
+                kept = [u for u in buf.recent_users if u.get("order") not in users]
+                buf.recent_users = deque(kept, maxlen=_RECENT_USERS)
+            if answers:
+                self._answer_confirmed(buf, max(answers))
+
     # -- watching -----------------------------------------------------------------------------
     def _take_epoch(self) -> int:
         epoch = self._next_epoch
@@ -163,6 +202,7 @@ class Buffers:
                     self._new_epoch(buf, "session_id")
                     buf.session_id = session_id
                     buf.known_ids.add(session_id)
+                    self._session_changed(buf)
                 if fresh:
                     self._observe(buf, session_id, mark)
             return buf
@@ -290,6 +330,7 @@ class Buffers:
                     self._new_epoch(buf, "session_id")
                 buf.session_id = str(session_id)
                 buf.known_ids.add(buf.session_id)
+                self._session_changed(buf)
             self._observe(buf, buf.session_id, mark)
             if event.get("platform"):
                 buf.platform = str(event["platform"])
@@ -313,7 +354,8 @@ class Buffers:
                     "client_message_id": payload.get("client_message_id"),
                     "message_id": payload.get("message_id"), "text": str(payload.get("text") or ""),
                     "origin": origin, "ts": ts, "delivery": payload.get("delivery"),
-                    "synthetic": payload.get("synthetic"), "session_id": sid, "mark": mark})
+                    "synthetic": payload.get("synthetic"), "session_id": sid, "mark": mark,
+                    "order": buf.order})
             if type_ == "turn.start" and id_ is not None:
                 buf.turn_starts[str(id_)] = {"session_id": sid, "mark": mark, "order": buf.order}
                 while len(buf.turn_starts) > _TURN_STARTS:
@@ -321,15 +363,13 @@ class Buffers:
             elif type_ == "turn.done" and payload.get("final_response"):
                 start = buf.turn_starts.get(str(id_)) if id_ is not None else None
                 uid, row_id = payload.get("message_uid"), payload.get("row_id")
-                buf.recent_answers.append({
-                    "turn_id": None if id_ is None else str(id_), "text": str(payload["final_response"]),
-                    "ts": ts, "session_id": sid, "mark": mark,
-                    # the turn's own start, or None: it began before this plugin observed the session
-                    "start_mark": start["mark"] if start else None, "started": start is not None,
-                    "order": buf.order,
-                    # the core named the answer's row (gateway/session_events.end_turn): matched by it alone
-                    "message_uid": uid if isinstance(uid, str) and uid else None,
-                    "row_id": row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None})
+                row_id = row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
+                uid = uid if isinstance(uid, str) and uid else None
+                if uid and row_id is not None and isinstance(mark, int) and row_id <= mark:
+                    # the core wrote the answer's row before turn.done (the session already has it)
+                    self._answer_confirmed(buf, buf.order)
+                else:
+                    self._add_answer(buf, id_, payload, ts, sid, mark, start, uid, row_id)
             buf.seq += 1
             buf.events.append({
                 "v": 1, "session_key": key, "session_id": buf.session_id, "epoch": buf.epoch,
@@ -339,6 +379,19 @@ class Buffers:
                 "ts": ts, "payload": payload,
             })
             self.cond.notify_all()
+
+    @staticmethod
+    def _add_answer(buf: SessionBuffer, id_: Any, payload: Dict[str, Any], ts: Any, sid: Optional[str],
+                    mark: Optional[int], start: Optional[Dict[str, Any]], uid: Optional[str],
+                    row_id: Optional[int]) -> None:
+        buf.recent_answers.append({
+            "turn_id": None if id_ is None else str(id_), "text": str(payload["final_response"]),
+            "ts": ts, "session_id": sid, "mark": mark,
+            # the turn's own start, or None: it began before this plugin observed the session
+            "start_mark": start["mark"] if start else None, "started": start is not None,
+            "order": buf.order,
+            # the core named the answer's row (gateway/session_events.end_turn): matched by it alone
+            "message_uid": uid, "row_id": row_id})
 
     @staticmethod
     def _track(buf: SessionBuffer, type_: str, id_: Any, parent_id: Any, payload: Dict[str, Any]) -> None:
@@ -376,6 +429,7 @@ class Buffers:
                     "recent_users": [dict(u) for u in buf.recent_users],
                     "recent_answers": [dict(a) for a in buf.recent_answers],
                     "turn_starts": [dict(t) for t in buf.turn_starts.values()],
+                    "confirmed_order": buf.confirmed_order,
                     "observed": dict(buf.observed),
                     # counted since the board first asked for this session (this plugin process)
                     "session": {"model": buf.model, "tool_count": buf.tool_count,

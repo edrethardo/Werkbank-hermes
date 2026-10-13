@@ -157,8 +157,17 @@ class GatewayHost:
         ``messages.id`` is AUTOINCREMENT: every row written later has a higher id, whatever the
         clock does. ``None`` when the store cannot be read."""
         db = self._db(session_key)
-        get = getattr(db, "get_messages", None)
-        if not session_id or get is None:
+        if not session_id:
+            return None
+        highest = getattr(db, "max_message_row_id", None)     # SELECT MAX(id): no message bodies read
+        if callable(highest):
+            try:
+                rid = highest(session_id)
+            except Exception:
+                return None
+            return rid if isinstance(rid, int) and not isinstance(rid, bool) else None
+        get = getattr(db, "get_messages", None)               # a store without it (older core)
+        if get is None:
             return None
         try:
             rows = list(get(session_id, include_inactive=True, latest=True, limit=1))

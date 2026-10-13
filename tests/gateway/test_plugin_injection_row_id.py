@@ -176,3 +176,112 @@ def test_compression_live_projection_keeps_client_message_id_and_plugin_id():
                                    "gateway_input_owner": "x"}
     live = user_originated_turn_view(carrier)
     assert live["display_metadata"] == {"client_message_id": "wb-7", "hermes_plugin_id": "platforms/werkbank"}
+
+
+# ── WB-1128 review 4: only THIS turn's rows, never an empty row, the mark by MAX(id) ─────────
+
+
+def test_turn_done_reads_only_the_rows_this_turn_added():
+    # the gateway passes history_offset = len(agent_history): an answer row before it is an earlier turn's
+    history = [{"role": "user", "content": "alt", "message_uid": "u-q", "_row_id": 1},
+               {"role": "assistant", "content": "alt", "message_uid": "u-alt", "_row_id": 2}]
+    payload = _done_payload({"final_response": "x", "messages": list(history), "history_offset": 2})
+    assert "message_uid" not in payload and "row_id" not in payload
+    # this turn's own answer counts
+    new = [{"role": "user", "content": "neu", "message_uid": "u-n", "_row_id": 3},
+           {"role": "assistant", "content": "neu", "message_uid": "u-neu", "_row_id": 4}]
+    payload = _done_payload({"final_response": "neu", "messages": history + new, "history_offset": 2})
+    assert payload["message_uid"] == "u-neu" and payload["row_id"] == 4
+    # compression: the gateway reports offset 0 (the list was rebuilt) — the whole list is this turn's view
+    payload = _done_payload({"final_response": "neu", "messages": new, "history_offset": 0})
+    assert payload["message_uid"] == "u-neu"
+
+
+def test_turn_done_never_names_an_empty_answer_row():
+    rows = [{"role": "user", "content": "q", "message_uid": "u-q", "_row_id": 1},
+            {"role": "assistant", "content": "  ", "message_uid": "u-e", "_row_id": 2}]
+    payload = _done_payload({"final_response": "Fehler", "messages": rows, "history_offset": 0})
+    assert "message_uid" not in payload and "row_id" not in payload
+
+
+def test_max_message_row_id_is_the_highest_row_rewound_rows_included(tmp_path):
+    from contextlib import closing
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+
+    with closing(SessionDB(db_path=Path(tmp_path) / "state.db")) as db:
+        db.create_session("s1", "telegram")
+        db.create_session("s2", "telegram")
+        assert db.max_message_row_id("s1") == 0
+        db.append_message("s1", "user", "a")
+        last = db.append_message("s1", "assistant", "b")
+        other = db.append_message("s2", "user", "c")
+        db.deactivate_message("s1", last)
+        assert db.max_message_row_id("s1") == last < other
+        assert db.max_message_row_id("") == 0
+
+
+@pytest.mark.asyncio
+async def test_real_gateway_turn_flushes_the_answer_before_turn_done_and_names_its_uid(monkeypatch, tmp_path):
+    """A real gateway turn (``_run_agent`` → ``run_sync`` → ``end_turn``) with a real ``AIAgent`` on a
+    real SessionDB (only the provider is scripted): the answer row exists when ``end_turn`` runs and
+    ``turn.done`` carries its ``message_uid`` / ``row_id``."""
+    import sys
+
+    from gateway import session_events
+    from hermes_state import SessionDB
+    from tests.agent.test_empty_response_recovery_persistence import _DEAD_LOCAL, _response
+    from tests.gateway.test_session_events import _admission_runner, _settle, _subscribe, _turn_runner
+    from unittest.mock import patch
+    import run_agent as real_module
+    from run_agent import AIAgent as RealAgent
+
+    session_events._reset_for_tests()
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "*")
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **k: None)
+    monkeypatch.setattr("agent.title_generator.start_title_upgrade", lambda *a, **k: None)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "sess-telegram-1"
+    with patch("agent.process_bootstrap.OpenAI"), patch("agent.model_metadata.fetch_model_metadata", return_value={}):
+        real = RealAgent(api_key="test-key", base_url=f"{_DEAD_LOCAL}/v1", model="test/model", quiet_mode=True,
+                         skip_context_files=True, skip_memory=True, enabled_toolsets=[], session_db=db,
+                         session_id=sid)
+    real._cached_system_prompt = "You are helpful."
+    real._use_prompt_caching = False
+    real.compression_enabled = False
+    real.save_trajectories = False
+    real.client = MagicMock()
+    real.client.chat.completions.create.side_effect = lambda **_kw: _response("Die Antwort.")
+
+    class GatewayAgent(RealAgent):
+        """What the gateway constructs: the prepared real agent (its kwargs only name the model)."""
+
+        def __new__(cls, **kwargs):
+            return real
+
+    turn_runner = _turn_runner(monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "run_agent", real_module)     # the real module, its class swapped
+    monkeypatch.setattr(real_module, "AIAgent", GatewayAgent)
+    rows_at_end = []
+    original_end = session_events.end_turn
+
+    def end_turn(scope, **kw):
+        rows_at_end.extend(db.get_messages(sid))
+        return original_end(scope, **kw)
+
+    monkeypatch.setattr(session_events, "end_turn", end_turn)
+    seen = _subscribe()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="4711", chat_type="dm", user_id="4711",
+                           user_name="owner", thread_id="51")
+    runner = _admission_runner(turn_runner, source)
+    try:
+        await runner._handle_message(MessageEvent(text="frage?", message_id="tg-1", source=source))
+        _settle(seen, lambda s: any(e["type"] == "turn.done" for e in s))
+    finally:
+        db.close()
+        session_events._reset_for_tests()
+    done = [e for e in seen if e["type"] == "turn.done"][-1]["payload"]
+    answer = [r for r in rows_at_end if r["role"] == "assistant" and r["content"] == "Die Antwort."]
+    assert len(answer) == 1, rows_at_end                      # flushed BEFORE end_turn
+    assert done["message_uid"] == answer[0]["message_uid"] and done["row_id"] == answer[0]["id"]

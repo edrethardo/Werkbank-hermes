@@ -703,6 +703,14 @@ class SessionMessagesMixin:
             (session_id, role, int(offset)))
         return row[0] if row else None
 
+    def max_message_row_id(self, session_id: str) -> int:  # fork: werkbank-chat
+        """Highest row id ever written for *session_id* (rewound/compacted rows included), ``0`` for
+        none. ``messages.id`` is AUTOINCREMENT: a row written later always has a higher id."""
+        if not session_id:  # fork: werkbank-chat
+            return 0  # fork: werkbank-chat
+        row = self._read_one("SELECT MAX(id) FROM messages WHERE session_id = ?", (session_id,))  # fork: werkbank-chat
+        return int(row[0]) if row and row[0] is not None else 0  # fork: werkbank-chat
+
     def latest_conversation_role(self, session_id: str) -> Optional[str]:
         """Role of the newest active user/assistant/tool row, or ``None``. ``session_meta`` /
         ``system`` rows are transcript bookkeeping stripped before the model sees history, so

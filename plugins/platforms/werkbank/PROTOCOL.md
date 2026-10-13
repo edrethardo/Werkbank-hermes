@@ -135,8 +135,37 @@ produced; its fields are in the snapshot's `session`.
   first observes a session); the answer row of a turn is the first assistant text row (no tool calls)
   above that mark and not above the next `turn.start`'s mark. A turn begun before the plugin observed
   the session uses the observation mark. Never the clock, never the text — the same answer twice
-  stays twice. Then it is shown once (as `db:<id>`). With a full window, entries whose row lies
-  before the window's first row are left out (row ids again).
+  stays twice. Then it is shown once (as `db:<id>`). `turn.done` names only a row this turn wrote
+  (the gateway's `history_offset`) and only one with visible text; an empty assistant row never
+  stands for the buffered answer.
+* **Buffered entries are a bridge, never a second history.** An entry leaves the plugin buffer for
+  good once its row was confirmed: seen in a snapshot (by id / uid / the row-id rule above) or, for
+  an answer, reported written by `turn.done` (`row_id` at or below the session's highest row id,
+  `SELECT MAX(id)` via `SessionDB.max_message_row_id`). A compression (in place or by rotation) or
+  `/undo` that later takes the row out of the active history never brings the buffered copy back.
+  Independent of the window: an entry whose row (`row_id`) or mark lies below the first row of the
+  active history is not shown; only answers of turns after the newest confirmed answer are shown
+  (in practice the last one or two); a new session id drops the answers of the old one.
+* **Remaining limits (honest):**
+  - An answer whose `turn.done` carries no uid (older core, empty row) is matched by row marks; if
+    it was never seen in a snapshot and a compression / `/undo` happens, it is dropped, not shown
+    twice. Without a watermark (store unreadable) entries cannot be checked against row ids: an
+    entry may then be missing until its row is read, never doubled by guesswork.
+  - A message queued during a turn that compresses in place may be missing from a snapshot taken
+    between the compression and its own row write (its mark lies below the new rows); the stream's
+    `user.message` still carries it.
+  - A row observed between the agent's flush and `turn.done` carries no uid in the buffer yet; the
+    row itself is in the history, so nothing is lost.
+  - Under a local connection flood a legitimate request can be delayed: unauthenticated
+    connections are capped (`max_pending`, the oldest is hung up) and must send their headers
+    within `HEADER_DEADLINE_S` (10 s); a client that sends its headers slowly may be dropped and
+    has to reconnect.
+  - `/retry` does NOT carry the board's id over: it rewinds the last user turn and sends its text as
+    a new message without `client_message_id` (`gateway/slash_commands_session._handle_retry_command`).
+    The snapshot then shows a plain row (`db:<id>`, origin of the session's platform); the board's
+    message id is gone with the rewound row.
+  - Rows written by a core before `hermes_plugin_id`: a `client_message_id` starting with `wb-`
+    (the board's own ids) counts as origin `werkbank`.
 * History: newest 200 SessionDB rows via the store's read API (`get_messages`), tool output capped
   at 4 KB like `tool.end` (`truncated`). `pending_approvals` from `list_gateway_approvals`, commands
   redacted like the event; `pending_clarify` from `get_pending_for_session` (the oldest open one).
