@@ -369,12 +369,12 @@ def _window_head(value: str) -> str:  # fork: werkbank-chat
     """
     head = value[:_REDACT_WINDOW_CHARS]  # fork: werkbank-chat
     if value[_REDACT_WINDOW_CHARS] == "\n":  # fork: werkbank-chat
-        return head  # fork: werkbank-chat
-    nl = head.rfind("\n")  # fork: werkbank-chat
-    if nl != -1:  # fork: werkbank-chat
-        return head[: nl + 1]  # fork: werkbank-chat
-    if not value[_REDACT_WINDOW_CHARS].isspace():  # fork: werkbank-chat
+        pass  # fork: werkbank-chat — window ends exactly at a line break
+    elif (nl := head.rfind("\n")) != -1:  # fork: werkbank-chat
+        head = head[: nl + 1]  # fork: werkbank-chat
+    elif not value[_REDACT_WINDOW_CHARS].isspace():  # fork: werkbank-chat
         head = head[: max(head.rfind(" "), head.rfind("\t"), 0)]  # fork: werkbank-chat
+    # A secret value may itself contain a line break; the field rule applies on every path.
     open_field = _OPEN_SECRET_FIELD_RE.search(head)  # fork: werkbank-chat
     return head[: open_field.start()] if open_field else head  # fork: werkbank-chat
 

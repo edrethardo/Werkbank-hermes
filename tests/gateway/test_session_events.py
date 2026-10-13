@@ -934,6 +934,16 @@ def test_capped_single_line_json_secret_with_spaces_at_the_window_edge_does_not_
     assert truncated and "correct" not in text and "horse" not in text, text[-200:]
 
 
+@pytest.mark.parametrize("offset", range(-14, -6))
+def test_capped_secret_value_with_a_real_line_break_at_the_window_edge_does_not_leak(offset):
+    # Review 4 repro: the value itself holds a newline; the line cut alone left it open.
+    window = session_events._REDACT_WINDOW_CHARS
+    field = '"password": "correct\nhorse battery staple"\n'
+    raw = "x" * (window - 30 + offset) + "\n" + field + "tail\n"
+    text, _truncated = session_events._capped(raw, 10**6)
+    assert "correct" not in text and "horse" not in text, text[-120:]
+
+
 def test_drop_open_block_ignores_an_incomplete_end_marker():
     key = _keyblock()
     cut = key[: key.rindex(_DASH5 + "END") + len(_DASH5 + "END RSA PRIVATE")]
