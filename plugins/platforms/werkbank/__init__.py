@@ -16,12 +16,16 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("plugins.platforms.werkbank")
 
 HOOK = "on_gateway_session_event"
+
+_STARTED: dict = {}
+_STARTED_LOCK = threading.Lock()
 
 
 def in_gateway_process() -> bool:
@@ -82,4 +86,13 @@ def register(ctx: Any) -> None:
     if settings.problem:
         logger.warning("werkbank: not started: plugins.entries.werkbank: %s", settings.problem)
         return
-    start(ctx, home, settings)
+    # The gateway may register this plugin from more than one scope; one server per process.
+    with _STARTED_LOCK:
+        if home.resolve() in _STARTED:
+            logger.debug("werkbank: already running in this process for %s", home)
+            return
+        srv = start(ctx, home, settings)
+        if srv is not None:
+            done = home.resolve()
+            _STARTED[done] = srv
+            ctx.on_unload(lambda: _STARTED.pop(done, None))

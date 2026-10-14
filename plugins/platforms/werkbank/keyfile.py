@@ -51,16 +51,26 @@ def _read(path: Path) -> str:
         os.close(fd)
 
 
+def _usable(key: str) -> bool:
+    return len(key) >= MIN_KEY_CHARS and not any(c.isspace() for c in key)
+
+
 def ensure_key(home: Path) -> str:
-    """The key of this profile; created (0600, in a 0700 directory) when there is none yet."""
+    """The key of this profile; created (0600, in a 0700 directory) when there is none yet.
+
+    Race-safe: two starts at the same moment (the gateway loads the plugin from more than one
+    scope) must end with ONE key — the one on disk. A new key is published with ``os.link``,
+    which fails when another start was first; then that key is read and used. Only a present
+    but unusable key is replaced (``os.replace``)."""
     directory = key_dir(home)
     _tighten_dir(directory)
     path = key_path(home)
     try:
         key = _read(path)
+        present = True
     except FileNotFoundError:
-        key = ""
-    if len(key) >= MIN_KEY_CHARS and not any(c.isspace() for c in key):
+        key, present = "", False
+    if _usable(key):
         return key
     key = secrets.token_urlsafe(KEY_BYTES)
     tmp = directory / f".key.{os.getpid()}.{secrets.token_hex(4)}"
@@ -70,5 +80,21 @@ def ensure_key(home: Path) -> str:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(tmp, path)
-    return key
+    try:
+        if present:
+            os.replace(tmp, path)
+            return key
+        try:
+            os.link(tmp, path)
+            return key
+        except FileExistsError:
+            other = _read(path)
+            if _usable(other):
+                return other
+            os.replace(tmp, path)
+            return key
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
