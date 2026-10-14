@@ -88,11 +88,11 @@ def register(ctx: Any) -> None:
         return
     # The gateway may register this plugin from more than one scope; one server per process.
     with _STARTED_LOCK:
-        if home.resolve() in _STARTED:
+        running = _STARTED.get(home.resolve())
+        closing = getattr(running, "closing", None)
+        if running is not None and not (callable(closing) and closing()):
             logger.debug("werkbank: already running in this process for %s", home)
             return
         srv = start(ctx, home, settings)
         if srv is not None:
-            done = home.resolve()
-            _STARTED[done] = srv
-            ctx.on_unload(lambda: _STARTED.pop(done, None))
+            _STARTED[home.resolve()] = srv

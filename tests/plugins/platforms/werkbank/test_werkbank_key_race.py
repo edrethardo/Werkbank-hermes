@@ -48,13 +48,14 @@ def test_register_twice_in_one_process_starts_one_server(tmp_path, monkeypatch):
     monkeypatch.setattr(wb, "plugin_home", lambda ctx: tmp_path)
     from plugins.platforms.werkbank import config
     monkeypatch.setattr(config, "read", lambda home: SimpleNamespace(enabled=True, problem=None))
-    monkeypatch.setattr(wb, "start", lambda ctx, home, settings: calls.append(home) or object())
+    state = {"closing": False}
+    srv = SimpleNamespace(closing=lambda: state["closing"])
+    monkeypatch.setattr(wb, "start", lambda ctx, home, settings: calls.append(home) or srv)
     monkeypatch.setattr(wb, "_STARTED", {})
     ctx = SimpleNamespace(on_unload=unloads.append)
     wb.register(ctx)
     wb.register(ctx)
     assert calls == [tmp_path]
-    for fn in unloads:
-        fn()
+    state["closing"] = True          # unloaded: a later register starts again
     wb.register(ctx)
     assert calls == [tmp_path, tmp_path]
