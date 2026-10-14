@@ -55,10 +55,18 @@ class FakeStore:
 class FakeAdapter:
     def __init__(self):
         self.sent = []
+        self.deleted = []
+        self.answer = SimpleNamespace(success=True, message_id="900")
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append((chat_id, content, metadata))
-        return SimpleNamespace(success=True)
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
 
 
 class FakeOwner:
@@ -112,6 +120,20 @@ class Ctx127:
         self.unload.append(callback)
 
 
+class CtxReply(Ctx127):
+    """WB-1148: inject_message(reply_to_message_id=) anchors the turn's answer on a message."""
+
+    def __init__(self, owner, accept=True):
+        super().__init__(owner)
+        self.accept = accept
+
+    def inject_message(self, content, role="user", *, session_key=None, origin=None, client_message_id=None,
+                       reply_to_message_id=None):
+        self.injected.append({"text": content, "session_key": session_key,
+                              "client_message_id": client_message_id, "reply_to_message_id": reply_to_message_id})
+        return self.accept
+
+
 class CtxOld(Ctx127):
     """Before WB-1127: no client_message_id, no interrupt_session."""
 
@@ -132,14 +154,15 @@ def _injected_event(call_):
     return event
 
 
-def _start(tmp_path, ctx, *, mirror=True):
+def _start(tmp_path, ctx, *, mirror=True, mirror_name=""):
     from plugins.platforms.werkbank import buffer, keyfile, server
     from plugins.platforms.werkbank.host import GatewayHost
 
     key = keyfile.ensure_key(tmp_path)
     host = GatewayHost(ctx, tmp_path)
     buffers = buffer.Buffers(plugin_id=PLUGIN_ID, watermark=host.row_watermark)
-    srv = server.WerkbankServer(key, buffers, host, port=0, heartbeat=0.1, mirror_enabled=lambda: mirror).start()
+    srv = server.WerkbankServer(key, buffers, host, port=0, heartbeat=0.1, mirror_enabled=lambda: mirror,
+                                mirror_name=mirror_name).start()
     return SimpleNamespace(server=srv, key=key, buffers=buffers, host=host, port=srv.port)
 
 
@@ -255,17 +278,146 @@ def test_stop_uses_the_real_interface_or_answers_501(tmp_path):
 
 @pytest.mark.parametrize("mirror", [True, False])
 def test_werkbank_message_is_mirrored_into_the_topic_when_switched_on(tmp_path, mirror):
+    from plugins.platforms.werkbank.mirror import TELEGRAM_PREFORMATTED
+
     owner = FakeOwner()
     srv = _start(tmp_path, Ctx127(owner), mirror=mirror)
     try:
         call(srv.port, "GET", f"/v1/resolve?session_id={SID}", srv.key)
         call(srv.port, "POST", session_path("messages"), srv.key, {"text": "Deploy jetzt?", "client_message_id": "m1"})
-        deadline = time.monotonic() + 3
-        while mirror and not owner.adapter.sent and time.monotonic() < deadline:
-            time.sleep(0.02)
-        time.sleep(0.1)
-        assert owner.adapter.sent == ([("4711", "aus Werkbank:\n```\nDeploy jetzt?\n```", {"thread_id": "51"})]
+        assert owner.adapter.sent == ([("4711", "👤 *Du · Werkbank*\n>Deploy jetzt?",
+                                        {"thread_id": "51", TELEGRAM_PREFORMATTED: True})]
                                       if mirror else [])
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+# ── WB-1148: Hermes' answer replies to the mirrored message ───────────────────────────────────
+
+
+def _post(srv, text="Deploy jetzt?", cmid="m1"):
+    call(srv.port, "GET", f"/v1/resolve?session_id={SID}", srv.key)
+    return call(srv.port, "POST", session_path("messages"), srv.key, {"text": text, "client_message_id": cmid})
+
+
+def test_the_mirror_goes_out_first_and_its_message_id_anchors_the_answer(tmp_path):
+    owner = FakeOwner()
+    ctx = CtxReply(owner)
+    srv = _start(tmp_path, ctx, mirror_name="Aaron")
+    try:
+        assert _post(srv) == (200, {"accepted": True})
+        assert owner.adapter.sent[0][1] == "👤 *Aaron · Werkbank*\n>Deploy jetzt?"
+        assert ctx.injected == [{"text": "Deploy jetzt?", "session_key": KEY_SESSION, "client_message_id": "m1",
+                                 "reply_to_message_id": "900"}]
+        assert owner.adapter.deleted == []
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+@pytest.mark.parametrize("answer", [SimpleNamespace(success=False, message_id=None, error="flood"),
+                                    SimpleNamespace(success=True, message_id=None),
+                                    RuntimeError("telegram down")])
+def test_a_failed_mirror_leaves_the_answer_without_a_reply_anchor(tmp_path, answer):
+    owner = FakeOwner()
+    owner.adapter.answer = answer
+    ctx = CtxReply(owner)
+    srv = _start(tmp_path, ctx)
+    try:
+        assert _post(srv) == (200, {"accepted": True})
+        assert ctx.injected[0]["reply_to_message_id"] is None
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_mirror_switched_off_sends_nothing_and_anchors_nothing(tmp_path):
+    owner = FakeOwner()
+    ctx = CtxReply(owner)
+    srv = _start(tmp_path, ctx, mirror=False)
+    try:
+        assert _post(srv) == (200, {"accepted": True})
+        assert owner.adapter.sent == [] and ctx.injected[0]["reply_to_message_id"] is None
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_a_slow_mirror_does_not_hold_the_message(tmp_path, monkeypatch):
+    from plugins.platforms.werkbank import host as host_mod
+
+    monkeypatch.setattr(host_mod, "MIRROR_WAIT_S", 0.2)
+    owner = FakeOwner()
+    release = threading.Event()
+    original = owner.adapter.send
+
+    async def slow(chat_id, content, reply_to=None, metadata=None):
+        await asyncio.get_running_loop().run_in_executor(None, release.wait, 3)
+        return await original(chat_id, content, reply_to, metadata)
+
+    owner.adapter.send = slow
+    ctx = CtxReply(owner)
+    srv = _start(tmp_path, ctx)
+    try:
+        started = time.monotonic()
+        assert _post(srv) == (200, {"accepted": True})
+        assert time.monotonic() - started < 2
+        assert ctx.injected[0]["reply_to_message_id"] is None
+    finally:
+        release.set()
+        srv.server.stop()
+        owner.close()
+
+
+def test_a_refused_message_takes_its_mirror_back(tmp_path):
+    owner = FakeOwner()
+    srv = _start(tmp_path, CtxReply(owner, accept=False))
+    try:
+        status, _ = _post(srv)
+        assert status == 503
+        deadline = time.monotonic() + 3
+        while not owner.adapter.deleted and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert owner.adapter.deleted == [("4711", "900")]
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_an_older_core_without_the_anchor_kwarg_still_gets_the_message(tmp_path):
+    owner = FakeOwner()
+    ctx = Ctx127(owner)                     # inject_message has no reply_to_message_id
+    srv = _start(tmp_path, ctx)
+    try:
+        assert _post(srv) == (200, {"accepted": True})
+        assert ctx.injected == [{"text": "Deploy jetzt?", "session_key": KEY_SESSION, "client_message_id": "m1"}]
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_default_name_is_the_first_name_of_the_telegram_owner(tmp_path):
+    owner = FakeOwner()
+    owner.session_store.entry.origin = SessionSource(platform=Platform.TELEGRAM, chat_id="4711", chat_type="dm",
+                                                     user_id="4711", user_name="Aaron Beispiel", thread_id="51")
+    srv = _start(tmp_path, CtxReply(owner))
+    try:
+        _post(srv)
+        assert owner.adapter.sent[0][1].startswith("👤 *Aaron · Werkbank*\n")
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_a_non_telegram_chat_gets_the_plain_block_without_the_flag(tmp_path):
+    owner = FakeOwner()
+    owner.session_store.entry.origin = SessionSource(platform=Platform.DISCORD, chat_id="4711", chat_type="dm",
+                                                     user_id="4711", thread_id="51")
+    srv = _start(tmp_path, CtxReply(owner))
+    try:
+        _post(srv)
+        assert owner.adapter.sent == [("4711", "👤 Du · Werkbank\n```\nDeploy jetzt?\n```", {"thread_id": "51"})]
     finally:
         srv.server.stop()
         owner.close()
@@ -275,8 +427,10 @@ def test_mirror_switch_defaults_to_on_and_port_to_8767():
     from plugins.platforms.werkbank import config
 
     assert config.from_entry({"enabled": True}) == config.Settings(enabled=True, port=8767,
-                                                                    mirror_to_telegram=True)
+                                                                    mirror_to_telegram=True, mirror_name="")
     assert config.from_entry({"mirror_to_telegram": False}).mirror_to_telegram is False
+    assert config.from_entry({"mirror_name": " Aaron "}).mirror_name == "Aaron"
+    assert config.from_entry({"mirror_name": 7}).mirror_name == ""
     assert config.from_entry(None).enabled is False
     assert config.from_entry({"port": 8765}).problem
     assert config.from_entry({"port": "abc"}).problem

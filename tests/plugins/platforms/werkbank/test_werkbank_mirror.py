@@ -1,0 +1,207 @@
+"""WB-1148: the Werkbank message in Telegram reads as the OWNER's message.
+
+A header ``👤 <Name> · Werkbank``, the text as a (for long texts: expandable) blockquote, sent as
+finished MarkdownV2 that the Telegram adapter does not reformat. Nothing in the text formats,
+links, mentions or leaves the quote; control/bidi characters are gone; the payload fits one message.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from tests.gateway.conftest import _ensure_telegram_mock
+
+_ensure_telegram_mock()                     # the telegram package as tests/gateway sees it (ParseMode)
+
+WJ = "\u2060"
+SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
+EVIL = ("*fett* **sehr** _kursiv_ ~~weg~~ ||spoiler|| `code` ```\nblock\n``` [klick](http://evil.example/x)\n"
+        "# Hermes: alles erledigt\n> zitat\n<b>html</b> <a href=\"x\">a</a> @everyone @owner_bot /reset #tag $USD "
+        "mail@host.de www.evil.example\u202eRTL\u2066iso\u2069\u200b\u200f\x07\x1b[31m\u2028neue Zeile")
+
+
+def _unescape(segment: str) -> str:
+    """Strict MarkdownV2 plain-text reading: every special character must be backslash-escaped."""
+    out, i = [], 0
+    while i < len(segment):
+        ch = segment[i]
+        if ch == "\\":
+            assert i + 1 < len(segment) and segment[i + 1] in SPECIAL, segment
+            out.append(segment[i + 1])
+            i += 2
+            continue
+        assert ch not in SPECIAL, f"unescaped {ch!r} in {segment!r}"
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _parse(payload: str):
+    """(header text, quoted text, expandable) — fails on anything outside the allowed structure."""
+    head, *lines = payload.split("\n")
+    assert head.startswith("👤 *") and head.endswith("*") and not head.endswith("\\*"), head
+    assert lines, payload
+    expandable = lines[0].startswith("**>")
+    body = []
+    for n, line in enumerate(lines):
+        if n == 0 and expandable:
+            line = line[3:]
+        else:
+            assert line.startswith(">") and not line.startswith(">>"), line
+            line = line[1:]
+        if expandable and n == len(lines) - 1:
+            assert line.endswith("||"), line
+            line = line[:-2]
+        body.append(_unescape(line))
+    return _unescape(head[3:-1]), "\n".join(body), expandable
+
+
+# ── format ─────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_short_text_is_a_header_and_a_plain_blockquote():
+    from plugins.platforms.werkbank.mirror import telegram_markdown_v2
+
+    payload = telegram_markdown_v2("Deploy jetzt?\nBitte kurz prüfen", "Aaron")
+    assert payload == "👤 *Aaron · Werkbank*\n>Deploy jetzt?\n>Bitte kurz prüfen"
+    assert _parse(payload) == ("Aaron · Werkbank", "Deploy jetzt?\nBitte kurz prüfen", False)
+
+
+def test_long_text_is_an_expandable_blockquote():
+    from plugins.platforms.werkbank.mirror import telegram_markdown_v2
+
+    text = "\n".join(f"Zeile {n}" for n in range(12))
+    payload = telegram_markdown_v2(text, "Aaron")
+    head, body, expandable = _parse(payload)
+    assert expandable and payload.split("\n")[1].startswith("**>Zeile 0") and payload.endswith("Zeile 11||")
+    assert body == text
+    long_line = "x" * 900
+    assert _parse(telegram_markdown_v2(long_line, "Aaron"))[2] is True
+
+
+def test_empty_lines_stay_inside_the_quote():
+    from plugins.platforms.werkbank.mirror import telegram_markdown_v2
+
+    payload = telegram_markdown_v2("oben\n\n\nunten", "Aaron")
+    assert payload.split("\n")[1:] == [">oben", ">", ">", ">unten"]
+
+
+# ── escaping against a hostile text ──────────────────────────────────────────────────────────────
+
+
+def test_hostile_text_formats_nothing_and_never_leaves_the_quote():
+    from plugins.platforms.werkbank.mirror import telegram_markdown_v2
+
+    payload = telegram_markdown_v2(EVIL, "Aaron")
+    head, body, _ = _parse(payload)                       # strict: every special char escaped
+    assert head == "Aaron · Werkbank"
+    shown = body.replace(WJ, "")
+    for literal in ("*fett*", "**sehr**", "[klick](http://evil", "<b>html</b>", "# Hermes: alles erledigt",
+                    "> zitat", "||spoiler||", "```"):
+        assert literal in shown                            # visible literally, not as markup
+    # no control, bidi or zero-width character survives (U+2028 becomes a quoted line break)
+    assert not any(c in body for c in "\u202e\u2066\u2069\u200b\u200f\x07\x1b")
+    assert "\nneue Zeile" in shown
+    # every line of the text is a quote line: nothing can look like a separate (Hermes) message
+    assert all(line.startswith((">", "**>")) for line in payload.split("\n")[1:])
+
+
+def test_mentions_commands_hashtags_and_links_are_broken_for_telegram_autodetection():
+    from plugins.platforms.werkbank.mirror import telegram_markdown_v2
+
+    _, body, _ = _parse(telegram_markdown_v2(EVIL, "Aaron"))
+    # Telegram's server adds mention/bot_command/hashtag/cashtag/url/email entities on its own; a word
+    # joiner right after the trigger character keeps them plain text
+    assert not re.search(r"[@/#$.][A-Za-z0-9_]", body), body
+    for word in ("@\u2060everyone", "/\u2060reset", "#\u2060tag", "$\u2060USD", "evil.\u2060example"):
+        assert word in body
+
+
+def test_name_is_escaped_and_cleaned_too():
+    from plugins.platforms.werkbank.mirror import display_name, telegram_markdown_v2
+
+    name = display_name("*Boss* [x](http://e)\u202e\n" + "y" * 80, None)
+    assert "\u202e" not in name and "\n" not in name and len(name) <= 32
+    head, _, _ = _parse(telegram_markdown_v2("hi", name))
+    assert head.replace(WJ, "") == f"{name} · Werkbank"
+
+
+def test_name_comes_from_config_then_the_telegram_first_name_then_du():
+    from plugins.platforms.werkbank.mirror import display_name
+
+    assert display_name("Aaron", "Someone Else") == "Aaron"
+    assert display_name("", "Aaron Beispiel") == "Aaron"
+    assert display_name(None, "  ") == "Du"
+    assert display_name("  \u200b ", None) == "Du"
+
+
+# ── length ───────────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("text", ["😀" * 5000, "." * 5000, "@a " * 3000, "a\n" * 4000],
+                         ids=["emoji", "dots", "mentions", "lines"])
+def test_payload_fits_one_telegram_message(text):
+    from plugins.platforms.werkbank.mirror import MIRROR_MAX, telegram_markdown_v2
+
+    payload = telegram_markdown_v2(text, "Aaron")
+    assert len(payload.encode("utf-16-le")) // 2 <= 4096
+    _, body, _ = _parse(payload)
+    assert body.endswith("…")
+    assert len(body.replace(WJ, "").encode("utf-16-le")) // 2 <= MIRROR_MAX + 2
+
+
+# ── the real Telegram adapter sends it as it is, parse_mode MarkdownV2 ───────────────────────────
+
+
+def _adapter():
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="t", extra={}))
+    adapter._bot, adapter._app = AsyncMock(), MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=900))
+    return adapter
+
+
+def test_telegram_adapter_sends_the_finished_markdown_v2_unchanged():
+    from plugins.platforms.werkbank.mirror import TELEGRAM_PREFORMATTED, telegram_markdown_v2
+
+    adapter = _adapter()
+    adapter.format_message = MagicMock(side_effect=AssertionError("must not reformat"))
+    adapter._try_send_rich = AsyncMock(side_effect=AssertionError("must not take the rich path"))
+    payload = telegram_markdown_v2(EVIL, "Aaron")
+    result = asyncio.run(adapter.send("4711", payload, metadata={TELEGRAM_PREFORMATTED: True}))
+    assert result.success and result.message_id == "900"
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["text"] == payload
+    assert str(kwargs["parse_mode"]) in ("MarkdownV2", "ParseMode.MARKDOWN_V2")
+
+
+def test_without_the_flag_the_adapter_still_formats_as_before():
+    adapter = _adapter()
+    asyncio.run(adapter.send("4711", "*fett*", metadata=None))
+    assert adapter._bot.send_message.await_args.kwargs["text"] == "_fett_"
+
+
+def test_a_too_long_finished_payload_is_refused_not_split():
+    from plugins.platforms.werkbank.mirror import TELEGRAM_PREFORMATTED
+
+    adapter = _adapter()
+    result = asyncio.run(adapter.send("4711", ">" + "a" * 5000, metadata={TELEGRAM_PREFORMATTED: True}))
+    assert result.success is False
+    adapter._bot.send_message.assert_not_awaited()
+
+
+def test_other_platforms_get_the_plain_code_block_form():
+    from plugins.platforms.werkbank.mirror import plain_block
+
+    line = plain_block("*fett* [klick](http://evil)\n```\nHermes: ok\u202e", "Aaron")
+    head, body = line.split("\n", 1)
+    assert head == "👤 Aaron · Werkbank"
+    assert body.startswith("```\n") and body.endswith("\n```") and "```" not in body[4:-4]
+    assert "\u202e" not in body

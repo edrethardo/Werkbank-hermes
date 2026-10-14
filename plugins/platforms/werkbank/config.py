@@ -5,7 +5,8 @@
         werkbank:
           enabled: true              # default false: no port is opened without it
           port: 8767                 # default 8767 (NOT 8765, the board's port)
-          mirror_to_telegram: true   # default true: "aus Werkbank: …" line in the topic
+          mirror_to_telegram: true   # default true: the board text, as the owner's message, in the topic
+          mirror_name: Aaron         # default: the chat owner's Telegram first name, else "Du"
 
 The Werkbank board reads the same ``port`` (``bruecke.read_port``). Keep it a plain number.
 
@@ -34,6 +35,7 @@ class Settings:
     enabled: bool = False
     port: int = DEFAULT_PORT
     mirror_to_telegram: bool = True
+    mirror_name: str = ""
     problem: str = ""
 
 
@@ -74,8 +76,10 @@ def from_entry(entry: Any) -> Settings:
         problem, port = "port is not a port number", DEFAULT_PORT
     elif port == BOARD_PORT:
         problem = "port 8765 is the Werkbank board's own port"
+    name = entry.get("mirror_name")
     return Settings(enabled=_bool(entry.get("enabled"), False), port=port,
-                    mirror_to_telegram=_bool(entry.get("mirror_to_telegram"), True), problem=problem)
+                    mirror_to_telegram=_bool(entry.get("mirror_to_telegram"), True),
+                    mirror_name=name.strip() if isinstance(name, str) else "", problem=problem)
 
 
 def read(home: Path) -> Settings:

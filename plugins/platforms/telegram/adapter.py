@@ -518,6 +518,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     _STATUS_MESSAGE_IDS_MAX = 2000
 
     MAX_MESSAGE_LENGTH = 4096
+    # send() metadata flag: content is finished MarkdownV2, send it unchanged (WB-1148 Werkbank mirror)
+    PREFORMATTED_MDV2 = "telegram_preformatted_markdown_v2"  # fork: werkbank-chat
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
@@ -3669,6 +3671,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         error_types = self._telegram_error_types()
         chunks: List[str] = []
         delivered: List[str] = []
+        if (metadata or {}).get(self.PREFORMATTED_MDV2) is True:  # fork: werkbank-chat
+            return await self._send_preformatted_locked(chat_id, content, reply_to, metadata, error_types)  # fork: werkbank-chat
         try:
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
@@ -3689,6 +3693,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
+
+    async def _send_preformatted_locked(  # fork: werkbank-chat
+        self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+        error_types: tuple) -> SendResult:
+        """The caller built finished MarkdownV2 (metadata ``PREFORMATTED_MDV2``): one message, sent as
+        it is — no ``format_message``, no rich path, never split (a split could cut an entity in
+        half). Too long for one message: refused, nothing sent."""
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error="preformatted message too long", retryable=False)
+        delivered: List[str] = []
+        try:
+            return await self._send_chunks(chat_id, [content], delivered, reply_to, metadata, error_types)
+        except Exception as e:
+            return self._classify_send_exception(e, error_types)
 
     def _classify_send_exception(self, e: Exception, error_types: tuple) -> SendResult:
         """The failed ``SendResult`` for an exception escaping the chunk loop. ``retryable`` doubles as

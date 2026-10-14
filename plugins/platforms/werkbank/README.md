@@ -23,7 +23,8 @@ plugins:
     werkbank:                   # read by this plugin AND by the board (bruecke.read_port)
       enabled: true             # default false: without it no port is opened
       port: 8767                # default 8767; NOT 8765 (the board's own port, refused)
-      mirror_to_telegram: true  # default true: "aus Werkbank: <text>" line in the session's topic
+      mirror_to_telegram: true  # default true: the board text, as the owner's message, in the session's topic
+      mirror_name: Aaron        # header name; default: the chat owner's Telegram first name, else "Du"
     platforms/werkbank:         # the core's gate for this plugin (its plugin id)
       allow_gateway_injection: true   # needed for sending AND stopping
 ```
@@ -55,8 +56,15 @@ Which SessionDB row is which board message needs no plugin file: the gateway sto
   them is logged, the HTTP handler writes no access log.
 * Before auth: at most 64 connections (when full the oldest unauthenticated one is closed, not the
   new one; authenticated ones have an own quota of 48), 10 s for request line + headers, `Host` must be loopback (`421`).
-* The mirror line is plain text: the board text goes into a literal code block, without control,
-  bidi or zero-width characters, capped at 3500 UTF-16 units.
+* The mirror (WB-1148, `mirror.py`) reads as the owner's message: `👤 <Name> · Werkbank`, then the
+  text as a blockquote (expandable when long), built as finished MarkdownV2 that the Telegram adapter
+  sends unchanged (metadata `telegram_preformatted_markdown_v2`). Every MarkdownV2 special character
+  is escaped; a word joiner after `@ # $ / .` keeps Telegram from making mentions, commands, hashtags
+  or links; control, bidi and zero-width characters are removed; ≤ 3500 UTF-16 units of text and one
+  message. It is sent BEFORE the turn is injected; its message id becomes the turn's reply anchor
+  (`inject_message(reply_to_message_id=…)`), so Hermes' answer replies to it. Mirror failed or slower
+  than 5 s: the answer goes out without a reply. Message refused by the gateway: the mirror is deleted.
+  Other platforms: header plus a literal code block.
 * Freigaben/Rückfragen (`approvals`, `clarify`, WB-1129, `approvals.py`): only the exact id pending in
   that session (else `404`, nothing resolved); a subagent's request `once`/`deny` only. A Telegram card
   answered from the board is edited to „erledigt in der Werkbank: …“ — the Telegram plugin subscribes

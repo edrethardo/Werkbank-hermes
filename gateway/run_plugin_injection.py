@@ -70,6 +70,7 @@ class GatewayPluginInjectionMixin:
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
+        reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
@@ -85,7 +86,8 @@ class GatewayPluginInjectionMixin:
                 return False
             target = f"origin={source.platform.value}/{source.chat_id}"
             coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id,
-                                                          client_message_id=client_message_id)  # fork: werkbank-chat
+                                                          client_message_id=client_message_id,  # fork: werkbank-chat
+                                                          reply_to_message_id=reply_to_message_id)  # fork: werkbank-chat
         else:
             if not isinstance(session_key, str) or not self._plugin_session_in_own_profile(  # fork: werkbank-chat
                     session_key, plugin_home=plugin_home, plugin_id=plugin_id,  # fork: werkbank-chat
@@ -95,6 +97,7 @@ class GatewayPluginInjectionMixin:
             coro = self._dispatch_plugin_message_injection(
                 session_key=session_key, content=content, plugin_id=plugin_id,
                 client_message_id=client_message_id,  # fork: werkbank-chat
+                reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
             )
         return self._submit_plugin_coroutine(coro, loop, plugin_id=plugin_id, target=target,  # fork: werkbank-chat
                                              what="Plugin message injection")  # fork: werkbank-chat
@@ -171,8 +174,10 @@ class GatewayPluginInjectionMixin:
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str,
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
+        reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
     ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        """Route a plugin-triggered turn through the session's live adapter. ``reply_to_message_id``
+        becomes the turn's reply anchor (``reply_anchor_override``); ``message_id`` stays unset."""
         if not self._plugin_injection_accepting():
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
@@ -192,6 +197,7 @@ class GatewayPluginInjectionMixin:
             await adapter.handle_message(MessageEvent(
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,
+                reply_anchor_override=reply_to_message_id,  # fork: werkbank-chat
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                     "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
@@ -265,6 +271,7 @@ class GatewayPluginInjectionMixin:
     async def _dispatch_plugin_origin_injection(
         self, *, source: SessionSource, content: str, plugin_id: str,
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
+        reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
     ) -> bool:
         """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
@@ -282,6 +289,7 @@ class GatewayPluginInjectionMixin:
             await adapter.handle_message(MessageEvent(
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,
+                reply_anchor_override=reply_to_message_id,  # fork: werkbank-chat
                 # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,

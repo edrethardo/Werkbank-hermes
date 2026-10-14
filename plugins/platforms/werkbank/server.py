@@ -14,7 +14,6 @@ import re
 import socket
 import threading
 import time
-import unicodedata
 import urllib.parse
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,50 +32,9 @@ MAX_STREAMS = 32
 MAX_CONNECTIONS = 64                 # connections not authenticated yet; beyond it the OLDEST one goes
 MAX_AUTHENTICATED = MAX_STREAMS + 16 # authenticated connections (streams + requests): an own quota
 HEADER_DEADLINE_S = 10.0             # request line + headers (+ POST body) must arrive within this
-MIRROR_PREFIX = "aus Werkbank:"
-MIRROR_MAX = 3500                    # UTF-16 units of the quoted text (a Telegram message holds 4096)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")      # = the board's bruecke.ID_RE
 _KEY_MAX = 512
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
-_FENCE_RUN = re.compile(r"`{3,}")
-
-
-def _plain(text: str) -> str:
-    """*text* without control, format (bidi, zero-width) or separator characters; tabs become
-    spaces, line breaks stay ``\n``."""
-    out = []
-    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
-        if ch == "\n":
-            out.append(ch)
-        elif ch == "\t":
-            out.append(" ")
-        elif unicodedata.category(ch) in ("Zl", "Zp"):
-            out.append("\n")
-        elif unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn"):
-            out.append(ch)
-    return "".join(out)
-
-
-def _utf16_cap(text: str, limit: int) -> str:
-    if len(text.encode("utf-16-le")) // 2 <= limit:
-        return text
-    used, cut = 0, 0
-    for i, ch in enumerate(text):
-        used += 2 if ord(ch) > 0xFFFF else 1
-        if used > limit:
-            cut = i
-            break
-    return text[:cut].rstrip() + " …"
-
-
-def mirror_line(text: str) -> str:
-    """The line posted into the session's own chat: a fixed prefix, then the board text as a literal
-    code block — never rendered as Markdown, no control/bidi characters, capped. A run of three
-    backticks in the text is broken up so it cannot close the block."""
-    body = _plain(text).strip("\n ")
-    body = _FENCE_RUN.sub(lambda m: "`\u2009" * (len(m.group()) - 1) + "`", body)
-    body = _utf16_cap(body, MIRROR_MAX)
-    return f"{MIRROR_PREFIX}\n```\n{body}\n```"
 
 
 def _loopback_host(header: Optional[str], port: int) -> bool:
@@ -164,7 +122,8 @@ class WerkbankServer:
     """``WerkbankServer(key, buffers, host, port).start()``; ``stop()`` on unload."""
 
     def __init__(self, key: str, buffers, host, port: int = DEFAULT_PORT, *, heartbeat: float = HEARTBEAT_S,
-                 mirror_enabled: Callable[[], bool] = lambda: True, max_streams: int = MAX_STREAMS,
+                 mirror_enabled: Callable[[], bool] = lambda: True, mirror_name: str = "",
+                 max_streams: int = MAX_STREAMS,
                  max_connections: int = MAX_CONNECTIONS, max_authenticated: int = MAX_AUTHENTICATED,
                  header_deadline: float = HEADER_DEADLINE_S) -> None:
         if not key or any(c.isspace() for c in key):
@@ -175,6 +134,7 @@ class WerkbankServer:
         self.requested_port = int(port)
         self.heartbeat = heartbeat
         self.mirror_enabled = mirror_enabled
+        self.mirror_name = mirror_name
         self.max_streams = max_streams
         self.max_connections = max_connections
         self.max_authenticated = max_authenticated
@@ -525,21 +485,29 @@ def _handler(app: WerkbankServer):
             if not app.buffers.accept_id(key, cmid, awaits_event=awaits):
                 return self._refuse(409, "duplicate", "Diese Nachricht wurde schon angenommen.",
                                     accepted=False)
+            # WB-1148: the mirror goes out FIRST, so its Telegram message id can be the reply anchor of
+            # Hermes' answer. A mirror that fails or is slow (host.MIRROR_WAIT_S) leaves no anchor.
+            anchor = None
+            if app.mirror_enabled():
+                try:
+                    anchor = app.host.mirror(key, text, app.mirror_name)
+                except Exception:
+                    logger.info("werkbank: mirror line not delivered")
             try:
-                accepted, _ = app.host.inject(key, text, cmid)
+                accepted, _ = app.host.inject(key, text, cmid, reply_to_message_id=anchor)
             except Exception:
                 accepted = False
             if not accepted:
                 app.buffers.release_id(key, cmid)
+                if anchor is not None:
+                    try:
+                        app.host.unmirror(key, anchor)      # Hermes never got it: take the mirror back
+                    except Exception:
+                        logger.info("werkbank: mirror line not taken back")
                 logger.info("werkbank: message refused by the gateway (session known, text not logged)")
                 return self._refuse(503, "not accepted",
                                     "Hermes hat die Nachricht nicht angenommen (Gateway nicht bereit oder "
                                     "allow_gateway_injection fehlt).", accepted=False)
-            if app.mirror_enabled():
-                try:
-                    app.host.mirror(key, mirror_line(text))
-                except Exception:
-                    logger.info("werkbank: mirror line not scheduled")
             self._json(200, {"accepted": True})
 
         def _stop(self, key: str):

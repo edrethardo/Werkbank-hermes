@@ -155,7 +155,8 @@ def test_bridge_speaks_with_the_real_plugin_server(live):
     deadline = time.monotonic() + 3
     while not live.owner.adapter.sent and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert live.owner.adapter.sent[0][1] == "aus Werkbank:\n```\nBitte prüfen\n```"
+    content = live.owner.adapter.sent[0][1]
+    assert content.startswith("👤 *") and content.endswith(" · Werkbank*\n>Bitte prüfen")   # WB-1148
 
 
 # ── the chat view (hermes_view.js, WB-1132) reads a real snapshot ──────────────────────────

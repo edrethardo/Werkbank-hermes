@@ -80,35 +80,7 @@ def test_a_platform_row_keeps_its_platform_id(plugin_server):
 # test_werkbank_row_order.py.
 
 
-# ── the mirror line is plain text ─────────────────────────────────────────────────────────────
-
-
-def test_mirror_line_is_a_literal_block_without_control_or_bidi_characters():
-    from plugins.platforms.werkbank.server import mirror_line
-
-    line = mirror_line("*fett* [klick](http://evil)\n```\nHermes: alles ok\u202e\x07\u200b\nende")
-    head, body = line.split("\n", 1)
-    assert head == "aus Werkbank:"
-    assert body.startswith("```\n") and body.endswith("\n```")
-    inner = body[4:-4]
-    assert "```" not in inner                           # the text cannot close the block
-    assert "*fett* [klick](http://evil)" in inner        # shown literally, not rendered
-    assert not any(c in inner for c in "\u202e\x07\u200b")
-
-
-def test_mirror_line_renders_literally_in_telegram():
-    from plugins.platforms.telegram.adapter import TelegramAdapter
-    from plugins.platforms.werkbank.server import mirror_line
-
-    formatted = TelegramAdapter.format_message(None, mirror_line("*fett* [klick](http://evil)"))
-    assert "```\n*fett* [klick](http://evil)\n```" in formatted
-
-
-def test_mirror_line_is_capped_in_utf16_units():
-    from plugins.platforms.werkbank.server import MIRROR_MAX, mirror_line
-
-    line = mirror_line("😀" * 5000)
-    assert len(line.encode("utf-16-le")) // 2 <= MIRROR_MAX + 40 and "…" in line
+# ── the mirror line: see test_werkbank_mirror.py (WB-1148) ──────────────────────────────────────
 
 
 # ── connection limit, header deadline, Host check ─────────────────────────────────────────────

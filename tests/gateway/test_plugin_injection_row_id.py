@@ -285,3 +285,53 @@ async def test_real_gateway_turn_flushes_the_answer_before_turn_done_and_names_i
     answer = [r for r in rows_at_end if r["role"] == "assistant" and r["content"] == "Die Antwort."]
     assert len(answer) == 1, rows_at_end                      # flushed BEFORE end_turn
     assert done["message_uid"] == answer[0]["message_uid"] and done["row_id"] == answer[0]["id"]
+
+
+# ── WB-1148: a plugin names the message the turn's answer replies to ─────────────────────────────
+# fork: werkbank-chat
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("anchor", ["900", None])
+async def test_dispatch_anchors_the_answer_on_the_named_message(anchor):
+    from gateway.platforms.base import _reply_anchor_for_event
+    from tests.gateway.test_plugin_message_injection import _entry, _runner as _injection_runner
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _injection_runner(entry, adapter)
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="hallo", plugin_id="werkbank", client_message_id="wb-7",
+        reply_to_message_id=anchor) is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.reply_anchor_override == anchor and _reply_anchor_for_event(event) == anchor
+    assert event.message_id is None                      # ledger key / inbound id untouched
+
+
+def test_reply_anchor_override_wins_in_a_telegram_forum_topic_too():
+    from gateway.platforms.base import _reply_anchor_for_event
+
+    forum = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", user_id="1", thread_id="7")
+    event = MessageEvent(text="x", source=forum, internal=True, reply_anchor_override="900")
+    assert _reply_anchor_for_event(event) == "900"
+
+
+@pytest.mark.parametrize("anchor,accepted,forwarded", [("900", True, "900"), (None, True, None),
+                                                        ("a\nb", False, None), ("x" * 300, False, None),
+                                                        (900, False, None)],
+                         ids=["anchor", "none", "newline", "too-long", "not-a-string"])
+def test_inject_message_hands_the_reply_anchor_to_the_gateway(monkeypatch, anchor, accepted, forwarded):
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    calls = []
+    manager._gateway_message_injector = (object(), lambda **kw: calls.append(kw) or True)
+    ctx = PluginContext(PluginManifest(name="werkbank", key="platforms/werkbank", source="bundled"), manager)
+    monkeypatch.setattr(ctx, "_gateway_injection_allowed", lambda: True)
+    assert ctx.inject_message("hallo", session_key=KEY, client_message_id="wb-1",
+                              reply_to_message_id=anchor) is accepted
+    if accepted:
+        assert calls[0].get("reply_to_message_id") == forwarded
+        assert ("reply_to_message_id" in calls[0]) is (anchor is not None)
+    else:
+        assert calls == []

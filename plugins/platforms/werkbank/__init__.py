@@ -91,7 +91,8 @@ def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[
     mirror = bool(settings.mirror_to_telegram)
     try:
         srv = server.WerkbankServer(key, buffers, host, settings.port if port is None else port,
-                                    mirror_enabled=lambda: mirror).start()
+                                    mirror_enabled=lambda: mirror,
+                                    mirror_name=getattr(settings, "mirror_name", "")).start()
     except OSError as exc:
         logger.warning("werkbank: cannot listen on 127.0.0.1:%s (%s)", settings.port, type(exc).__name__)
         return None

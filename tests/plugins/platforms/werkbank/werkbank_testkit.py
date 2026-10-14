@@ -37,12 +37,17 @@ class FakeHost:
         self.interrupts: list = []
         self.interrupt_answer: Optional[bool] = True   # None = interrupt_session missing (pre WB-1127)
         self.mirrored: list = []
+        self.anchors: list = []            # reply anchor handed to each inject (WB-1148)
+        self.unmirrored: list = []
         self.messages: list = []
         self.approvals: list = []
         self.clarify: list = []
         self.outputs: dict = {}
         self.running = False
         self.lineages: dict = {}           # session_id -> compression lineage root → tip
+
+    def unmirror(self, session_key, message_id):
+        self.unmirrored.append((session_key, message_id))
 
     def resolve(self, session_id):
         return self.sessions.get(session_id)
@@ -53,17 +58,18 @@ class FakeHost:
                 return info["session_id"]
         return None
 
-    def inject(self, session_key, text, client_message_id):
+    def inject(self, session_key, text, client_message_id, reply_to_message_id=None):
         self.injected.append((session_key, text, client_message_id))
+        self.anchors.append(reply_to_message_id)
         return self.inject_answer, self.supports_client_message_id
 
     def interrupt(self, session_key):
         self.interrupts.append(session_key)
         return self.interrupt_answer
 
-    def mirror(self, session_key, line):
-        self.mirrored.append((session_key, line))
-        return True
+    def mirror(self, session_key, text, name=""):
+        self.mirrored.append((session_key, text, name))
+        return None                        # no message id: the answer gets no reply anchor
 
     def is_running(self, session_key):
         return self.running

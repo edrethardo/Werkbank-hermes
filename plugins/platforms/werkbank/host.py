@@ -11,6 +11,8 @@ Feature detection against WB-1127 (built in parallel):
   and the buffer gives the id to the next ``user.message`` this plugin injected (FIFO).
 * ``PluginContext.interrupt_session(session_key)`` — missing: ``interrupt`` returns ``None`` and the
   server answers 501 with the reason.
+* ``PluginContext.inject_message(..., reply_to_message_id=…)`` (WB-1148) — present: Hermes' answer
+  replies to the mirrored message. Missing: the answer goes out as before, without a reply.
 """
 
 from __future__ import annotations
@@ -21,12 +23,14 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import mirror as mirror_mod
 from . import resolve as resolve_mod
 
 logger = logging.getLogger("plugins.platforms.werkbank")
 
 TOOL_OUTPUT_MAX = 1024 * 1024        # GET tools/{id}/output: the full text, up to 1 MB
 _TOOL_SCAN = 500                     # newest messages searched for a tool call id
+MIRROR_WAIT_S = 5.0                  # the board's POST waits this long for the mirror's message id
 
 
 def accepts_kwarg(func: Any, name: str) -> bool:
@@ -50,6 +54,8 @@ class GatewayHost:
         self.supports_client_message_id = accepts_kwarg(getattr(ctx, "inject_message", None),
                                                         "client_message_id")
         self.supports_interrupt = callable(getattr(ctx, "interrupt_session", None))
+        self.supports_reply_anchor = accepts_kwarg(getattr(ctx, "inject_message", None),
+                                                   "reply_to_message_id")      # WB-1148
 
     # -- the live gateway -------------------------------------------------------------------------
     def owner(self) -> Any:
@@ -69,12 +75,16 @@ class GatewayHost:
         return resolve_mod.current_session_id(self.owner(), session_key)
 
     # -- send / stop ----------------------------------------------------------------------------
-    def inject(self, session_key: str, text: str, client_message_id: str) -> Tuple[bool, bool]:
-        """(accepted, the id travels with the message)."""
+    def inject(self, session_key: str, text: str, client_message_id: str,
+               reply_to_message_id: Optional[str] = None) -> Tuple[bool, bool]:
+        """(accepted, the id travels with the message). ``reply_to_message_id``: the message Hermes'
+        answer replies to, passed only when this core knows the parameter."""
+        kwargs: Dict[str, Any] = {}
         if self.supports_client_message_id:
-            ok = self.ctx.inject_message(text, session_key=session_key, client_message_id=client_message_id)
-        else:
-            ok = self.ctx.inject_message(text, session_key=session_key)
+            kwargs["client_message_id"] = client_message_id
+        if reply_to_message_id is not None and self.supports_reply_anchor:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        ok = self.ctx.inject_message(text, session_key=session_key, **kwargs)
         return bool(ok), self.supports_client_message_id
 
     def interrupt(self, session_key: str) -> Optional[bool]:
@@ -86,38 +96,63 @@ class GatewayHost:
             logger.warning("werkbank: interrupt_session failed", exc_info=False)
             return False
 
-    def mirror(self, session_key: str, line: str) -> bool:
-        """Post *line* into the session's own chat (the Telegram topic). Best effort, async."""
+    def _chat(self, session_key: str):
+        """(adapter, source, loop) of the session's own chat, or ``None``."""
         owner = self.owner()
         entry = self._entry(session_key)
         if owner is None or entry is None or getattr(entry, "origin", None) is None:
-            return False
+            return None
         restore = getattr(owner, "_restored_source", None)
         source = restore(entry) if callable(restore) else entry.origin
         deliver = getattr(owner, "_delivery_adapter_for", None)
         adapter = deliver(source) if callable(deliver) and source is not None else None
         loop = getattr(owner, "_gateway_loop", None)
         if adapter is None or loop is None or loop.is_closed():
-            return False
+            return None
+        return adapter, source, loop
+
+    def mirror(self, session_key: str, text: str, name: str = "") -> Optional[str]:
+        """Post the board *text* into the session's own chat as the owner's message (``mirror.py``).
+
+        Returns the posted message's id (the reply anchor for Hermes' answer), or ``None`` when it
+        was not posted within ``MIRROR_WAIT_S`` — the send then still finishes in the background."""
+        chat = self._chat(session_key)
+        if chat is None:
+            return None
+        adapter, source, loop = chat
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+        who = mirror_mod.display_name(name, getattr(source, "user_name", None))
+        content, extra = mirror_mod.for_platform(str(platform or ""), text, who)
         thread_id = getattr(source, "thread_id", None)
-        metadata = {"thread_id": str(thread_id)} if thread_id else None
+        metadata = {**({"thread_id": str(thread_id)} if thread_id else {}), **extra} or None
         try:
             future = asyncio.run_coroutine_threadsafe(
-                adapter.send(str(source.chat_id), line, metadata=metadata), loop)
+                adapter.send(str(source.chat_id), content, metadata=metadata), loop)
         except Exception:
             logger.info("werkbank: mirror line not scheduled")
+            return None
+        try:
+            result = future.result(timeout=MIRROR_WAIT_S)
+        except Exception:                # timeout, cancelled, or the send raised
+            future.add_done_callback(_log_late_mirror)
+            logger.info("werkbank: mirror line not delivered in time (answer without reply)")
+            return None
+        if getattr(result, "success", True) is False:
+            logger.info("werkbank: mirror line not delivered")
+            return None
+        message_id = getattr(result, "message_id", None)
+        return str(message_id) if message_id not in (None, "") else None
+
+    def unmirror(self, session_key: str, message_id: str) -> bool:
+        """Delete a mirror whose message the gateway then refused. Best effort, not awaited."""
+        chat = self._chat(session_key)
+        delete = getattr(chat[0], "delete_message", None) if chat else None
+        if not callable(delete):
             return False
-
-        def _done(fut) -> None:
-            try:
-                result = fut.result()
-            except Exception:
-                logger.info("werkbank: mirror line not delivered")
-                return
-            if getattr(result, "success", True) is False:
-                logger.info("werkbank: mirror line not delivered")
-
-        future.add_done_callback(_done)
+        try:
+            asyncio.run_coroutine_threadsafe(delete(str(chat[1].chat_id), str(message_id)), chat[2])
+        except Exception:
+            return False
         return True
 
     # -- state for the snapshot --------------------------------------------------------------------
@@ -221,6 +256,16 @@ class GatewayHost:
             return []
         entry = get_pending_for_session(session_key, include_choice_prompts=True)
         return [] if entry is None else [clarify_payload(entry)]
+
+
+def _log_late_mirror(fut) -> None:
+    try:
+        result = fut.result()
+    except Exception:
+        logger.info("werkbank: mirror line not delivered")
+        return
+    if getattr(result, "success", True) is False:
+        logger.info("werkbank: mirror line not delivered")
 
 
 def approval_payload(data: Dict[str, Any], redact) -> Dict[str, Any]:

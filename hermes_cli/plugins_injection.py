@@ -21,6 +21,7 @@ def _valid_client_message_id(value: Any) -> bool:  # fork: werkbank-chat
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
     origin: Optional[Mapping[str, Any]], client_message_id: Optional[str] = None,  # fork: werkbank-chat
+    reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
 ) -> bool:
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
@@ -41,6 +42,9 @@ def inject_plugin_message(
         return False
     if client_message_id is not None and not _valid_client_message_id(client_message_id):  # fork: werkbank-chat
         logger.warning("inject_message: client_message_id must be a short single-line string")  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    if reply_to_message_id is not None and not _valid_client_message_id(reply_to_message_id):  # fork: werkbank-chat
+        logger.warning("inject_message: reply_to_message_id must be a short single-line string")  # fork: werkbank-chat
         return False  # fork: werkbank-chat
     if not ctx._gateway_injection_allowed():
         logger.warning("inject_message: gateway injection denied for plugin %s; set "
@@ -72,6 +76,8 @@ def inject_plugin_message(
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
     if client_message_id is not None:  # fork: werkbank-chat
         target["client_message_id"] = client_message_id  # fork: werkbank-chat
+    if reply_to_message_id is not None:  # fork: werkbank-chat
+        target["reply_to_message_id"] = reply_to_message_id  # fork: werkbank-chat
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:

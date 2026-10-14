@@ -223,7 +223,9 @@ def test_send_refused_by_the_gateway_is_503_with_a_reason_and_may_be_resent(plug
     body = {"text": "hallo", "client_message_id": "wb-2"}
     status, answer = call(srv.port, "POST", session_path("messages"), srv.key, body)
     assert status == 503 and answer["accepted"] is False and "allow_gateway_injection" in answer["grund"]
-    assert srv.host.mirrored == []
+    # WB-1148: the mirror goes out first (its id anchors the answer); a posted one is taken back,
+    # see test_refused_message_takes_back_its_mirror
+    assert [m[1] for m in srv.host.mirrored] == ["hallo"]
     srv.host.inject_answer = True
     assert call(srv.port, "POST", session_path("messages"), srv.key, body)[0] == 200
 
@@ -244,16 +246,39 @@ def test_mirror_line_follows_the_switch(tmp_path, mirror):
     try:
         _resolve(srv)
         call(srv.port, "POST", session_path("messages"), srv.key, {"text": "Deploy?", "client_message_id": "m1"})
-        assert srv.host.mirrored == ([(KEY_SESSION, "aus Werkbank:\n```\nDeploy?\n```")] if mirror else [])
+        # the raw text goes to the host (it knows the chat's platform and owner); the format is mirror.py's
+        assert srv.host.mirrored == ([(KEY_SESSION, "Deploy?", "")] if mirror else [])
     finally:
         srv.server.stop()
 
 
-def test_mirror_line_is_capped_for_telegram():
-    from plugins.platforms.werkbank.server import mirror_line
+def test_mirror_message_id_becomes_the_reply_anchor_of_the_injected_turn(tmp_path):
+    host = FakeHost()
+    host.mirror = lambda key, text, name="": host.mirrored.append((key, text, name)) or "900"
+    srv = running_server(tmp_path, host)
+    try:
+        _resolve(srv)
+        call(srv.port, "POST", session_path("messages"), srv.key, {"text": "Deploy?", "client_message_id": "m1"})
+        assert host.anchors == ["900"] and host.mirrored == [(KEY_SESSION, "Deploy?", "")]
+    finally:
+        srv.server.stop()
 
-    line = mirror_line("a" * 10_000)
-    assert line.startswith("aus Werkbank:\n```\n") and len(line) < 4096 and line.endswith("…\n```")
+
+def test_mirror_that_raises_still_injects_without_anchor(tmp_path):
+    host = FakeHost()
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("down")
+
+    host.mirror = boom
+    srv = running_server(tmp_path, host)
+    try:
+        _resolve(srv)
+        assert call(srv.port, "POST", session_path("messages"), srv.key,
+                    {"text": "Deploy?", "client_message_id": "m1"}) == (200, {"accepted": True})
+        assert host.anchors == [None]
+    finally:
+        srv.server.stop()
 
 
 def test_stop_uses_interrupt_session_or_answers_501(plugin_server):
@@ -355,3 +380,17 @@ def test_snapshot_after_turn_done_has_the_final_answer_before_the_db_row(plugin_
     srv.host.messages = [{"id": 7, "role": "assistant", "content": "Fertig, alle Tests grün.", "timestamp": 2e9}]
     snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
     assert [a["id"] for a in snap["messages"] if a["role"] == "assistant"] == ["db:7"]
+
+
+def test_refused_message_takes_back_its_mirror(tmp_path):
+    host = FakeHost()
+    host.inject_answer = False
+    host.mirror = lambda key, text, name="": "900"
+    srv = running_server(tmp_path, host)
+    try:
+        _resolve(srv)
+        assert call(srv.port, "POST", session_path("messages"), srv.key,
+                    {"text": "Deploy?", "client_message_id": "m1"})[0] == 503
+        assert host.unmirrored == [(KEY_SESSION, "900")]
+    finally:
+        srv.server.stop()
