@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +33,7 @@ logger = logging.getLogger("plugins.platforms.werkbank")
 TOOL_OUTPUT_MAX = 1024 * 1024        # GET tools/{id}/output: the full text, up to 1 MB
 _TOOL_SCAN = 500                     # newest messages searched for a tool call id
 MIRROR_WAIT_S = 5.0                  # the board's POST waits this long for the mirror's message id
+_ANCHOR_RE = re.compile(r"[0-9]{1,20}")   # = the core's reply_to_message_id check (plugins_injection.py)
 
 
 def accepts_kwarg(func: Any, name: str) -> bool:
@@ -82,8 +85,8 @@ class GatewayHost:
         kwargs: Dict[str, Any] = {}
         if self.supports_client_message_id:
             kwargs["client_message_id"] = client_message_id
-        if reply_to_message_id is not None and self.supports_reply_anchor:
-            kwargs["reply_to_message_id"] = reply_to_message_id
+        if self.supports_reply_anchor and _ANCHOR_RE.fullmatch(reply_to_message_id or ""):
+            kwargs["reply_to_message_id"] = reply_to_message_id     # the core refuses anything else
         ok = self.ctx.inject_message(text, session_key=session_key, **kwargs)
         return bool(ok), self.supports_client_message_id
 
@@ -111,17 +114,34 @@ class GatewayHost:
             return None
         return adapter, source, loop
 
-    def mirror(self, session_key: str, text: str, name: str = "") -> Optional[str]:
+    def injection_possible(self) -> bool:
+        """Can the gateway take a plugin message right now? Checked BEFORE the mirror goes out, so a
+        message the gateway would refuse anyway does not push a notification and then vanish: a live
+        injector, the gateway running and not draining, ``allow_gateway_injection`` granted. Only a
+        pre-check — the state can change before ``inject`` (drain starts, config edited) and the core
+        also checks the session's authorization; ``PostedMirror.take_back`` covers that window."""
+        owner = self.owner()
+        if owner is None or not getattr(owner, "_running", False) or getattr(owner, "_draining", False):
+            return False
+        allowed = getattr(self.ctx, "_gateway_injection_allowed", None)   # core-internal; absent: let inject decide
+        try:
+            return bool(allowed()) if callable(allowed) else True
+        except Exception:
+            return False
+
+    def mirror(self, session_key: str, text: str, name: str = "") -> Optional["PostedMirror"]:
         """Post the board *text* into the session's own chat as the owner's message (``mirror.py``).
 
-        Returns the posted message's id (the reply anchor for Hermes' answer), or ``None`` when it
-        was not posted within ``MIRROR_WAIT_S`` — the send then still finishes in the background."""
+        Returns ``None`` when nothing was sent (no chat, injection impossible, send failed in time),
+        else a ``PostedMirror``: ``message_id`` is the reply anchor for Hermes' answer when the send
+        finished within ``MIRROR_WAIT_S``; a slower send still finishes in the background, and
+        ``take_back()`` deletes it once it lands."""
         chat = self._chat(session_key)
-        if chat is None:
+        if chat is None or not self.injection_possible():
             return None
         adapter, source, loop = chat
         platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
-        who = mirror_mod.display_name(name, getattr(source, "user_name", None))
+        who = mirror_mod.display_name(name)
         content, extra = mirror_mod.for_platform(str(platform or ""), text, who)
         thread_id = getattr(source, "thread_id", None)
         metadata = {**({"thread_id": str(thread_id)} if thread_id else {}), **extra} or None
@@ -131,20 +151,23 @@ class GatewayHost:
         except Exception:
             logger.info("werkbank: mirror line not scheduled")
             return None
+        posted = PostedMirror(self, session_key)
         try:
             result = future.result(timeout=MIRROR_WAIT_S)
         except Exception:                # timeout, cancelled, or the send raised
-            future.add_done_callback(_log_late_mirror)
+            future.add_done_callback(posted._landed_late)
             logger.info("werkbank: mirror line not delivered in time (answer without reply)")
-            return None
-        if getattr(result, "success", True) is False:
+            return posted
+        message_id = _message_id(result)
+        if message_id is None:
             logger.info("werkbank: mirror line not delivered")
             return None
-        message_id = getattr(result, "message_id", None)
-        return str(message_id) if message_id not in (None, "") else None
+        posted.message_id = message_id
+        posted._landed(message_id)
+        return posted
 
     def unmirror(self, session_key: str, message_id: str) -> bool:
-        """Delete a mirror whose message the gateway then refused. Best effort, not awaited."""
+        """Delete a posted mirror message. Best effort, not awaited."""
         chat = self._chat(session_key)
         delete = getattr(chat[0], "delete_message", None) if chat else None
         if not callable(delete):
@@ -258,14 +281,49 @@ class GatewayHost:
         return [] if entry is None else [clarify_payload(entry)]
 
 
-def _log_late_mirror(fut) -> None:
-    try:
-        result = fut.result()
-    except Exception:
-        logger.info("werkbank: mirror line not delivered")
-        return
+def _message_id(result: Any) -> Optional[str]:
+    """The sent message's id from an adapter ``SendResult``; ``None`` when it was not delivered."""
     if getattr(result, "success", True) is False:
-        logger.info("werkbank: mirror line not delivered")
+        return None
+    message_id = getattr(result, "message_id", None)
+    return str(message_id) if message_id not in (None, "") else None
+
+
+class PostedMirror:
+    """One mirror send. ``message_id``: the id known within ``MIRROR_WAIT_S`` (the reply anchor), else
+    ``None``. ``take_back()`` — the gateway refused the message — deletes the mirror now, or, when
+    the send is still running, as soon as it lands: whichever of ``take_back`` and the send's done
+    callback comes second does the delete (both flags under one lock), so it happens exactly once."""
+
+    def __init__(self, host: "GatewayHost", session_key: str) -> None:
+        self.message_id: Optional[str] = None
+        self._host, self._key = host, session_key
+        self._lock = threading.Lock()
+        self._landed_id: Optional[str] = None
+        self._withdrawn = False
+
+    def _landed(self, message_id: Optional[str]) -> None:
+        with self._lock:
+            self._landed_id = message_id
+            delete = self._withdrawn and message_id is not None
+        if delete:
+            self._host.unmirror(self._key, message_id)
+
+    def _landed_late(self, fut) -> None:
+        try:
+            message_id = _message_id(fut.result())
+        except Exception:
+            message_id = None
+        if message_id is None:
+            logger.info("werkbank: mirror line not delivered")
+        self._landed(message_id)
+
+    def take_back(self) -> None:
+        with self._lock:
+            self._withdrawn = True
+            message_id = self._landed_id
+        if message_id is not None:
+            self._host.unmirror(self._key, message_id)
 
 
 def approval_payload(data: Dict[str, Any], redact) -> Dict[str, Any]:

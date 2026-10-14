@@ -625,8 +625,9 @@ class PluginContext:
         ``client_message_id`` (gateway only; a short single-line string) is the sender's own id for
         this message: it rides in ``MessageEvent.metadata``, keeps two messages from sharing a
         pending slot, and comes back as the ``user.message`` session event's id.
-        ``reply_to_message_id`` (gateway only; same shape) is a message of that chat the turn's
-        answer replies to — e.g. the plugin's own mirror of the text in the chat.
+        ``reply_to_message_id`` (gateway only; a platform message id of 1-20 ASCII digits, anything
+        else is refused) is a message of that chat the turn's answer replies to — e.g. the plugin's
+        own mirror of the text in the chat.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
         return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,

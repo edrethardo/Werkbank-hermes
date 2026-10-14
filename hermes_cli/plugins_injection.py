@@ -3,6 +3,7 @@ gateway (existing ``session_key`` or a new session at ``origin``)."""
 from __future__ import annotations
 
 import logging
+import re  # fork: werkbank-chat
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -10,6 +11,7 @@ logger = logging.getLogger("hermes_cli.plugins")
 
 
 _CLIENT_MESSAGE_ID_MAX = 256  # fork: werkbank-chat
+_REPLY_TO_MESSAGE_ID_RE = re.compile(r"[0-9]{1,20}")  # fork: werkbank-chat — a platform message id: ASCII digits only
 
 
 def _valid_client_message_id(value: Any) -> bool:  # fork: werkbank-chat
@@ -43,8 +45,9 @@ def inject_plugin_message(
     if client_message_id is not None and not _valid_client_message_id(client_message_id):  # fork: werkbank-chat
         logger.warning("inject_message: client_message_id must be a short single-line string")  # fork: werkbank-chat
         return False  # fork: werkbank-chat
-    if reply_to_message_id is not None and not _valid_client_message_id(reply_to_message_id):  # fork: werkbank-chat
-        logger.warning("inject_message: reply_to_message_id must be a short single-line string")  # fork: werkbank-chat
+    if reply_to_message_id is not None and not (isinstance(reply_to_message_id, str)  # fork: werkbank-chat
+                                                and _REPLY_TO_MESSAGE_ID_RE.fullmatch(reply_to_message_id)):  # fork: werkbank-chat
+        logger.warning("inject_message: reply_to_message_id must be 1-20 ASCII digits")  # fork: werkbank-chat
         return False  # fork: werkbank-chat
     if not ctx._gateway_injection_allowed():
         logger.warning("inject_message: gateway injection denied for plugin %s; set "

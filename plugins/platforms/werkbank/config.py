@@ -6,7 +6,7 @@
           enabled: true              # default false: no port is opened without it
           port: 8767                 # default 8767 (NOT 8765, the board's port)
           mirror_to_telegram: true   # default true: the board text, as the owner's message, in the topic
-          mirror_name: Aaron         # default: the chat owner's Telegram first name, else "Du"
+          mirror_name: Aaron         # recommended; unset: "Du" (never the Telegram @-username)
 
 The Werkbank board reads the same ``port`` (``bruecke.read_port``). Keep it a plain number.
 

@@ -24,7 +24,7 @@ plugins:
       enabled: true             # default false: without it no port is opened
       port: 8767                # default 8767; NOT 8765 (the board's own port, refused)
       mirror_to_telegram: true  # default true: the board text, as the owner's message, in the session's topic
-      mirror_name: Aaron        # header name; default: the chat owner's Telegram first name, else "Du"
+      mirror_name: "Aaron"      # recommended: the header name; unset: "Du" (never the Telegram @-username)
     platforms/werkbank:         # the core's gate for this plugin (its plugin id)
       allow_gateway_injection: true   # needed for sending AND stopping
 ```
@@ -60,11 +60,15 @@ Which SessionDB row is which board message needs no plugin file: the gateway sto
   text as a blockquote (expandable when long), built as finished MarkdownV2 that the Telegram adapter
   sends unchanged (metadata `telegram_preformatted_markdown_v2`). Every MarkdownV2 special character
   is escaped; a word joiner after `@ # $ / .` keeps Telegram from making mentions, commands, hashtags
-  or links; control, bidi and zero-width characters are removed; ≤ 3500 UTF-16 units of text and one
+  or links; control, bidi and zero-width characters are removed (ZWJ/ZWNJ only stay between two
+  visible characters: emoji sequences, Persian/Indic scripts); ≤ 3500 UTF-16 units of text and one
   message. It is sent BEFORE the turn is injected; its message id becomes the turn's reply anchor
   (`inject_message(reply_to_message_id=…)`), so Hermes' answer replies to it. Mirror failed or slower
-  than 5 s: the answer goes out without a reply. Message refused by the gateway: the mirror is deleted.
-  Other platforms: header plus a literal code block.
+  than 5 s: the answer goes out without a reply. No mirror at all when the gateway cannot take the
+  message (not running, draining, `allow_gateway_injection` missing — checked first, so no push for a
+  message that then vanishes); refused anyway (state changed in between, session not authorized): the
+  mirror is deleted — a slow one as soon as it lands. Only digit message ids become reply anchors.
+  Other platforms: header (name reduced to letters, digits, spaces, `'`, `-`) plus a literal code block.
 * Freigaben/Rückfragen (`approvals`, `clarify`, WB-1129, `approvals.py`): only the exact id pending in
   that session (else `404`, nothing resolved); a subagent's request `once`/`deny` only. A Telegram card
   answered from the board is edited to „erledigt in der Werkbank: …“ — the Telegram plugin subscribes

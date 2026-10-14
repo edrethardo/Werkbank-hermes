@@ -486,22 +486,24 @@ def _handler(app: WerkbankServer):
                 return self._refuse(409, "duplicate", "Diese Nachricht wurde schon angenommen.",
                                     accepted=False)
             # WB-1148: the mirror goes out FIRST, so its Telegram message id can be the reply anchor of
-            # Hermes' answer. A mirror that fails or is slow (host.MIRROR_WAIT_S) leaves no anchor.
-            anchor = None
+            # Hermes' answer — and only when the gateway can take the message at all (host pre-check).
+            # A mirror that fails or is slow (host.MIRROR_WAIT_S) leaves no anchor.
+            posted = None
             if app.mirror_enabled():
                 try:
-                    anchor = app.host.mirror(key, text, app.mirror_name)
+                    posted = app.host.mirror(key, text, app.mirror_name)
                 except Exception:
                     logger.info("werkbank: mirror line not delivered")
+            anchor = getattr(posted, "message_id", None)
             try:
                 accepted, _ = app.host.inject(key, text, cmid, reply_to_message_id=anchor)
             except Exception:
                 accepted = False
             if not accepted:
                 app.buffers.release_id(key, cmid)
-                if anchor is not None:
+                if posted is not None:
                     try:
-                        app.host.unmirror(key, anchor)      # Hermes never got it: take the mirror back
+                        posted.take_back()      # Hermes never got it: delete the mirror, now or once it lands
                     except Exception:
                         logger.info("werkbank: mirror line not taken back")
                 logger.info("werkbank: message refused by the gateway (session known, text not logged)")

@@ -318,8 +318,14 @@ def test_reply_anchor_override_wins_in_a_telegram_forum_topic_too():
 
 @pytest.mark.parametrize("anchor,accepted,forwarded", [("900", True, "900"), (None, True, None),
                                                         ("a\nb", False, None), ("x" * 300, False, None),
-                                                        (900, False, None)],
-                         ids=["anchor", "none", "newline", "too-long", "not-a-string"])
+                                                        (900, False, None), ("12345678901234567890", True,
+                                                                             "12345678901234567890"),
+                                                        ("1" * 21, False, None), ("", False, None),
+                                                        ("12a", False, None), ("-5", False, None),
+                                                        (" 9", False, None), ("1.5", False, None),
+                                                        ("\u0663\u0664", False, None), ("\u00b2", False, None)],
+                         ids=["anchor", "none", "newline", "too-long", "not-a-string", "20-digits", "21-digits",
+                              "empty", "letter", "sign", "space", "dot", "arabic-indic-digits", "superscript"])
 def test_inject_message_hands_the_reply_anchor_to_the_gateway(monkeypatch, anchor, accepted, forwarded):
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 

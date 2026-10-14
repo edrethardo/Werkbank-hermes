@@ -85,10 +85,12 @@ produced; its fields are in the snapshot's `session`.
   WB-1127 the plugin assigns it to the next `user.message` it injected. While a turn runs the
   gateway steers or queues it (`delivery: nachgeschoben|eingereiht`).
   With `mirror_to_telegram` (default on) the session's chat (the Telegram topic) first gets the
-  text as the owner's message — header `👤 <mirror_name> · Werkbank`, the text as an escaped
-  blockquote (nothing formats, links or mentions; control, bidi and zero-width characters removed;
-  ≤ 3500 UTF-16 units) — and Hermes' answer to the turn replies to that message (WB-1148). The
-  `200` waits for that mirror at most 5 s.
+  text as the owner's message — header `👤 <mirror_name> · Werkbank` (unset: `Du`), the text as an
+  escaped blockquote (nothing formats, links or mentions; control, bidi and zero-width characters
+  removed, ZWJ/ZWNJ kept between two visible characters; ≤ 3500 UTF-16 units) — and Hermes' answer
+  to the turn replies to that message (WB-1148). The `200` waits for that mirror at most 5 s. No
+  mirror when the gateway cannot take the message (not running, draining, injection not allowed);
+  a mirror whose message is refused anyway is deleted, a late one as soon as it lands.
 * `POST /v1/s/{key}/stop` → `{stopped: bool}` via `ctx.interrupt_session(key)` (`false`: nothing
   running or refused). Without that API (core before WB-1127): `501` with `grund`.
 * `POST /v1/s/{key}/approvals/{request_id} {choice: once|session|always|deny}` →

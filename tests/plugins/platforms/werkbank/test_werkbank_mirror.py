@@ -125,19 +125,43 @@ def test_mentions_commands_hashtags_and_links_are_broken_for_telegram_autodetect
 def test_name_is_escaped_and_cleaned_too():
     from plugins.platforms.werkbank.mirror import display_name, telegram_markdown_v2
 
-    name = display_name("*Boss* [x](http://e)\u202e\n" + "y" * 80, None)
+    name = display_name("*Boss* [x](http://e)\u202e\n" + "y" * 80)
     assert "\u202e" not in name and "\n" not in name and len(name) <= 32
     head, _, _ = _parse(telegram_markdown_v2("hi", name))
     assert head.replace(WJ, "") == f"{name} · Werkbank"
 
 
-def test_name_comes_from_config_then_the_telegram_first_name_then_du():
+def test_name_is_the_configured_mirror_name_else_du():
     from plugins.platforms.werkbank.mirror import display_name
 
-    assert display_name("Aaron", "Someone Else") == "Aaron"
-    assert display_name("", "Aaron Beispiel") == "Aaron"
-    assert display_name(None, "  ") == "Du"
-    assert display_name("  \u200b ", None) == "Du"
+    # the session origin's user_name is NOT a fallback: Telegram fills it with the @-username
+    assert display_name("Aaron") == "Aaron"
+    assert display_name("") == "Du"
+    assert display_name(None) == "Du"
+    assert display_name("  \u200b ") == "Du"
+
+
+# ── ZWJ / ZWNJ: kept between two visible characters, bidi still removed ─────────────────────────
+
+
+@pytest.mark.parametrize("text", ["👨\u200d👩\u200d👧", "🏳\ufe0f\u200d🌈", "می\u200cخواهم", "क्\u200dष",
+                                  "ক্\u200cষ"], ids=["family", "flag", "persian-zwnj", "devanagari-zwj", "bengali-zwnj"])
+def test_joiners_between_two_visible_characters_survive(text):
+    from plugins.platforms.werkbank.mirror import plain, telegram_markdown_v2
+
+    assert plain(text) == text
+    assert _parse(telegram_markdown_v2(text, "Aaron"))[1] == text
+
+
+@pytest.mark.parametrize("text,want", [("\u200dab", "ab"), ("ab\u200c", "ab"), ("a \u200d b", "a  b"),
+                                       ("a\u200d\nb", "a\nb"), ("a\u200d\u202eb", "ab"), ("a\u202e\u200db", "ab"),
+                                       ("a\u200d\u200db", "ab"), ("a\u200b\u200fb\u2066c", "abc")],
+                         ids=["leading", "trailing", "spaces", "newline", "before-bidi", "after-bidi", "double",
+                              "zwsp-and-bidi"])
+def test_stray_joiners_and_all_bidi_and_zero_width_characters_are_removed(text, want):
+    from plugins.platforms.werkbank.mirror import plain
+
+    assert plain(text) == want
 
 
 # ── length ───────────────────────────────────────────────────────────────────────────────────────
@@ -205,3 +229,21 @@ def test_other_platforms_get_the_plain_code_block_form():
     assert head == "👤 Aaron · Werkbank"
     assert body.startswith("```\n") and body.endswith("\n```") and "```" not in body[4:-4]
     assert "\u202e" not in body
+
+
+@pytest.mark.parametrize("name", ["*Boss* @everyone", "[x](http://e.vil)", "<@123> <!here>", "_a_ ~b~ `c` |d|",
+                                  "evil.example/x", "#chan :smile:"])
+def test_other_platforms_show_the_name_as_plain_text(name):
+    from plugins.platforms.werkbank.mirror import plain_block
+
+    head = plain_block("hi", name).split("\n", 1)[0]
+    assert head.startswith("👤 ") and head.endswith(" · Werkbank")
+    shown = head[2:-len(" · Werkbank")]
+    assert not set(shown) & set("*_~`|[]()<>@!#:./\\"), shown
+
+
+@pytest.mark.parametrize("name", ["Aaron", "Jean-Luc O'Neil", "Zoë", "محمد", "Du"])
+def test_ordinary_names_stay_as_they_are_on_other_platforms(name):
+    from plugins.platforms.werkbank.mirror import plain_block
+
+    assert plain_block("hi", name).split("\n", 1)[0] == f"👤 {name} · Werkbank"

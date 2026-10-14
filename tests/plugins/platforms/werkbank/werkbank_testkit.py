@@ -46,8 +46,10 @@ class FakeHost:
         self.running = False
         self.lineages: dict = {}           # session_id -> compression lineage root → tip
 
-    def unmirror(self, session_key, message_id):
-        self.unmirrored.append((session_key, message_id))
+    def posted(self, session_key, message_id):
+        """A mirror the host posted (``host.PostedMirror`` shape): its id, and ``take_back``."""
+        return SimpleNamespace(message_id=message_id,
+                               take_back=lambda: self.unmirrored.append((session_key, message_id)))
 
     def resolve(self, session_id):
         return self.sessions.get(session_id)

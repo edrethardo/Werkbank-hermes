@@ -397,14 +397,125 @@ def test_an_older_core_without_the_anchor_kwarg_still_gets_the_message(tmp_path)
         owner.close()
 
 
-def test_default_name_is_the_first_name_of_the_telegram_owner(tmp_path):
+def _telegram_origin(username="aaron_handle", full_name="Aaron Beispiel"):
+    """The origin the real Telegram adapter builds: ``user_name`` is the @-username when there is one."""
+    from tests.gateway.conftest import _ensure_telegram_mock
+
+    _ensure_telegram_mock()
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="t", extra={}))
+    message = SimpleNamespace(from_user=SimpleNamespace(id=4711, is_bot=False, username=username, full_name=full_name),
+                              chat=SimpleNamespace(id=4711, type="private", is_forum=False),
+                              message_thread_id=None, is_topic_message=False, sender_chat=None)
+    source = adapter._source_from_message_for_auth(message)
+    assert source.user_name == username                   # the @-name, not "Aaron"
+    return source
+
+
+@pytest.mark.parametrize("configured,header", [("", "👤 *Du · Werkbank*\n"), ("Aaron", "👤 *Aaron · Werkbank*\n")])
+def test_without_mirror_name_the_header_says_du_never_the_telegram_username(tmp_path, configured, header):
     owner = FakeOwner()
-    owner.session_store.entry.origin = SessionSource(platform=Platform.TELEGRAM, chat_id="4711", chat_type="dm",
-                                                     user_id="4711", user_name="Aaron Beispiel", thread_id="51")
-    srv = _start(tmp_path, CtxReply(owner))
+    owner.session_store.entry.origin = _telegram_origin()
+    srv = _start(tmp_path, CtxReply(owner), mirror_name=configured)
     try:
         _post(srv)
-        assert owner.adapter.sent[0][1].startswith("👤 *Aaron · Werkbank*\n")
+        assert owner.adapter.sent[0][1].startswith(header)
+        assert "aaron\\_handle" not in owner.adapter.sent[0][1] and "Beispiel" not in owner.adapter.sent[0][1]
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def _slow_adapter(owner, release):
+    original = owner.adapter.send
+
+    async def slow(chat_id, content, reply_to=None, metadata=None):
+        await asyncio.get_running_loop().run_in_executor(None, release.wait, 3)
+        return await original(chat_id, content, reply_to, metadata)
+
+    owner.adapter.send = slow
+
+
+@pytest.mark.parametrize("accept", [False, True], ids=["refused", "accepted"])
+def test_a_late_mirror_is_deleted_when_the_message_was_refused_meanwhile(tmp_path, monkeypatch, accept):
+    from plugins.platforms.werkbank import host as host_mod
+
+    monkeypatch.setattr(host_mod, "MIRROR_WAIT_S", 0.2)
+    owner = FakeOwner()
+    release = threading.Event()
+    _slow_adapter(owner, release)
+    ctx = CtxReply(owner, accept=accept)
+    srv = _start(tmp_path, ctx)
+    try:
+        assert _post(srv)[0] == (200 if accept else 503)
+        assert ctx.injected[0]["reply_to_message_id"] is None      # too late to be the anchor
+        assert owner.adapter.deleted == []                          # not posted yet: nothing to delete
+        release.set()                                               # now the mirror reaches the chat
+        deadline = time.monotonic() + 3
+        while not owner.adapter.sent and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if accept:
+            time.sleep(0.2)
+            assert owner.adapter.deleted == []
+        else:
+            while not owner.adapter.deleted and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert owner.adapter.deleted == [("4711", "900")]
+    finally:
+        release.set()
+        srv.server.stop()
+        owner.close()
+
+
+@pytest.mark.parametrize("state", ["not-running", "draining", "injection-not-allowed", "no-gateway"])
+def test_no_mirror_when_the_gateway_cannot_take_the_message(tmp_path, state):
+    owner = FakeOwner()
+    ctx = CtxReply(owner, accept=False)
+    if state == "not-running":
+        owner._running = False
+    elif state == "draining":
+        owner._draining = True
+    elif state == "injection-not-allowed":
+        ctx._gateway_injection_allowed = lambda: False
+    srv = _start(tmp_path, ctx)
+    try:
+        call(srv.port, "GET", f"/v1/resolve?session_id={SID}", srv.key)
+        if state == "no-gateway":
+            ctx._manager._gateway_message_injector = None
+        status, _ = call(srv.port, "POST", session_path("messages"), srv.key,
+                         {"text": "Deploy jetzt?", "client_message_id": "m1"})
+        assert status == 503
+        time.sleep(0.1)
+        assert owner.adapter.sent == [] and owner.adapter.deleted == []
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_mirror_is_sent_when_injection_is_allowed(tmp_path):
+    owner = FakeOwner()
+    ctx = CtxReply(owner)
+    ctx._gateway_injection_allowed = lambda: True
+    srv = _start(tmp_path, ctx)
+    try:
+        assert _post(srv) == (200, {"accepted": True})
+        assert len(owner.adapter.sent) == 1 and ctx.injected[0]["reply_to_message_id"] == "900"
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_a_non_numeric_message_id_is_no_reply_anchor(tmp_path):
+    """The core takes digit strings only (WB-1148): a Slack-style ts must not get the message refused."""
+    owner = FakeOwner()
+    owner.adapter.answer = SimpleNamespace(success=True, message_id="1700000000.123")
+    ctx = CtxReply(owner)
+    srv = _start(tmp_path, ctx)
+    try:
+        assert _post(srv) == (200, {"accepted": True})
+        assert ctx.injected[0]["reply_to_message_id"] is None
     finally:
         srv.server.stop()
         owner.close()

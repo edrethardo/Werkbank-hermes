@@ -254,7 +254,7 @@ def test_mirror_line_follows_the_switch(tmp_path, mirror):
 
 def test_mirror_message_id_becomes_the_reply_anchor_of_the_injected_turn(tmp_path):
     host = FakeHost()
-    host.mirror = lambda key, text, name="": host.mirrored.append((key, text, name)) or "900"
+    host.mirror = lambda key, text, name="": host.mirrored.append((key, text, name)) or host.posted(key, "900")
     srv = running_server(tmp_path, host)
     try:
         _resolve(srv)
@@ -385,7 +385,7 @@ def test_snapshot_after_turn_done_has_the_final_answer_before_the_db_row(plugin_
 def test_refused_message_takes_back_its_mirror(tmp_path):
     host = FakeHost()
     host.inject_answer = False
-    host.mirror = lambda key, text, name="": "900"
+    host.mirror = lambda key, text, name="": host.posted(key, "900")
     srv = running_server(tmp_path, host)
     try:
         _resolve(srv)

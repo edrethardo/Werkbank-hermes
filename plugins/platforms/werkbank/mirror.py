@@ -12,8 +12,12 @@ For Telegram the plugin builds the finished MarkdownV2 itself and the adapter se
 backslash-escaped, so nothing formats, links or leaves the quote; a word joiner right after
 ``@ # $ / .`` (when a word character follows) keeps Telegram's server from turning the text into
 mention / hashtag / cashtag / bot-command / URL / e-mail entities. Control, format (bidi,
-zero-width), surrogate and unassigned characters are dropped. Other platforms get the earlier form:
-header plus a literal code block.
+zero-width), surrogate and unassigned characters are dropped — except ZWJ / ZWNJ between two visible
+characters (emoji sequences, Persian / Indic scripts). Other platforms get the earlier form: header
+(the name as plain letters, see ``plain_name``) plus a literal code block.
+
+The name is ``plugins.entries.werkbank.mirror_name``, else ``Du`` — never the session origin's
+``user_name``: the Telegram adapter fills that with the @-username when there is one.
 """
 
 from __future__ import annotations
@@ -34,20 +38,31 @@ WORD_JOINER = "\u2060"
 _MDV2_SPECIAL = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
 _AUTO_ENTITY = re.compile(r"([@#$/.])(?=\w)")
 _FENCE_RUN = re.compile(r"`{3,}")
+_JOINERS = ("\u200c", "\u200d")       # ZWNJ, ZWJ: kept between two visible characters
+_DROPPED = ("Cc", "Cf", "Cs", "Co", "Cn")
+
+
+def _visible(ch: str) -> bool:
+    return bool(ch) and not ch.isspace() and unicodedata.category(ch) not in _DROPPED + ("Zl", "Zp")
 
 
 def plain(text: str) -> str:
     """*text* without control, format (bidi, zero-width) or separator characters; tabs become
-    spaces, line breaks stay ``\\n``."""
+    spaces, line breaks stay ``\\n``. A ZWJ / ZWNJ stays when both its neighbours in *text* are
+    visible characters (👨‍👩‍👧, می‌خواهم, क्‍ष); anywhere else it goes like every other format character."""
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
     out = []
-    for ch in str(text).replace("\r\n", "\n").replace("\r", "\n"):
+    for i, ch in enumerate(text):
         if ch == "\n":
             out.append(ch)
         elif ch == "\t":
             out.append(" ")
         elif unicodedata.category(ch) in ("Zl", "Zp"):
             out.append("\n")
-        elif unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn"):
+        elif ch in _JOINERS:
+            if 0 < i < len(text) - 1 and _visible(text[i - 1]) and _visible(text[i + 1]):
+                out.append(ch)
+        elif unicodedata.category(ch) not in _DROPPED:
             out.append(ch)
     return "".join(out)
 
@@ -68,14 +83,22 @@ def utf16_cap(text: str, limit: int) -> str:
     return text[:cut].rstrip() + " …"
 
 
-def display_name(configured: Any, user_name: Any) -> str:
-    """``plugins.entries.werkbank.mirror_name``, else the first name of the chat's Telegram owner
-    (first word of the session origin's ``user_name``), else ``Du`` — one line, cleaned, short."""
-    for candidate in (configured, (str(user_name).split() or [""])[0] if user_name else ""):
-        name = " ".join(plain(candidate).split()) if isinstance(candidate, str) else ""
-        if name:
-            return name if utf16_len(name) <= NAME_MAX else utf16_cap(name, NAME_MAX - 2)
-    return DEFAULT_NAME
+def display_name(configured: Any) -> str:
+    """``plugins.entries.werkbank.mirror_name``, else ``Du`` — one line, cleaned, short. No fallback
+    to the session origin's ``user_name``: Telegram puts the @-username there (``username or
+    full_name``), and the header would show the handle instead of a name."""
+    name = " ".join(plain(configured).split()) if isinstance(configured, str) else ""
+    if not name:
+        return DEFAULT_NAME
+    return name if utf16_len(name) <= NAME_MAX else utf16_cap(name, NAME_MAX - 2)
+
+
+def plain_name(name: str) -> str:
+    """*name* for a platform whose Markdown flavour we do not escape for: letters, digits, spaces,
+    ``'`` and ``-`` only — nothing can format, mention (``@`` ``<@…>`` ``<!here>``), link or tag.
+    Nothing left: ``Du``."""
+    kept = "".join(ch if unicodedata.category(ch)[0] in "LMN" or ch in "'-" else " " for ch in name)
+    return " ".join(kept.split()) or DEFAULT_NAME
 
 
 def _escape(text: str) -> str:
@@ -104,14 +127,16 @@ def telegram_markdown_v2(text: str, name: str) -> str:
         over = utf16_len(payload) - PAYLOAD_MAX
         if over <= 0 or limit <= 0:
             return payload
-        limit -= max(over // 2, 16)     # escaping at most doubles a unit: shrink by half the overshoot
+        # one shown unit costs 1–3 payload units (backslash, word joiner after ``.``/``@``…, ``>`` per
+        # line): cutting half the overshoot (≥ 16) never cuts far too much and ends in a few rounds
+        limit -= max(over // 2, 16)
 
 
 def plain_block(text: str, name: str) -> str:
     """Other platforms: the header, then the text as a literal code block. A run of three backticks
     in the text is broken up so it cannot close the block."""
     body = _FENCE_RUN.sub(lambda m: "`\u2009" * (len(m.group()) - 1) + "`", _body(text))
-    return HEADER.format(name=name) + "\n```\n" + utf16_cap(body, MIRROR_MAX) + "\n```"
+    return HEADER.format(name=plain_name(name)) + "\n```\n" + utf16_cap(body, MIRROR_MAX) + "\n```"
 
 
 def for_platform(platform: Optional[str], text: str, name: str):
