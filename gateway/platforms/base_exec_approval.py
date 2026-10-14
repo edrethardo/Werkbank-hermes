@@ -57,6 +57,20 @@ def ea_action_labels() -> dict[str, str]:
     }
 
 
+def ea_choices(*, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> tuple[str, ...]:  # fork: werkbank-chat
+    """The approval scopes a surface may offer, in button order. A smart deny is an owner override
+    for one operation only, so it offers neither the session nor the permanent tier; the permanent
+    tier is never offered without the session tier. One rule for the Telegram card and the Werkbank
+    board (``plugins/platforms/werkbank/approvals.py``), so the two cannot drift apart."""  # fork: werkbank-chat
+    choices = ["once"]  # fork: werkbank-chat
+    if not smart_denied and allow_session:  # fork: werkbank-chat
+        choices.append("session")  # fork: werkbank-chat
+        if allow_permanent:  # fork: werkbank-chat
+            choices.append("always")  # fork: werkbank-chat
+    choices.append("deny")  # fork: werkbank-chat
+    return tuple(choices)  # fork: werkbank-chat
+
+
 def approval_timed_out_notice(window: str) -> str:
     """Localized ``APPROVAL_TIMED_OUT_NOTICE`` for an already-formatted ``window``."""
     return t("gateway.exec_approval.timed_out_notice", window=window)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,7 +128,8 @@ def test_bad_request_id_is_400(plugin_server):
 
 
 @pytest.mark.parametrize("flags,refused,allowed", [
-    ({"allow_session": False}, "session", "always"),
+    ({"allow_session": False}, "session", "once"),
+    ({"allow_session": False}, "always", "deny"),     # no permanent tier without the session tier
     ({"allow_permanent": False}, "always", "session"),
     ({"smart_denied": True, "allow_permanent": False, "allow_session": False}, "always", "once"),
     ({"smart_denied": True}, "session", "deny"),
@@ -141,6 +143,20 @@ def test_scope_the_card_does_not_offer_is_400(plugin_server, flags, refused, all
     assert not entry.event.is_set()
     assert post_approval(srv, "req-A", allowed)[1]["resolved"] == 1
     assert entry.result == allowed
+
+
+@pytest.mark.parametrize("allow_session", [True, False])
+@pytest.mark.parametrize("allow_permanent", [True, False])
+@pytest.mark.parametrize("smart_denied", [True, False])
+def test_offered_choices_are_exactly_the_telegram_buttons(allow_session, allow_permanent, smart_denied):
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.werkbank.approvals import offered_choices
+    flags = {"allow_session": allow_session, "allow_permanent": allow_permanent, "smart_denied": smart_denied}
+    buttons = [c for _label, c, _style in BasePlatformAdapter._exec_approval_actions(
+        SimpleNamespace(_EA_ACTION_LABELS=__import__("collections").defaultdict(str),
+                        _EA_ACTION_STYLES={}), **flags)]
+    assert list(offered_choices(flags)) == buttons
+    assert list(offered_choices({**flags, "delegated_child": True})) == ["once", "deny"]
 
 
 # ── child (subagent) requests: once/deny only; a parent's answer never frees a child ──────────
@@ -359,6 +375,23 @@ def test_clarify_resolved_event_names_werkbank(plugin_server, recorded_events):
     assert resolved[-1]["payload"]["decided_by"] == "werkbank"
     assert resolved[-1]["payload"]["answer"] == "A"
     assert entry.decided_by == "werkbank"
+
+
+def test_clarify_answer_drops_control_characters_but_keeps_newline_and_tab(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    entry = clarify_gateway.register("clar-1", KEY_SESSION, "Wohin?", None)
+    raw = "nach\x00 Hau\x1b[31mse\tjetzt\r\nzweite\x07 Zeile\x7f"
+    assert post_clarify(srv, "clar-1", raw) == (200, {"resolved": True})
+    assert entry.response == "nach Hau[31mse\tjetzt\nzweite Zeile"          # C0 and DEL gone
+
+
+def test_clarify_answer_of_only_control_characters_is_400(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    entry = clarify_gateway.register("clar-1", KEY_SESSION, "Wohin?", None)
+    assert post_clarify(srv, "clar-1", "\x00\x1b\x07")[0] == 400
+    assert not entry.event.is_set()
 
 
 # ── subagent name for the board's card ────────────────────────────────────────────────────────

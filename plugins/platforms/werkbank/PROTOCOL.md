@@ -96,12 +96,15 @@ produced; its fields are in the snapshot's `session`.
   Resolved with the exact id (`resolve_gateway_approval(…, request_id=…, decided_by="werkbank")`):
   of a Telegram tap and a board click exactly one wins; the loser gets `resolved: 0` plus the
   winner's `choice`/`decided_by`, the Telegram card shows the same outcome. `400` for a scope the
-  Telegram card does not offer (the flags `allow_session`, `allow_permanent`, `smart_denied`) and
-  for `session`/`always` on a subagent's request (`delegated_child`): a child is `once`/`deny` only,
-  and answering the parent's id never frees a child's request.
+  Telegram card does not offer — the same rule as its buttons (`ea_choices`): `session` only with
+  `allow_session`, `always` only with `allow_session` AND `allow_permanent`, once/deny only on a
+  `smart_denied` — and for `session`/`always` on a subagent's request (`delegated_child`): a child
+  is `once`/`deny` only. The plugin resolves only the named id; the core's coalescing of an
+  identical pending command (same text and pattern keys) applies as it does for a Telegram tap.
 * `POST /v1/s/{key}/clarify/{clarify_id} {answer}` → `{resolved: bool}`. Only a `clarify_id` of
   THIS session (else `404`); the answer is read like a typed Telegram reply (number or label of a
-  choice, free text for an open prompt, `skip`), else `400`. `resolved: false` when it was answered
+  choice, free text for an open prompt, `skip`; C0 control characters except newline/tab, and
+  DEL, removed first; at most 20 000 characters), else `400`. `resolved: false` when it was answered
   already. `clarify.resolved` carries `decided_by`.
 * `GET /v1/s/{key}/tools/{tool_call_id}/output` → `{tool_call_id, output}` (full text, redacted,
   ≤ 1 MB) from the SessionDB; `404` when unknown.

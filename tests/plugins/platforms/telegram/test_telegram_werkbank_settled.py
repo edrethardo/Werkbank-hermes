@@ -25,6 +25,11 @@ KEY = "agent:main:telegram:dm:12345:51"
 
 
 @pytest.fixture(autouse=True)
+def _werkbank_on(monkeypatch):
+    monkeypatch.setattr(tg, "_WERKBANK_ANSWERS", True)       # register() saw the plugin enabled
+
+
+@pytest.fixture(autouse=True)
 def _clean():
     def scrub():
         with approval._lock:
@@ -246,3 +251,115 @@ def test_hook_is_registered_only_with_the_werkbank_plugin_enabled(monkeypatch):
     monkeypatch.setattr(tg, "_werkbank_answers_enabled", lambda _ctx: True)
     tg.register(ctx)
     assert registered == [("on_gateway_session_event", tg.on_gateway_session_event)]
+
+
+# ── review: _clarify_cards stays bounded and is forgotten everywhere the card is done ─────────
+
+
+async def send_card(a, cid, question="Welche?", choices=("A", "B")):
+    clarify_gateway.register(cid, KEY, question, list(choices) if choices else None)
+    await a.send_clarify("12345", question, list(choices) if choices else None, cid, KEY,
+                         metadata={"thread_id": "51"})
+
+
+@pytest.mark.asyncio
+async def test_clarify_cards_are_not_kept_without_the_werkbank_plugin(monkeypatch):
+    monkeypatch.setattr(tg, "_WERKBANK_ANSWERS", False)
+    a = make_adapter()
+    await send_card(a, "clar-1")
+    assert "clar-1" in a._clarify_state
+    assert a._clarify_cards == {}
+
+
+@pytest.mark.asyncio
+async def test_clarify_cards_are_capped():
+    a = make_adapter()
+    a._bot.send_message.side_effect = lambda **_k: SimpleNamespace(message_id=7, message_thread_id=51)
+    for n in range(tg._SETTLED_MAX + 40):
+        await a.send_clarify("12345", "Welche?", ["A"], f"clar-{n}", KEY, metadata={"thread_id": "51"})
+    assert len(a._clarify_cards) == tg._SETTLED_MAX
+    assert f"clar-{tg._SETTLED_MAX + 39}" in a._clarify_cards and "clar-0" not in a._clarify_cards
+
+
+@pytest.mark.asyncio
+async def test_clarify_card_forgotten_after_a_telegram_tap():
+    a = make_adapter()
+    await send_card(a, "clar-1")
+    await a._handle_clarify_callback(query(42), "cl:clar-1:1", {"chat_id": "12345", "thread_id": "51"})
+    assert "clar-1" not in a._clarify_cards
+
+
+@pytest.mark.asyncio
+async def test_clarify_card_forgotten_when_other_cannot_flip():
+    a = make_adapter()
+    await send_card(a, "clar-1")
+    with clarify_gateway._lock:
+        clarify_gateway._entries.pop("clar-1", None)           # evicted between ask and tap
+    a._notify_clarify_expired = AsyncMock()
+    await a._handle_clarify_callback(query(42), "cl:clar-1:other", {"chat_id": "12345", "thread_id": "51"})
+    assert "clar-1" not in a._clarify_cards and "clar-1" not in a._clarify_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("type_,payload", [
+    ("clarify.resolved", {"answer": "frei getippt", "skipped": False, "decided_by": None}),      # text reply
+    ("clarify.resolved", {"answer": "A", "skipped": False, "decided_by": "telegram"}),
+    ("clarify.expired", {"reason": "timeout"}),
+    ("clarify.expired", {"reason": "cancelled"}),
+])
+async def test_clarify_card_forgotten_on_text_answer_expiry_and_cancel(type_, payload):
+    a = make_adapter()
+    await send_card(a, "clar-1")
+    await deliver(resolved_event(type_, {"clarify_id": "clar-1", **payload}))
+    assert "clar-1" not in a._clarify_cards
+    assert edits(a) == []                                      # Telegram's own outcome: no Werkbank edit
+
+
+@pytest.mark.asyncio
+async def test_expired_event_of_another_session_keeps_the_card():
+    a = make_adapter()
+    await send_card(a, "clar-1")
+    await deliver(resolved_event("clarify.expired", {"clarify_id": "clar-1", "reason": "timeout"},
+                                 key="agent:main:telegram:dm:1:2"))
+    assert "clar-1" in a._clarify_cards
+
+
+# ── review: state changes from the session-event worker happen on the adapter loop ────────────
+
+
+@pytest.mark.asyncio
+async def test_session_event_changes_no_state_on_the_calling_thread():
+    a = make_adapter()
+    pend("req-A")
+    await a.send_exec_approval("12345", "rm", KEY, metadata={"approval_request_id": "req-A", "thread_id": "51"})
+    await send_card(a, "clar-1")
+    token = next(iter(a._approval_state))
+    a.on_session_event(resolved_event("approval.resolved", {"request_id": "req-A", "choice": "once",
+                                                            "decided_by": "werkbank"}))
+    a.on_session_event(resolved_event("clarify.resolved", {"clarify_id": "clar-1", "answer": "B",
+                                                           "skipped": False, "decided_by": "werkbank"}))
+    # nothing touched yet: the adapter loop has not run since
+    assert token in a._approval_state and a._approval_settled == {}
+    assert "clar-1" in a._clarify_cards and "clar-1" in a._clarify_state
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert token not in a._approval_state and token in a._approval_settled
+    assert "clar-1" not in a._clarify_cards and "clar-1" not in a._clarify_state
+    assert len(edits(a)) == 2
+
+
+# ── review: the edited clarify card stays under Telegram's 4096 limit ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_edited_clarify_card_fits_telegram_limit_with_a_huge_question():
+    a = make_adapter()
+    question = "<&>" * 5000
+    await send_card(a, "clar-1", question=question, choices=None)
+    await deliver(resolved_event("clarify.resolved", {"clarify_id": "clar-1", "answer": "x" * 5000,
+                                                     "skipped": False, "decided_by": "werkbank"}))
+    [edit] = edits(a)
+    import html, re
+    visible = html.unescape(re.sub(r"<[^>]+>", "", edit["text"]))
+    assert len(visible) <= 4096
+    assert "erledigt in der Werkbank" in visible and visible.startswith("❓ <&>")

@@ -5,9 +5,12 @@ The board answers ONE request, named by its exact id — never "the oldest", nev
 * an approval only when ``request_id`` is pending in THIS session
   (``tools.approval.list_gateway_approvals(session_key)``), else ``404`` and nothing is resolved;
 * only a scope the Telegram card offers for it (the flags ``_approval_notify_sync`` passes on:
-  ``allow_session``, ``allow_permanent``, ``smart_denied``), else ``400``;
-* a subagent's request (``delegated_child``, stamped by the core): ``once`` or ``deny`` only. A
-  parent's answer resolves the parent's request id and nothing else, so it never frees a child;
+  ``allow_session``, ``allow_permanent``, ``smart_denied``; the very rule the buttons use,
+  ``gateway.platforms.base_exec_approval.ea_choices``), else ``400``;
+* a subagent's request (``delegated_child``, stamped by the core): ``once`` or ``deny`` only. The
+  board names exactly one request id and the plugin resolves only that one; the core's coalescing
+  stays as it is for a Telegram tap: a request with the identical command and pattern keys that
+  waits on a pending one (parent or child) adopts its ``session``/``always``/``deny``;
 * resolved with ``resolve_gateway_approval(…, request_id=…, decided_by="werkbank")`` — the core
   resolves under its lock, so of a Telegram tap and a board click exactly one wins (``resolved``
   1 / 0). The answer carries the outcome the agent actually got (``choice``, ``decided_by``), the
@@ -15,19 +18,22 @@ The board answers ONE request, named by its exact id — never "the oldest", nev
 
 A clarify prompt: only when ``clarify_id`` belongs to THIS session (checked again atomically by the
 core), the answer coerced like a typed Telegram reply (number or label of a choice, free text for an
-open prompt), ``resolve_gateway_clarify(…, decided_by="werkbank", session_key=…)``.
+open prompt; C0 control characters except newline and tab, and DEL, removed first),
+``resolve_gateway_clarify(…, decided_by="werkbank", session_key=…)``.
 
 Nothing here logs a command, a question or an answer.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional, Tuple
 
 CHOICES = ("once", "session", "always", "deny")
 CHILD_CHOICES = ("once", "deny")
 DECIDED_BY = "werkbank"
 MAX_ANSWER = 20_000
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")      # C0 except \t \n, and DEL
 
 Answer = Tuple[int, Dict[str, Any]]
 
@@ -38,17 +44,13 @@ def _refuse(code: int, error: str, grund: str) -> Answer:
 
 def offered_choices(data: Dict[str, Any]) -> Tuple[str, ...]:
     """The scopes the Telegram card offers for this request — and, for a subagent, once/deny only."""
+    from gateway.platforms.base_exec_approval import ea_choices
+
     if data.get("delegated_child"):
         return CHILD_CHOICES
-    if data.get("smart_denied"):
-        return CHILD_CHOICES
-    out = ["once"]
-    if data.get("allow_session", True):
-        out.append("session")
-    if data.get("allow_permanent", True):
-        out.append("always")
-    out.append("deny")
-    return tuple(out)
+    return ea_choices(allow_permanent=bool(data.get("allow_permanent", True)),
+                      allow_session=bool(data.get("allow_session", True)),
+                      smart_denied=bool(data.get("smart_denied")))
 
 
 def answer_approval(session_key: str, request_id: str, body: Dict[str, Any]) -> Answer:
@@ -92,6 +94,7 @@ def answer_clarify(session_key: str, clarify_id: str, body: Dict[str, Any]) -> A
     text = body.get("answer")
     if not isinstance(text, str) or len(text) > MAX_ANSWER:
         return _refuse(400, "bad answer", "Bitte eine Antwort als Text senden.")
+    text = _CONTROL.sub("", text)
     entry = _clarify_entry(session_key, clarify_id)
     if entry is None:
         return _refuse(404, "unknown clarify", "Diese Rückfrage wartet in dieser Sitzung nicht (mehr).")

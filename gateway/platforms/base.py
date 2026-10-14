@@ -428,6 +428,7 @@ from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
+from gateway.platforms.base_exec_approval import ea_choices  # fork: werkbank-chat
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
@@ -2877,12 +2878,8 @@ class BasePlatformAdapter(ABC):
         """``(label, choice, style)`` rows for the approval buttons. A smart deny is an owner
         override for one operation only, so it offers neither the session nor the permanent tier;
         the permanent tier is never offered without the session tier."""
-        choices = ["once"]
-        if not smart_denied and allow_session:
-            choices.append("session")
-            if allow_permanent:
-                choices.append("always")
-        choices.append("deny")
+        choices = ea_choices(allow_permanent=allow_permanent, allow_session=allow_session,  # fork: werkbank-chat
+                             smart_denied=smart_denied)  # fork: werkbank-chat
         return [(self._EA_ACTION_LABELS[c], c, self._EA_ACTION_STYLES.get(c, "")) for c in choices]
 
     @classmethod
