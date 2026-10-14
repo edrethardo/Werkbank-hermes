@@ -430,7 +430,10 @@ def test_register_does_nothing_outside_the_gateway_or_when_not_enabled(tmp_path,
         plugin.register(ctx)
         assert ctx.hooks == {} and not (tmp_path / "plugin-data").exists()
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        monkeypatch.setitem(sys.modules, "gateway.run", sys.modules.get("gateway.run") or object())
+        monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(gateway_process_started=lambda: False))
+        plugin.register(ctx)
+        assert ctx.hooks == {}       # gateway.run imported by a CLI, start_gateway() never ran
+        monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(gateway_process_started=lambda: True))
         (tmp_path / "config.yaml").write_text("plugins:\n  entries:\n    werkbank:\n      port: 8767\n")
         plugin.register(ctx)
         assert ctx.hooks == {}

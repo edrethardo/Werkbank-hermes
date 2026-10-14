@@ -39,9 +39,14 @@ def accepts_kwarg(func: Any, name: str) -> bool:
 
 class GatewayHost:
     def __init__(self, ctx: Any, home: Path) -> None:
-        self.ctx = ctx
         self.home = Path(home)
         self.profile = resolve_mod.profile_of(self.home)
+        self.rebind(ctx)
+
+    def rebind(self, ctx: Any) -> None:
+        """Serve from ``ctx`` from now on: the context that created this host may be unloaded while
+        another context of the plugin (a reload, a second scope) still holds the server."""
+        self.ctx = ctx
         self.supports_client_message_id = accepts_kwarg(getattr(ctx, "inject_message", None),
                                                         "client_message_id")
         self.supports_interrupt = callable(getattr(ctx, "interrupt_session", None))

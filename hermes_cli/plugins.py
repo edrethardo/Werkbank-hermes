@@ -1406,6 +1406,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             # ``on_plugin_loaded`` reports the plugins this sweep loads that the process did not have before
             # (boot: everything; a mid-run install/enable: just the newcomer), keyed on the pre-sweep set.
             loaded_before = frozenset(k for k, p in self._plugins.items() if not p.error and not p.deferred)
+            # fork: werkbank-chat — deferred platforms that were live before this pass (see below).
+            materialized = self._materialized_deferred_platforms() if force else []
             if force:
                 self.unload()  # the ledger owns teardown of process-global registries
             if env_var_enabled("HERMES_SAFE_MODE"):
@@ -1434,11 +1436,34 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # Re-register so force-reload is symmetric (#60036; tracking #64178 — salvaged from PR
                     # #64188; outbound webhooks added per #92682 review).
                     self._re_register_config_hooks_after_force()
+                    self._rematerialize_platforms(materialized)  # fork: werkbank-chat
             except BaseException:
                 self._discovered = False
                 raise
         # Outside the lock: a listener (the gateway's re-wire) may read the registry from another thread.
         self._notify_plugin_loaded(loaded_before)
+
+    # fork: werkbank-chat — a force pass unloads every plugin, a materialized deferred platform included,
+    # but re-arms only its LAZY loader. A platform with no adapter (``platforms/werkbank``: a hook and a
+    # listening port) is never looked up again, so it stayed unloaded until the next restart. Bring back
+    # exactly the deferred platforms that were live before the pass; the rest stay lazy.
+    def _materialized_deferred_platforms(self) -> List[str]:
+        return sorted({self._platform_name_from_manifest(p.manifest) for p in self._plugins.values()
+                       if p.manifest.kind == "platform" and p.manifest.source == "bundled"
+                       and p.enabled and not p.deferred and not p.error})
+
+    def _rematerialize_platforms(self, names: List[str]) -> None:
+        if not names:
+            return
+        try:
+            from gateway.platform_registry import platform_registry
+        except Exception:
+            return
+        for name in names:
+            try:
+                platform_registry.get(name)  # runs the re-armed deferred loader (this home is current)
+            except Exception:
+                logger.warning("force-reload: re-loading platform plugin %r failed", name, exc_info=True)
 
     def _re_register_config_hooks_after_force(self) -> None:
         """Restore config-owned shell hooks/outbound webhooks after a force clear; each guarded

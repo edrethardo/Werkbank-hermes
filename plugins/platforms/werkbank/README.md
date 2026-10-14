@@ -8,6 +8,13 @@ It is a bundled platform plugin **without** a messaging adapter: it registers no
 core hook `on_gateway_session_event` (`gateway/session_events.py`, WB-1126) and its own server. It
 starts only inside `hermes gateway`; the CLI, the TUI and `hermes plugins` load it and do nothing.
 
+"Inside the gateway" means `start_gateway()` ran in the process (`gateway.run.gateway_process_started()`,
+`# fork: werkbank-chat`), not merely that `gateway.run` was imported: `hermes gateway status` imports it
+and resolves every platform plugin, and used to grab the port while the gateway booted. Per process and
+Hermes home there is exactly one server (state in `sys.modules["hermes_werkbank_runtime"]`, shared by
+every copy the loader imports); every plugin context that loads holds it, and it stops when the last one
+unloads. A forced plugin re-discovery (`reload-plugins`, plugin go-live) re-loads it in the same pass.
+
 ## Configuration (profile `config.yaml`)
 
 ```yaml

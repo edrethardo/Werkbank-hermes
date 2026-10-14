@@ -43,19 +43,28 @@ def test_unusable_key_is_still_replaced(tmp_path):
 
 def test_register_twice_in_one_process_starts_one_server(tmp_path, monkeypatch):
     calls = []
-    unloads = []
+    monkeypatch.delitem(__import__("sys").modules, wb.RUNTIME_MODULE, raising=False)
     monkeypatch.setattr(wb, "in_gateway_process", lambda: True)
     monkeypatch.setattr(wb, "plugin_home", lambda ctx: tmp_path)
     from plugins.platforms.werkbank import config
     monkeypatch.setattr(config, "read", lambda home: SimpleNamespace(enabled=True, problem=None))
-    state = {"closing": False}
-    srv = SimpleNamespace(closing=lambda: state["closing"])
-    monkeypatch.setattr(wb, "start", lambda ctx, home, settings: calls.append(home) or srv)
-    monkeypatch.setattr(wb, "_STARTED", {})
-    ctx = SimpleNamespace(on_unload=unloads.append)
+
+    class Srv:
+        closing = False            # a property on the real server, not a method
+        port = 1
+
+        def stop(self):
+            self.closing = True
+
+    def launch(ctx, home, settings):
+        calls.append(home)
+        return wb.Instance(Srv(), SimpleNamespace(on_event=lambda e: None), SimpleNamespace(), str(home.resolve()))
+
+    monkeypatch.setattr(wb, "_launch", launch)
+    ctx = SimpleNamespace(register_hook=lambda *a: None, on_unload=lambda cb: None)
     wb.register(ctx)
     wb.register(ctx)
     assert calls == [tmp_path]
-    state["closing"] = True          # unloaded: a later register starts again
+    wb.runtime().instances[str(tmp_path.resolve())].server.stop()   # stopped: a later register starts again
     wb.register(ctx)
     assert calls == [tmp_path, tmp_path]

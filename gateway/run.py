@@ -1560,6 +1560,17 @@ def _planned_restart_notification_pending() -> bool:
 # Gateway marker so a lazily imported cli.py load_cli_config() doesn't clobber TERMINAL_CWD.
 os.environ["_HERMES_GATEWAY"] = "1"
 
+# fork: werkbank-chat — the marker above is set by EVERY import of this module, and CLI commands import
+# it incidentally (``hermes gateway status`` → gateway_migrate → ``_profile_runtime_scope``), so it cannot
+# tell the gateway from a CLI. start_gateway() sets this flag; plugins with process-wide side effects
+# (a listening port) ask gateway_process_started() instead.
+_GATEWAY_PROCESS_STARTED = False
+
+
+def gateway_process_started() -> bool:
+    """True once ``start_gateway()`` runs in this process (not on a bare import)."""
+    return _GATEWAY_PROCESS_STARTED
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home, get_hermes_home_override, get_process_hermes_home
@@ -5753,8 +5764,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
+    global _GATEWAY_PROCESS_STARTED
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
+    _GATEWAY_PROCESS_STARTED = True  # fork: werkbank-chat
 
     # Messaging-only defaults belong to startup, not incidental imports by the TUI.
     configured_cwd = os.environ.get("TERMINAL_CWD", "")
