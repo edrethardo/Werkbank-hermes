@@ -666,6 +666,7 @@ class DockerEnvironment(BaseEnvironment):
         board_socket: str = "",
         labels: dict | None = None):
         self._strict = strict
+        self._board_socket = board_socket or ""  # re-validated on container recreation
         board_volume: list[str] = []
         extra_labels: dict[str, str] = {}
         if (board_socket or labels) and not strict:
@@ -1175,6 +1176,15 @@ class DockerEnvironment(BaseEnvironment):
         recovery fails so the caller surfaces the original error."""
         logger.warning("Container %s appears to be gone — attempting recovery", (self._container_id or "")[:12])
         self._container_id = None
+        if getattr(self, "_strict", False) and getattr(self, "_board_socket", ""):
+            # The saved run args bind the board socket by path; it may have been swapped since the
+            # first start, so recovery applies the start's socket rules to the LIVE path again.
+            from tools import docker_strict
+            try:
+                docker_strict.validate_board_socket(self._board_socket)
+            except (ValueError, OSError) as exc:
+                logger.error("Recovery: board socket no longer valid, not recreating: %s", exc)
+                return False
 
         existing = self._find_reusable_container(
             self._labels.get("hermes-task-id", ""),

@@ -147,17 +147,29 @@ def load_sandbox_config(path: os.PathLike | str) -> SandboxConfig:
 def apply_sandbox_config(cfg: SandboxConfig) -> None:
     """Pin *cfg* as this process' terminal policy for the rest of its life."""
     global _applied
-    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
     from tools.terminal_scope import pin_process_terminal_policy
 
     pin_process_terminal_policy(cfg.policy)
     _applied = cfg
-    # Mirror into os.environ for the few ambient readers (status lines, file-path hints). The
-    # pin, not this mirror, is the authority: later env writes cannot reach the terminal tool.
-    owned = set(TERMINAL_CONFIG_ENV_MAP.values()) | set(cfg.policy)
+    mirror_policy_to_environ(cfg.policy)
+
+
+def mirror_policy_to_environ(policy: Dict[str, str]) -> None:
+    """Make the ``TERMINAL_*`` part of ``os.environ`` exactly *policy*.
+
+    For the ambient readers (status lines, file-path hints) and for subprocesses, which inherit
+    ``os.environ``, not the pin. The pin stays the authority for the terminal tool. Called by
+    :func:`apply_sandbox_config` and again by ``cli_config_load._mirror_config_to_env`` (``import
+    cli`` runs it AFTER the pin with the profile's terminal block; WB-855 review). Keys the policy
+    leaves out are removed, so ``TERMINAL_DOCKER_BOARD_SOCKET=''`` / ``TERMINAL_DOCKER_LABELS='{}'``
+    (shipped defaults) are always present in a pinned process.
+    """
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+
+    owned = set(TERMINAL_CONFIG_ENV_MAP.values()) | set(policy)
     for name in [n for n in os.environ if n.startswith("TERMINAL_") and n in owned]:
         del os.environ[name]
-    os.environ.update(cfg.policy)
+    os.environ.update(policy)
 
 
 def _reset_for_tests() -> None:

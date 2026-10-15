@@ -9,9 +9,11 @@ runs. ``hermes chat`` projects config.yaml earlier through a DIFFERENT function,
 ``cli_config_load._mirror_config_to_env``; both follow the same precedence rule (a config.yaml
 with a ``terminal`` section overrides ``TERMINAL_*`` env, otherwise env wins), but they are two
 code paths, so equality is pinned by tests, not by construction. ``--sandbox-config`` (WB-1176)
-avoids the question: there the run pins one policy that the probe reads back. The result is
+pins one policy; the probe reads it back AND runs the start path (pin + ``import cli``) in a
+child to compare the ``os.environ`` the run's subprocesses inherit (``probe_sandbox_config``). The result is
 parsed with the terminal tool's own reader (``_get_env_config`` under a bound terminal scope).
-It never mutates ``os.environ``, starts Docker, opens the network or touches the session store.
+It never mutates ``os.environ``, starts Docker, opens the network or touches the session store
+(the ``--sandbox-config`` child imports ``cli`` with this profile, which loads config and ``.env``).
 
 Contract (``hermes -p <profile> sandbox-probe --config <file> --json``), one JSON object:
 
@@ -325,12 +327,48 @@ def _labels(cfg: Dict[str, Any]) -> Dict[str, str]:
     return {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
 
 
+# Child for :func:`_start_path_terminal_environ`: the start path's own steps, nothing else.
+_START_PATH_CHILD = (
+    "import json, os, sys\n"
+    "from hermes_cli import sandbox_config\n"
+    "sandbox_config.apply_sandbox_config(sandbox_config.load_sandbox_config(sys.argv[1]))\n"
+    "import cli\n"
+    "print('WB855-ENV:' + json.dumps({k: v for k, v in os.environ.items() if k.startswith('TERMINAL_')}))\n")
+
+
+def _start_path_terminal_environ(run_config: Path) -> Optional[Dict[str, str]]:
+    """``TERMINAL_*`` of ``os.environ`` as the REAL start path leaves it: pin, then ``import cli``
+    (``load_hermes_dotenv`` + ``load_cli_config`` with this profile). Subprocesses of the run
+    inherit exactly this. Runs in a child so this process' environment stays untouched; no model,
+    no Docker. ``None`` when the child fails (nothing proven)."""
+    import subprocess
+
+    repo = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (repo, env.get("PYTHONPATH", "")) if p)
+    try:
+        proc = subprocess.run([sys.executable, "-c", _START_PATH_CHILD, str(run_config)], env=env,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("WB855-ENV:")]
+    if proc.returncode != 0 or not lines:
+        return None
+    try:
+        return {str(k): str(v) for k, v in json.loads(lines[-1][len("WB855-ENV:"):]).items()}
+    except (ValueError, AttributeError):
+        return None
+
+
 def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
     """Report for ``hermes chat --sandbox-config FILE`` (WB-1176): same loader as the start path.
 
-    The effective policy is READ through the terminal tool's own accessor under the run's pin,
-    then compared with the file's projection; ``config_sha256`` is FILE's hash only when every
-    terminal setting the run reads comes from FILE (else ``overrides`` names the drift).
+    Two checks feed ``overrides``. (1) The terminal tool's accessor under the run's pin: by
+    construction this equals the policy (the pin outranks scope and env), so it only guards the
+    accessor itself. (2) The real check: ``os.environ`` of the start path after the pin AND
+    ``import cli`` (profile config/.env bridges run there), which every subprocess of the run
+    inherits, must equal the policy (:func:`_start_path_terminal_environ`; ``start_path_unverified``
+    when that child fails). ``config_sha256`` is FILE's hash only when both agree.
     """
     from hermes_cli import sandbox_config
     from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
@@ -345,9 +383,14 @@ def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
     names = sorted(set(TERMINAL_CONFIG_ENV_MAP.values()) | set(cfg.policy))
     with process_terminal_pin(cfg.policy):
         seen = {name: terminal_env(name, missing) for name in names}  # type: ignore[arg-type]
-    overrides = sorted([name for name in names
-                        if (None if seen[name] is missing else seen[name]) != cfg.policy.get(name)]
-                       + _docker_runtime_overrides(os.environ))
+    drift = {name for name in names
+             if (None if seen[name] is missing else seen[name]) != cfg.policy.get(name)}
+    started = _start_path_terminal_environ(Path(cfg.path))
+    if started is None:
+        drift.add("start_path_unverified")
+    else:
+        drift |= {name for name in names if started.get(name) != cfg.policy.get(name)}
+    overrides = sorted(drift | set(_docker_runtime_overrides(os.environ)))
     policy = sandbox_config.read_policy(cfg.policy)
     home = Path(get_hermes_home())
     auth_reasons = _auth_reasons(policy, home)

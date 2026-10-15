@@ -408,3 +408,25 @@ def test_config_defaults_are_empty():
     finally:
         reset_terminal_scope(token)
     assert cfg["docker_board_socket"] == "" and cfg["docker_labels"] == {}
+
+
+# --- recovery re-checks the live socket (WB-855 review) -------------------------------------------
+
+def test_container_recreation_revalidates_the_board_socket(docker_calls, run_dir, bind_socket, monkeypatch):
+    """'No such container' recovery recreates from the saved run args; the socket may have been
+    swapped since the first start, so recovery runs validate_board_socket again (and refuses)."""
+    sock = bind_socket(run_dir)
+    env = docker.DockerEnvironment("test-image", strict=True, board_socket=f"{sock}:{TARGET}")
+    monkeypatch.setattr(env, "_find_reusable_container", lambda *a: None)
+    checked = []
+    real = docker_strict.validate_board_socket
+
+    def spy(spec, **kw):
+        checked.append((spec, kw))
+        return real(spec, **kw)
+    monkeypatch.setattr(docker_strict, "validate_board_socket", spy)
+    os.chmod(sock, 0o666)  # no longer private: the start-time check would refuse it now
+    docker_calls.clear()
+    assert env._recreate_container() is False
+    assert checked and checked[0][0] == f"{sock}:{TARGET}"
+    assert not [argv for argv, _ in docker_calls if "run" in argv]

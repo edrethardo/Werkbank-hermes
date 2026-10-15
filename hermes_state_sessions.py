@@ -239,6 +239,8 @@ SESSION_STATUS_COMPLETE = "complete"
 SESSION_STATUS_INTERRUPTED = "interrupted"
 SESSION_STATUS_ERROR = "error"
 SESSION_STATUS_EMPTY = "empty"
+# ``sessions.created_source`` of a ``reserve_session`` row (``hermes sessions reserve``, WB-1090).
+RESERVED_CREATED_SOURCE = "reserve"
 
 # finish_reason values meaning the turn ended in a provider/agent error.
 _ERROR_FINISH_REASONS = frozenset({"error", "agent_error", "content_filter"})
@@ -475,7 +477,9 @@ class SessionSessionsMixin:
         before the run starts and then ``--resume`` exactly that session. Unlike the
         ``create_session`` upsert this never adopts an existing row: the insert is
         ``ON CONFLICT DO NOTHING`` inside the store's write transaction, and a collision mints a
-        new id. Raises ``RuntimeError`` when no free id was found, or when this store lies outside
+        new id. The row carries ``created_source = RESERVED_CREATED_SOURCE`` (``source`` stays
+        *source*, so ``--resume`` treats it as a normal CLI session); the empty-session sweep skips
+        it even after an orphan reap ended it empty. Raises ``RuntimeError`` when no free id was found, or when this store lies outside
         the profile tree (``_own_profile_name()`` is None): a reservation the launcher cannot
         attribute to a profile proves nothing, so nothing is written.
         """
@@ -492,7 +496,7 @@ class SessionSessionsMixin:
                 cur = conn.execute(
                     "INSERT INTO sessions (id, source, created_source, profile_name, started_at) "
                     "VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
-                    (session_id, source, source, profile_name, time.time()))
+                    (session_id, source, RESERVED_CREATED_SOURCE, profile_name, time.time()))
                 return cur.rowcount == 1
 
             if self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S):
@@ -1899,8 +1903,11 @@ class SessionSessionsMixin:
     # counts live rows only (rewind/compaction keep dropped turns as active = 0): NOT EXISTS is authority.
     # The ``NOT EXISTS`` probe is the authority; : ``message_count = 0`` stays as a cheap prefilter. Same
     # shape as every : other emptiness guard in this module. (#95868)
+    # ``created_source = 'reserve'`` (``reserve_session``): a launcher already bound that id and will
+    # ``--resume`` it, so an ended-while-empty reservation (orphan reap) is never swept (WB-855).
     _EMPTY_SESSION_WHERE = (
-        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 AND NOT EXISTS ("
+        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 "
+        f"AND COALESCE(created_source, '') != '{RESERVED_CREATED_SOURCE}' AND NOT EXISTS ("
         "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
     )
 

@@ -190,7 +190,10 @@ hermes -p <profile> sessions reserve --json
 ```
 
 This inserts exactly one new, empty session row through the session store's own write path
-and never adopts an existing id. Start that session afterwards with `--resume <id>`. A store
+and never adopts an existing id. Start that session afterwards with `--resume <id>`. The row is
+marked `created_source = reserve`; the empty-session sweep (`DELETE /api/sessions/empty`) skips
+it even when an orphan reap has ended it before the run started. A reservation that never runs
+therefore stays until it is deleted explicitly (`hermes sessions delete <id>`). A store
 outside the Hermes profile tree (no owning profile) is refused with a non-zero exit and nothing
 is written.
 
@@ -213,8 +216,26 @@ policy of the process: the profile's `terminal.*`, its `.env` and `TERMINAL_*` i
 environment no longer reach the terminal tool, also not after later config reloads. Model
 access, memory, skills and the session store stay the profile's, on the host.
 
+`os.environ` mirrors the pinned policy, also after the CLI loads the profile config
+(`import cli` re-mirrors the pin instead of the profile's `terminal.*`), so subprocesses inherit
+the run's `TERMINAL_*`. Every `TERMINAL_*` key the policy defines is present, including the
+shipped defaults `TERMINAL_DOCKER_BOARD_SOCKET=''` and `TERMINAL_DOCKER_LABELS='{}'` when the file
+leaves them out. Code that reads the backend (`subagent_worktree.local_backend_active`, the
+session's launch cwd) reads it from the pin, so a pinned Docker run never offers host worktrees
+or stamps a host cwd. Container recreation after "No such container" re-validates the board
+socket with the start's rules (strict Docker also disables cross-process reuse, so this path is a
+second line, not the normal one).
+
 With `--sandbox-config` the probe's `config_sha256` is the run file's hash (and
 `"mode": "sandbox-config"`); it is `null` when any terminal setting the run reads differs from
-the file or a Docker runtime variable is set (`overrides`). `board_socket` and `labels` are
+the file or a Docker runtime variable is set (`overrides`). Reading the pin back cannot differ
+by construction; the real check runs the start path in a child process (pin, then `import cli`
+with this profile's config and `.env`) and compares its `TERMINAL_*` environment with the
+policy. When that child fails, `overrides` contains `start_path_unverified`.
+
+Limit: the probe recognises another Docker daemon only through `DOCKER_HOST`, `DOCKER_CONTEXT`,
+`DOCKER_CONFIG` and `HERMES_DOCKER_BINARY`. A `currentContext` set in `~/.docker/config.json`
+(`docker context use …`) is **not** detected; the launcher must check the daemon itself (for
+example `docker context show` must print `default`) before it trusts `config_sha256`. `board_socket` and `labels` are
 reported as in the profile mode. `--tui` and `--worktree` are refused with `--sandbox-config`: both
 leave the process the policy is pinned in. Without the flag nothing changes.

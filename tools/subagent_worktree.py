@@ -36,6 +36,11 @@ def _run_git(args, cwd: str, timeout: int = _GIT_TIMEOUT, env=None):
 
 def local_backend_active() -> bool:
     """True when the terminal backend is local (worktrees visible to tools)."""
+    from tools.terminal_scope import get_process_terminal_pin
+
+    pin = get_process_terminal_pin()
+    if pin is not None:  # ``--sandbox-config`` run: the pin, never the profile, names the backend
+        return str(pin.get("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
     try:
         from hermes_cli.config import load_config_readonly
 

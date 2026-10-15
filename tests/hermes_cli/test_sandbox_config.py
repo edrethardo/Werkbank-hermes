@@ -401,3 +401,82 @@ def test_sandbox_config_probe_counts_docker_runtime_env_as_override(run, monkeyp
     assert rc == 0
     assert var in report["overrides"]
     assert report["config_sha256"] is None and report["config_matches"] is False
+
+
+# WB-855 review: the pin must survive ``import cli`` and reach every backend reader ---------------
+
+_CHILD = r"""
+import json, os, subprocess, sys
+from hermes_cli import sandbox_config
+sandbox_config.apply_sandbox_config(sandbox_config.load_sandbox_config(sys.argv[1]))
+import cli  # load_cli_config -> _mirror_config_to_env runs here with the PROFILE's terminal block
+names = ("TERMINAL_ENV", "TERMINAL_TIMEOUT", "TERMINAL_DOCKER_STRICT")
+grand = subprocess.run([sys.executable, "-c",
+                        "import json, os, sys; print(json.dumps({n: os.environ.get(n) for n in sys.argv[1:]}))",
+                        *names], capture_output=True, text=True, check=True)
+print("WB1176:" + json.dumps({"self": {n: os.environ.get(n) for n in names},
+                              "child": json.loads(grand.stdout.strip().splitlines()[-1])}))
+"""
+
+
+def test_import_cli_after_the_pin_keeps_the_run_policy_in_environ(tmp_path):
+    """Repro: profile local/timeout 999, run file strict docker/timeout 60 -> after ``import cli``
+    os.environ (and every subprocess) still carries the run's values, not the profile's."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("terminal:\n  backend: local\n  timeout: 999\n", encoding="utf-8")
+    lauf = tmp_path / "lauf"
+    (lauf / "workspace").mkdir(parents=True)
+    (lauf / "cache").mkdir()
+    cfg = lauf / "config.yaml"
+    cfg.write_text(json.dumps({"terminal": {**_strict_terminal(lauf / "workspace", lauf / "cache"),
+                                            "timeout": 60}}), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TERMINAL_")}
+    env.update(HERMES_HOME=str(home), PYTHONPATH=str(REPO), TERMINAL_ENV="local", TERMINAL_TIMEOUT="999")
+    env.pop("HERMES_IGNORE_USER_CONFIG", None)
+    proc = subprocess.run([sys.executable, "-c", _CHILD, str(cfg)], cwd=str(tmp_path), env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("WB1176:"))
+    seen = json.loads(line[len("WB1176:"):])
+    want = {"TERMINAL_ENV": "docker", "TERMINAL_TIMEOUT": "60", "TERMINAL_DOCKER_STRICT": "true"}
+    assert seen["self"] == want
+    assert seen["child"] == want
+
+
+def test_backend_readers_follow_the_pin_not_profile_or_environ(run, monkeypatch):
+    """subagent_worktree.local_backend_active and run_agent._launch_cwd_for_session read the
+    backend through the pin: a docker run never stamps a host cwd or offers host worktrees."""
+    from hermes_cli import sandbox_config
+    from run_agent import _launch_cwd_for_session
+    from tools import subagent_worktree
+
+    assert subagent_worktree.local_backend_active() is True  # profile says local
+    assert _launch_cwd_for_session("cli") is not None
+    sandbox_config.apply_sandbox_config(sandbox_config.load_sandbox_config(run["config"]))
+    os.environ["TERMINAL_ENV"] = "local"  # a stale ambient write must not matter
+    assert subagent_worktree.local_backend_active() is False
+    assert _launch_cwd_for_session("cli") is None
+
+
+def test_sandbox_config_probe_reports_start_path_environ_drift(run, monkeypatch):
+    """The probe compares os.environ of the REAL start path (pin + ``import cli``) with the policy."""
+    import hermes_cli.sandbox_probe as sandbox_probe
+
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0 and report["overrides"] == [] and report["config_matches"] is True
+
+    def drifted(path):
+        from hermes_cli import sandbox_config
+        policy = dict(sandbox_config.load_sandbox_config(path).policy)
+        policy["TERMINAL_ENV"] = "local"
+        return policy
+    monkeypatch.setattr(sandbox_probe, "_start_path_terminal_environ", drifted)
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0 and "TERMINAL_ENV" in report["overrides"]
+    assert report["config_sha256"] is None and report["config_matches"] is False
+
+    monkeypatch.setattr(sandbox_probe, "_start_path_terminal_environ", lambda path: None)
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0 and "start_path_unverified" in report["overrides"]
+    assert report["config_sha256"] is None

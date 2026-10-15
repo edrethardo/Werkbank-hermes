@@ -167,3 +167,18 @@ def test_cli_reserve_without_profile_fails(monkeypatch, capsys):
     assert code != 0
     assert out.out.strip() == ""
     assert "profile" in out.err
+
+
+def test_reserved_empty_session_survives_orphan_reap_and_empty_sweep(db):
+    """Between ``reserve`` and ``--resume`` the row is empty; once something ends it (orphan
+    reap, crash) the empty sweep must still leave it alone: the launcher already bound its id."""
+    sid = db.reserve_session()
+    other = db.create_session("20261015_120000_cccccc", source="cli")
+    db.end_session(other, "test")
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET ended_at = ?, end_reason = 'startup_orphan_reap' WHERE id = ?",
+        (1.0, sid)))
+    assert db.count_empty_sessions() == 1
+    assert db.delete_empty_sessions() == 1
+    assert db.get_session(sid) is not None
+    assert db.get_session(other) is None
