@@ -466,6 +466,34 @@ class SessionSessionsMixin:
         self._insert_session_row(session_id, source, model=model, **kwargs)
         return session_id
 
+    _RESERVE_ATTEMPTS = 5
+
+    def reserve_session(self, source: str = "cli") -> str:
+        """Atomically create a NEW empty session row and return its freshly minted id.
+
+        For trusted launchers (``hermes sessions reserve``, WB-1090) that must bind a session id
+        before the run starts and then ``--resume`` exactly that session. Unlike the
+        ``create_session`` upsert this never adopts an existing row: the insert is
+        ``ON CONFLICT DO NOTHING`` inside the store's write transaction, and a collision mints a
+        new id. Raises ``RuntimeError`` when no free id was found.
+        """
+        import hermes_state_ids
+
+        profile_name = self._own_profile_name()
+        for _ in range(self._RESERVE_ATTEMPTS):
+            session_id = hermes_state_ids.new_session_id()
+
+            def _do(conn, session_id=session_id):
+                cur = conn.execute(
+                    "INSERT INTO sessions (id, source, created_source, profile_name, started_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                    (session_id, source, source, profile_name, time.time()))
+                return cur.rowcount == 1
+
+            if self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S):
+                return session_id
+        raise RuntimeError("could not reserve a fresh session id (every candidate already exists)")
+
     def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
         """Mirror ``SessionEntry.expiry_finalized`` so it survives a lost sessions.json.
 
