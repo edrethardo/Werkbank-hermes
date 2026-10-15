@@ -118,6 +118,33 @@ session-isolation/config-bridge tests are run alongside them. The parent task
 performs independent real-container acceptance; mocked constructor tests alone
 are not proof of live Docker isolation.
 
+## One board socket and run labels (`docker_board_socket`, `docker_labels`)
+
+`docker_volumes` rejects every Unix socket, including sockets inside a bound directory. A
+launcher that hands the container exactly one door back to its board uses a separate key:
+
+```yaml
+terminal:
+  docker_strict: true
+  docker_board_socket: "/abs/run-root/board.sock:/run/werkbank/board.sock"
+  docker_labels: {"werkbank.sandbox.run": "<run-id>"}
+```
+
+`docker_board_socket` accepts exactly one `source:target` pair (no mode suffix; the bind is
+`rw` because connecting needs write). The source must be the socket itself: an absolute,
+normalized path with no symlink anywhere, named `board.sock`, owned by the calling user with no
+group/other permission bits, inside a caller-owned `0700` directory. Known Docker/Podman socket
+paths, their parents, a hard link to one of them and `$SSH_AUTH_SOCK` are rejected. The target
+must be a file directly under `/run/werkbank/`. The socket is re-checked at container start.
+
+`docker_labels` adds at most four labels whose keys start with `werkbank.`; values must already
+be label-safe (`[A-Za-z0-9_.-]`, 1–63 characters) and are rejected instead of rewritten. They are
+added after the Hermes labels, which they cannot replace.
+
+Both keys require `docker_strict: true`; without them the `docker run` arguments are unchanged.
+`sandbox-probe` reports them as `board_socket` and `labels` and counts an invalid socket or label
+as `auth_exposed`.
+
 ## Proving the effective policy to a launcher (`sandbox-probe`, `sessions reserve`)
 
 A config file a launcher wrote proves nothing by itself: a profile `.env`, the ambient
@@ -140,6 +167,8 @@ object. Read the fields, not the exit code (non-zero only means nothing was prov
 | `auth_exposed` | `false` only when strict and nothing forwards credentials (no `docker_forward_env`, no credential-named `docker_env`, no extra args, no bind of the Hermes home or a host credential directory); see `auth_reasons` |
 | `config_matches` | the `--config` file's bytes equal the effective `config.yaml` |
 | `overrides` | `TERMINAL_*` values where env/.env/managed scope differ from file plus defaults |
+| `board_socket` | the one board socket (`source`, `target`, `present`) or `null` |
+| `labels` | the `werkbank.*` container labels |
 
 The probe is read-only: it starts no container, opens no network and does not touch the
 session store. It does not prove Docker itself is healthy; a launch still fails closed when

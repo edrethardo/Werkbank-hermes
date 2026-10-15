@@ -225,3 +225,126 @@ def test_probe_is_builtin_so_no_plugin_code_runs(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["hermes", "-p", "werkbank", "sandbox-probe", "--config", "x"])
     assert main_mod._plugin_cli_discovery_needed() is False
+
+
+# --- WB-1177: one board socket and werkbank labels ------------------------------------------------
+
+BOARD_TARGET = "/run/werkbank/board.sock"
+
+
+@pytest.fixture
+def board(tmp_path, monkeypatch):
+    """A Werkbank-like private run root holding ``board.sock`` (bound relative: sun_path limit)."""
+    import socket
+
+    root = tmp_path / "run"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    sock = socket.socket(socket.AF_UNIX)
+    monkeypatch.chdir(root)
+    sock.bind("board.sock")
+    os.chmod(root / "board.sock", 0o600)
+    yield root / "board.sock"
+    sock.close()
+
+
+def test_valid_board_socket_is_reported_and_not_exposed(home, board):
+    path = _write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{board}:{BOARD_TARGET}",
+                             docker_labels={"werkbank.sandbox.run": "run-1"}))
+    rep = _probe(path)
+    assert rep["strict"] is True and rep["config_sha256"] == _sha(path)
+    assert rep["auth_exposed"] is False, rep["auth_reasons"]
+    assert rep["board_socket"] == {"source": str(board), "target": BOARD_TARGET, "present": True}
+    assert rep["labels"] == {"werkbank.sandbox.run": "run-1"}
+
+
+def test_no_board_socket_reports_none(home):
+    rep = _probe(_write(home, STRICT_TERMINAL))
+    assert rep["board_socket"] is None and rep["labels"] == {}
+
+
+def test_board_socket_parent_directory_is_exposed(home, board):
+    path = _write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{board.parent}:{BOARD_TARGET}"))
+    rep = _probe(path)
+    assert rep["auth_exposed"] is True
+    assert any("docker_board_socket" in r for r in rep["auth_reasons"])
+
+
+def test_board_socket_symlink_is_exposed(home, board, tmp_path):
+    alias = tmp_path / "alias"
+    alias.mkdir(mode=0o700)
+    (alias / "board.sock").symlink_to(board)
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{alias / 'board.sock'}:{BOARD_TARGET}")))
+    assert rep["auth_exposed"] is True
+
+
+def test_board_socket_with_open_permissions_is_exposed(home, board):
+    os.chmod(board.parent, 0o755)
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{board}:{BOARD_TARGET}")))
+    os.chmod(board.parent, 0o700)
+    assert rep["auth_exposed"] is True
+
+
+def test_board_socket_inside_hermes_home_is_exposed(home, monkeypatch):
+    import socket
+
+    inner = home / "run"
+    inner.mkdir(mode=0o700)
+    os.chmod(inner, 0o700)
+    monkeypatch.chdir(inner)
+    sock = socket.socket(socket.AF_UNIX)
+    try:
+        sock.bind("board.sock")
+        os.chmod(inner / "board.sock", 0o600)
+        rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{inner / 'board.sock'}:{BOARD_TARGET}")))
+    finally:
+        sock.close()
+    assert rep["auth_exposed"] is True
+
+
+def test_board_socket_not_yet_bound_is_reported_absent(home, tmp_path, monkeypatch):
+    """The broker may bind after the probe; the container start re-checks the live socket."""
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    root = tmp_path / "later"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{root / 'board.sock'}:{BOARD_TARGET}")))
+    assert rep["auth_exposed"] is False, rep["auth_reasons"]
+    assert rep["board_socket"]["present"] is False
+
+
+def test_board_socket_without_strict_is_exposed(home, board):
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_strict=False,
+                                   docker_board_socket=f"{board}:{BOARD_TARGET}")))
+    assert rep["auth_exposed"] is True
+
+
+def test_foreign_label_is_exposed(home):
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_labels={"com.example": "x"})))
+    assert rep["auth_exposed"] is True
+    assert any("docker_labels" in r for r in rep["auth_reasons"])
+
+
+@pytest.mark.parametrize("var,value", [
+    ("TERMINAL_DOCKER_BOARD_SOCKET", "/elsewhere/board.sock:/run/werkbank/board.sock"),
+    ("TERMINAL_DOCKER_LABELS", '{"werkbank.sandbox.run": "other"}'),
+])
+def test_env_setting_a_new_key_breaks_the_hash(home, var, value):
+    path = _write(home, STRICT_TERMINAL)
+    rep = _probe(path, dict(os.environ, **{var: value}))
+    assert var in rep["overrides"]
+    assert rep["config_sha256"] is None
+
+
+def test_new_keys_change_the_config_hash(home, board):
+    plain = _sha(_write(home, STRICT_TERMINAL))
+    with_socket = _probe(_write(home, dict(STRICT_TERMINAL, docker_board_socket=f"{board}:{BOARD_TARGET}")))
+    with_label = _probe(_write(home, dict(STRICT_TERMINAL, docker_labels={"werkbank.sandbox.run": "r"})))
+    assert len({plain, with_socket["config_sha256"], with_label["config_sha256"]}) == 3
+    assert None not in (with_socket["config_sha256"], with_label["config_sha256"])
+
+
+def test_non_mapping_labels_are_exposed_not_a_crash(home):
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_labels=["werkbank.sandbox.run=x"])))
+    assert rep["auth_exposed"] is True and rep["labels"] == {}
