@@ -385,6 +385,11 @@ DEFAULT_CONFIG = {
         # anything under `--init` or `--security-opt no-new-privileges` ("operation not
         # permitted"). True drops those two flags; every other hardening stays. See #9730.
         "docker_snap_compat": False,
+        # docker_strict only (WB-1177): the ONE Unix socket a strict container may get, as
+        # "/abs/run/board.sock:/run/werkbank/board.sock" (caller-owned, 0600 in a 0700 directory,
+        # never a Docker/Podman socket), and up to 4 extra "werkbank.*" container labels.
+        "docker_board_socket": "",
+        "docker_labels": {},
         # Trusted profiles sharing one Docker container identity; empty = per-profile boundary.
         "docker_shared_container_key": "",
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.

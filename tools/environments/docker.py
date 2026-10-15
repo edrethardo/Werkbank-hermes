@@ -662,14 +662,25 @@ class DockerEnvironment(BaseEnvironment):
         shared_container_key: str = "",
         snap_compat: bool = False,
         image_pinned: bool = False,
-        strict: bool = False):
+        strict: bool = False,
+        board_socket: str = "",
+        labels: dict | None = None):
         self._strict = strict
+        board_volume: list[str] = []
+        extra_labels: dict[str, str] = {}
+        if (board_socket or labels) and not strict:
+            raise ValueError("docker_board_socket and docker_labels require terminal.docker_strict")
         if strict:
-            from tools.docker_strict import validate_extra_args, validate_volumes
+            from tools.docker_strict import (validate_board_socket, validate_extra_args, validate_labels,
+                                             validate_volumes)
             user_spec = _resolve_host_user_spec()
             if not user_spec or user_spec.split(":")[0] == "0":
                 raise ValueError("docker_strict requires a non-root POSIX host user")
             volumes = validate_volumes(volumes)
+            # WB-1177: the one board-door socket and werkbank.* run labels, validated apart from
+            # docker_volumes (which still rejects every socket).
+            board_volume = validate_board_socket(board_socket)
+            extra_labels = validate_labels(labels)
             extra_args = validate_extra_args(extra_args)
             if snap_compat:
                 raise ValueError("docker_strict forbids docker_snap_compat")
@@ -712,6 +723,7 @@ class DockerEnvironment(BaseEnvironment):
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
+        volume_args.extend(arg for vol in board_volume for arg in ("-v", vol))
         mount = getattr(self, "host_cwd_mount", None)
         if mount and cwd_follows_host_mount(cwd, mount):
             logger.info(
@@ -775,6 +787,8 @@ class DockerEnvironment(BaseEnvironment):
             self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
                 image=image, mount_args=[*writable_args, *volume_args],
                 hermes_home=str(get_hermes_home()))
+        # Strict-only werkbank.* labels (WB-1177) go last; the prefix keeps them off Hermes keys.
+        self._labels.update(extra_labels)
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_pinned = image_pinned

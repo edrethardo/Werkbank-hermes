@@ -18,7 +18,10 @@ Contract (``hermes -p <profile> sandbox-probe --config <file> --json``), one JSO
 - ``docker_network``: False only for a Docker backend with ``docker_network: false``.
 - ``auth_exposed``: False only when strict and no credential path into the container is
   configured (no forwarded env, no credential-named ``docker_env``, no extra Docker args, no
-  bind of the Hermes home or a host credential directory). ``auth_reasons`` explains.
+  bind of the Hermes home or a host credential directory, and a ``docker_board_socket`` only
+  when it passes the container start's own socket rules). ``auth_reasons`` explains.
+- ``board_socket``: the one approved board-door socket (``source``/``target``/``present``) or
+  ``None``; ``labels``: the ``werkbank.*`` container labels (WB-1177).
 
 ``--config`` names the run's config file; ``config_matches`` says whether its bytes equal the
 effective config. Exit 0 = report printed (read the fields, not the exit code); non-zero =
@@ -163,7 +166,43 @@ def _auth_reasons(cfg: Dict[str, Any], home: Path) -> List[str]:
         src = Path(os.path.realpath(source))
         if src == user_home or src in user_home.parents or any(_overlaps(src, p) for p in sensitive):
             reasons.append(f"volume {source} overlaps the Hermes home or a host credential path")
+    reasons += _board_socket_reasons(cfg, sensitive)
+    if cfg.get("docker_labels"):
+        from tools.docker_strict import validate_labels
+        try:
+            validate_labels(cfg["docker_labels"])
+        except ValueError as exc:
+            reasons.append(f"docker_labels rejected: {exc}")
     return reasons
+
+
+def _board_socket(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The one board-door socket strict Docker would bind (WB-1177), ``None`` when unset."""
+    spec = cfg.get("docker_board_socket")
+    if not spec:
+        return None
+    source, _, target = str(spec).partition(":")
+    return {"source": source, "target": target, "present": os.path.lexists(source)}
+
+
+def _board_socket_reasons(cfg: Dict[str, Any], sensitive: List[Path]) -> List[str]:
+    """The board socket is an approved door only when it passes the SAME rules the container start
+    applies (exact socket path, no parent directory, no symlink, caller-owned and private, never a
+    Docker socket). Not yet bound is fine here: the container start re-checks the live socket."""
+    spec = cfg.get("docker_board_socket")
+    if not spec:
+        return []
+    if not cfg.get("docker_strict"):
+        return ["docker_board_socket is set but docker_strict is off"]
+    from tools.docker_strict import validate_board_socket
+    try:
+        validate_board_socket(spec, require_present=False)
+    except (OSError, ValueError) as exc:
+        return [f"docker_board_socket rejected: {exc}"]
+    source = Path(str(spec).split(":", 1)[0])
+    if any(_overlaps(source, p) for p in sensitive):
+        return [f"docker_board_socket {source} lies in the Hermes home or a host credential path"]
+    return []
 
 
 def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
@@ -214,6 +253,9 @@ def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None
         "config_matches": effective_sha is not None and effective_sha == requested_sha,
         "overrides": overrides,
         "auth_reasons": auth_reasons,
+        "board_socket": _board_socket(cfg) if backend == "docker" else None,
+        "labels": (dict(cfg["docker_labels"]) if backend == "docker"
+                   and isinstance(cfg.get("docker_labels"), dict) else {}),
         "strict_reason": strict_reason,
     }
 
@@ -239,6 +281,12 @@ def cmd_sandbox_probe(args) -> int:
     print(f"auth_exposed:     {yes[report['auth_exposed']]}")
     for reason in report["auth_reasons"]:
         print(f"  - {reason}")
+    board = report["board_socket"]
+    if board:
+        print(f"board_socket:     {board['source']} -> {board['target']}"
+              + ("" if board["present"] else "  (not bound yet)"))
+    for key, value in sorted(report["labels"].items()):
+        print(f"label:            {key}={value}")
     print(f"config_sha256:    {report['config_sha256'] or '-'}")
     print(f"config_matches:   {yes[report['config_matches']]}")
     if report["overrides"]:

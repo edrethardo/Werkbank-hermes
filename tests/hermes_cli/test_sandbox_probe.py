@@ -343,3 +343,8 @@ def test_new_keys_change_the_config_hash(home, board):
     with_label = _probe(_write(home, dict(STRICT_TERMINAL, docker_labels={"werkbank.sandbox.run": "r"})))
     assert len({plain, with_socket["config_sha256"], with_label["config_sha256"]}) == 3
     assert None not in (with_socket["config_sha256"], with_label["config_sha256"])
+
+
+def test_non_mapping_labels_are_exposed_not_a_crash(home):
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_labels=["werkbank.sandbox.run=x"])))
+    assert rep["auth_exposed"] is True and rep["labels"] == {}
