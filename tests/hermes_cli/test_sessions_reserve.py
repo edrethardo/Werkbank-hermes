@@ -23,9 +23,18 @@ from hermes_state import SessionDB
 ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6,}$")
 
 
+def _profile_store():
+    """A store INSIDE the profile tree (a reservation must name its owning profile)."""
+    from hermes_constants import get_default_hermes_root
+
+    path = get_default_hermes_root() / "profiles" / "wbtest" / "state.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 @pytest.fixture
 def db(tmp_path):
-    d = SessionDB(db_path=tmp_path / "state.db")
+    d = SessionDB(db_path=_profile_store())
     yield d
     d.close()
 
@@ -62,7 +71,7 @@ def test_reserve_gives_up_when_every_id_collides(db, monkeypatch):
 
 
 def test_concurrent_reservations_are_distinct(tmp_path):
-    path = tmp_path / "state.db"
+    path = _profile_store()
     SessionDB(db_path=path).close()
     out, errors = [], []
 
@@ -127,3 +136,34 @@ def test_cli_reserve_plain_prints_only_the_id(monkeypatch, capsys):
     code, out = _main(monkeypatch, capsys, ["sessions", "reserve"])
     assert code == 0
     assert ID_RE.match(out.out.strip())
+
+
+def test_reserve_refuses_a_store_outside_the_profile_tree(tmp_path):
+    """No owning profile -> no reservation: a NULL-profile row cannot be attributed later."""
+    d = SessionDB(db_path=tmp_path / "elsewhere" / "state.db")
+    try:
+        assert d._own_profile_name() is None
+        with pytest.raises(RuntimeError, match="profile"):
+            d.reserve_session()
+    finally:
+        d.close()
+    con = sqlite3.connect(tmp_path / "elsewhere" / "state.db")
+    try:
+        assert con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_reserve_row_names_its_profile(db):
+    sid = db.reserve_session()
+    assert db.get_session(sid)["profile_name"] == "wbtest"
+
+
+def test_cli_reserve_without_profile_fails(monkeypatch, capsys):
+    import hermes_state_sessions
+
+    monkeypatch.setattr(hermes_state_sessions.SessionSessionsMixin, "_own_profile_name", lambda self: None)
+    code, out = _main(monkeypatch, capsys, ["sessions", "reserve", "--json"])
+    assert code != 0
+    assert out.out.strip() == ""
+    assert "profile" in out.err

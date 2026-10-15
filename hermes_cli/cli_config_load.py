@@ -119,7 +119,13 @@ _CWD_PLACEHOLDERS = (".", "auto", "cwd")
 
 
 def _mirror_config_to_env(defaults, _file_has_terminal_config):
-    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions). Env always wins when already set."""
+    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions).
+
+    Env wins when already set, except that a config.yaml WITH a ``terminal`` section overrides
+    ``TERMINAL_*`` (``_file_has_terminal_config``). This is NOT the bridge the terminal tool and
+    ``hermes sandbox-probe`` run (``hermes_cli.config.apply_terminal_config_to_env``): the two
+    share the precedence rule, not the code, so keep them in step (WB-1090 review).
+    """
     from cli import _AUXILIARY_TASK_ENV, _CWD_PLACEHOLDERS, _TERMINAL_ENV_MAPPINGS
     terminal_config = defaults.get("terminal", {})
 

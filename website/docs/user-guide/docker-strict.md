@@ -155,20 +155,28 @@ actually runs with. Ask the binary instead:
 hermes -p <profile> sandbox-probe --config <run-config.yaml> --json
 ```
 
-It resolves the terminal policy through the same config-to-env bridge a run of that profile
-uses (on a copy of the environment) and the terminal tool's own parser, then prints one JSON
-object. Read the fields, not the exit code (non-zero only means nothing was provable):
+It resolves the terminal policy with the config-to-env bridge the terminal tool itself runs
+(`apply_terminal_config_to_env`, on a copy of the environment; `hermes chat` projects
+`config.yaml` through a separate function with the same precedence rule) and the terminal
+tool's own parser, then prints one JSON object. The probe is a built-in command: it loads no
+plugin code. Read the fields, not the exit code (non-zero only means nothing was provable):
 
 | Field | Meaning |
 |---|---|
 | `strict` | `true` only when `docker_strict` is on and the backend is Docker |
 | `config_sha256` | sha256 of the profile's `config.yaml`; `null` when no file governs the run or `overrides` is non-empty |
 | `docker_network` | `false` only for a Docker backend with `docker_network: false` |
-| `auth_exposed` | `false` only when strict and nothing forwards credentials (no `docker_forward_env`, no credential-named `docker_env`, no extra args, no bind of the Hermes home or a host credential directory); see `auth_reasons` |
+| `auth_exposed` | `false` only when strict and nothing forwards credentials (no `docker_forward_env`, no credential-named `docker_env`, no extra args, no bind of the Hermes home or a host credential directory — taken from both `$HOME` and the passwd home); see `auth_reasons` |
 | `config_matches` | the `--config` file's bytes equal the effective `config.yaml` |
-| `overrides` | `TERMINAL_*` values where env/.env/managed scope differ from file plus defaults |
+| `overrides` | `TERMINAL_*` values where env/.env/managed scope differ from file plus defaults, plus any of `HERMES_DOCKER_BINARY`, `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` that is set (they pick another binary or daemon) |
+| `docker_binary` | the container CLI `find_docker()` resolves, or `null` |
 | `board_socket` | the one board socket (`source`, `target`, `present`) or `null` |
 | `labels` | the `werkbank.*` container labels |
+
+`docker_env` is checked by variable **name** (`*_KEY`, `*TOKEN*`, `*SECRET*`, …). Values are
+only screened for a few well-known key shapes (`ghp_`/`github_pat_`, `sk-`, `AKIA`/`ASIA`,
+`xoxb-`-style Slack tokens, `scheme://user:password@`); a secret in any other shape under a
+harmless name is not detected. The launcher that writes `docker_env` owns its values.
 
 The probe is read-only: it starts no container, opens no network and does not touch the
 session store. It does not prove Docker itself is healthy; a launch still fails closed when
@@ -182,7 +190,9 @@ hermes -p <profile> sessions reserve --json
 ```
 
 This inserts exactly one new, empty session row through the session store's own write path
-and never adopts an existing id. Start that session afterwards with `--resume <id>`.
+and never adopts an existing id. Start that session afterwards with `--resume <id>`. A store
+outside the Hermes profile tree (no owning profile) is refused with a non-zero exit and nothing
+is written.
 
 ## Starting a run with its own config (`chat --sandbox-config`)
 
@@ -196,7 +206,8 @@ hermes -p <profile> chat --resume <session> --sandbox-config <run>/config.yaml -
 
 Both go through the same loader. The file may contain only a `terminal:` section with known
 `terminal.*` keys, must say `backend: docker` and `docker_strict: true`, and must pass the
-strict volume/extra-args checks; otherwise `chat` exits 2 before any provider or model work
+strict volume/extra-args checks and the `docker_board_socket`/`docker_labels` rules (the socket
+itself may still be unbound); otherwise `chat` exits 2 before any provider or model work
 and the probe exits 2. The file's section plus shipped defaults becomes the complete terminal
 policy of the process: the profile's `terminal.*`, its `.env` and `TERMINAL_*` in the
 environment no longer reach the terminal tool, also not after later config reloads. Model
@@ -204,5 +215,6 @@ access, memory, skills and the session store stay the profile's, on the host.
 
 With `--sandbox-config` the probe's `config_sha256` is the run file's hash (and
 `"mode": "sandbox-config"`); it is `null` when any terminal setting the run reads differs from
-the file (`overrides`). `--tui` and `--worktree` are refused with `--sandbox-config`: both
+the file or a Docker runtime variable is set (`overrides`). `board_socket` and `labels` are
+reported as in the profile mode. `--tui` and `--worktree` are refused with `--sandbox-config`: both
 leave the process the policy is pinned in. Without the flag nothing changes.

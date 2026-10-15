@@ -348,3 +348,154 @@ def test_new_keys_change_the_config_hash(home, board):
 def test_non_mapping_labels_are_exposed_not_a_crash(home):
     rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_labels=["werkbank.sandbox.run=x"])))
     assert rep["auth_exposed"] is True and rep["labels"] == {}
+
+
+# --- WB-855 integration: review findings on WB-1090 ------------------------------------------------
+
+DOCKER_RUNTIME_ENV = {
+    "HERMES_DOCKER_BINARY": "/opt/other/docker",
+    "DOCKER_HOST": "tcp://10.0.0.9:2375",
+    "DOCKER_CONTEXT": "remote",
+    "DOCKER_CONFIG": "/tmp/other-docker-config",
+}
+
+
+@pytest.fixture
+def no_docker_runtime_env(monkeypatch):
+    for var in DOCKER_RUNTIME_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.parametrize("var", sorted(DOCKER_RUNTIME_ENV))
+def test_docker_runtime_env_is_an_override(home, no_docker_runtime_env, var):
+    """Which daemon/binary runs the container is part of the policy: another daemon sees other
+    host paths, another binary is other code. The file hash cannot vouch for that."""
+    path = _write(home, STRICT_TERMINAL)
+    rep = _probe(path, dict(os.environ, **{var: DOCKER_RUNTIME_ENV[var]}))
+    assert var in rep["overrides"]
+    assert rep["config_sha256"] is None and rep["config_matches"] is False
+
+
+def test_clean_docker_runtime_env_keeps_the_hash(home, no_docker_runtime_env):
+    path = _write(home, STRICT_TERMINAL)
+    rep = _probe(path)
+    assert rep["overrides"] == [] and rep["config_sha256"] == _sha(path)
+
+
+def test_probe_reports_the_resolved_docker_binary(home, no_docker_runtime_env, monkeypatch):
+    from tools.environments import docker
+    monkeypatch.setattr(docker, "find_docker", lambda: "/usr/local/bin/docker-x")
+    rep = _probe(_write(home, STRICT_TERMINAL))
+    assert rep["docker_binary"] == "/usr/local/bin/docker-x"
+
+
+def _passwd_home():
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+@pytest.mark.parametrize("entry", ["", ".ssh", ".ssh/id_ed25519", ".hermes", ".config/gh"])
+def test_credential_paths_come_from_passwd_not_HOME(home, tmp_path, monkeypatch, entry):
+    """A launcher (or .env) that moves $HOME must not hide the real ~/.ssh or ~/.hermes."""
+    fake = tmp_path / "fakehome"
+    fake.mkdir()
+    monkeypatch.setenv("HOME", str(fake))
+    source = os.path.join(_passwd_home(), entry) if entry else _passwd_home()
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_volumes=[f"{source}:/workspace:rw"])))
+    assert rep["auth_exposed"] is True, (source, rep["auth_reasons"])
+
+
+@pytest.mark.parametrize("value", [
+    "ghp_" + "A1b2C3d4" * 5, "github_pat_" + "A" * 30, "sk-" + "x" * 40,
+    "sk-ant-api03-" + "y" * 30, "AKIA" + "ABCDEFGHIJKLMNOP", "xoxb-1234-5678-abcdef",
+    "https://user:s3cret@git.example.com/repo.git",
+])
+def test_docker_env_value_that_looks_like_a_key_is_exposed(home, value):
+    """Names are the primary check; known key shapes under a harmless name are caught too."""
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_env={"HOME": "/tmp", "GIT_REMOTE": value})))
+    assert rep["auth_exposed"] is True
+    assert any("GIT_REMOTE" in r for r in rep["auth_reasons"])
+    assert not any(value in r for r in rep["auth_reasons"])  # never echo the secret
+
+
+@pytest.mark.parametrize("value", ["https://git.example.com/repo.git", "/cache/pip", "sk", "skip-tests"])
+def test_docker_env_plain_values_are_not_exposed(home, value):
+    rep = _probe(_write(home, dict(STRICT_TERMINAL, docker_env={"HOME": "/tmp", "GIT_REMOTE": value})))
+    assert rep["auth_exposed"] is False, rep["auth_reasons"]
+
+
+# --- real process: .env, plugin discovery ---------------------------------------------------------
+
+MARKER_PLUGIN = "wb855-marker"
+
+
+def _subprocess_env(home):
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("TERMINAL_") and k not in DOCKER_RUNTIME_ENV
+           and k not in {"HERMES_IGNORE_USER_CONFIG", "PYTHONDONTWRITEBYTECODE"}}
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _install_marker_plugin(home):
+    """A user plugin that leaves a file the moment its code is imported."""
+    import hermes_yaml as yaml
+
+    marker = home / "plugin-code-ran"
+    plugin = home / "plugins" / MARKER_PLUGIN
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(yaml.safe_dump({"name": MARKER_PLUGIN, "version": "0.1.0"}),
+                                        encoding="utf-8")
+    (plugin / "__init__.py").write_text(
+        f"import pathlib\npathlib.Path({str(marker)!r}).write_text('imported')\n"
+        "def register(ctx):\n    pass\n", encoding="utf-8")
+    return marker
+
+
+def _run_probe_process(home, *extra):
+    import subprocess
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "sandbox-probe", "--config",
+         str(home / "config.yaml"), "--json", *extra],
+        cwd=repo, env=_subprocess_env(home), capture_output=True, text=True, timeout=120)
+
+
+def test_process_probe_loads_no_plugin_code(home):
+    import subprocess
+    from pathlib import Path
+
+    config = dict(STRICT_TERMINAL)
+    home.joinpath("config.yaml").write_text(
+        json.dumps({"terminal": config, "plugins": {"enabled": [MARKER_PLUGIN]}}), encoding="utf-8")
+    marker = _install_marker_plugin(home)
+    repo = Path(__file__).resolve().parents[2]
+    # Control: the same home under plain plugin discovery DOES run the plugin's code.
+    control = subprocess.run(
+        [sys.executable, "-c", "from hermes_cli.plugins import discover_plugins; discover_plugins()"],
+        cwd=repo, env=_subprocess_env(home), capture_output=True, text=True, timeout=120)
+    assert control.returncode == 0, control.stderr
+    assert marker.exists(), "control: marker plugin was not loaded; the test proves nothing"
+    marker.unlink()
+
+    result = _run_probe_process(home)
+    assert result.returncode == 0, result.stderr
+    rep = json.loads(result.stdout)
+    assert rep["strict"] is True
+    assert not marker.exists(), "sandbox-probe imported plugin code"
+
+
+def test_process_probe_sees_docker_host_from_dotenv(home):
+    path = _write(home, STRICT_TERMINAL)
+    (home / ".env").write_text("DOCKER_HOST=tcp://10.0.0.9:2375\n", encoding="utf-8")
+    result = _run_probe_process(home)
+    assert result.returncode == 0, result.stderr
+    rep = json.loads(result.stdout)
+    assert "DOCKER_HOST" in rep["overrides"]
+    assert rep["config_sha256"] is None and rep["config_matches"] is False
+    (home / ".env").unlink()
+    clean = json.loads(_run_probe_process(home).stdout)
+    assert clean["config_sha256"] == _sha(path) and clean["overrides"] == []

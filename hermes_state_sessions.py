@@ -475,11 +475,16 @@ class SessionSessionsMixin:
         before the run starts and then ``--resume`` exactly that session. Unlike the
         ``create_session`` upsert this never adopts an existing row: the insert is
         ``ON CONFLICT DO NOTHING`` inside the store's write transaction, and a collision mints a
-        new id. Raises ``RuntimeError`` when no free id was found.
+        new id. Raises ``RuntimeError`` when no free id was found, or when this store lies outside
+        the profile tree (``_own_profile_name()`` is None): a reservation the launcher cannot
+        attribute to a profile proves nothing, so nothing is written.
         """
         import hermes_state_ids
 
         profile_name = self._own_profile_name()
+        if profile_name is None:
+            raise RuntimeError(f"cannot reserve a session: {self.db_path} is not a Hermes profile "
+                               "store (no owning profile)")
         for _ in range(self._RESERVE_ATTEMPTS):
             session_id = hermes_state_ids.new_session_id()
 

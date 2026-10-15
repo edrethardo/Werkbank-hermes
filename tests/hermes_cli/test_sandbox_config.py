@@ -326,3 +326,78 @@ def test_a_strict_profile_with_other_mounts_still_loses_to_the_run_file(run, mon
     assert seen["mounts"] == run["terminal"]["docker_volumes"]
     assert seen["cfg"]["docker_network"] is False and seen["network_none"] is True
     assert report["config_sha256"] == seen["applied"].sha256
+
+
+# WB-855 integration: board socket + labels go through the same loader (WB-1177 x WB-1176) -------
+
+BOARD_TARGET = "/run/werkbank/board.sock"
+
+
+@pytest.fixture
+def board_dir(tmp_path, monkeypatch):
+    """A private run root where the broker will bind ``board.sock`` (not bound yet)."""
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    root = tmp_path / "wbrun"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    return root
+
+
+def _with(run, **extra):
+    run["config"].write_text(json.dumps({"terminal": {**run["terminal"], **extra}}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("bad", [
+    {"docker_board_socket": "PARENT:" + BOARD_TARGET},            # a directory, not the socket
+    {"docker_board_socket": "SOCK:/run/elsewhere/board.sock"},     # target outside /run/werkbank
+    {"docker_labels": {"com.example.owner": "x"}},                # foreign label namespace
+    {"docker_labels": {"werkbank.run": "has space"}},              # value would be rewritten
+    {"docker_labels": ["werkbank.run=x"]},                         # not a mapping
+])
+def test_run_config_with_invalid_socket_or_labels_is_refused(run, board_dir, bad):
+    from hermes_cli import sandbox_config
+
+    value = {k: (v.replace("PARENT", str(board_dir)).replace("SOCK", str(board_dir / "board.sock"))
+                 if isinstance(v, str) else v) for k, v in bad.items()}
+    _with(run, **value)
+    with pytest.raises(sandbox_config.SandboxConfigError):
+        sandbox_config.load_sandbox_config(run["config"])
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 2 and "error" in report
+
+
+def test_open_board_socket_directory_is_refused(run, board_dir):
+    from hermes_cli import sandbox_config
+
+    os.chmod(board_dir, 0o755)
+    _with(run, docker_board_socket=f"{board_dir / 'board.sock'}:{BOARD_TARGET}")
+    with pytest.raises(sandbox_config.SandboxConfigError):
+        sandbox_config.load_sandbox_config(run["config"])
+
+
+def test_sandbox_config_probe_reports_board_socket_and_labels(run, board_dir):
+    labels = {"werkbank.sandbox.run": "run-42", "werkbank.ticket": "wb-855"}
+    _with(run, docker_board_socket=f"{board_dir / 'board.sock'}:{BOARD_TARGET}", docker_labels=labels)
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0, report
+    assert report["board_socket"] == {"source": str(board_dir / "board.sock"), "target": BOARD_TARGET,
+                                      "present": False}
+    assert report["labels"] == labels
+    assert report["auth_exposed"] is False, report["auth_reasons"]
+    assert report["config_sha256"] == hashlib.sha256(run["config"].read_bytes()).hexdigest()
+
+
+def test_sandbox_config_probe_without_socket_reports_none(run):
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0 and report["board_socket"] is None and report["labels"] == {}
+
+
+@pytest.mark.parametrize("var,value", [("DOCKER_HOST", "tcp://10.0.0.9:2375"),
+                                       ("DOCKER_CONTEXT", "remote"),
+                                       ("HERMES_DOCKER_BINARY", "/opt/other/docker")])
+def test_sandbox_config_probe_counts_docker_runtime_env_as_override(run, monkeypatch, var, value):
+    monkeypatch.setenv(var, value)
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0
+    assert var in report["overrides"]
+    assert report["config_sha256"] is None and report["config_matches"] is False

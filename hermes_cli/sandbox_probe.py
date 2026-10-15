@@ -3,23 +3,35 @@
 A trusted launcher (the Werkbank sandbox handshake, WB-855/WB-1064) must not trust a config
 file it wrote: a profile ``.env``, the ambient environment, a managed-scope overlay or
 ``HERMES_IGNORE_USER_CONFIG`` can change what Hermes actually runs with. This command asks
-the binary itself. It resolves the terminal policy through the SAME config->env bridge a run
-of this profile uses (``apply_terminal_config_to_env`` on a COPY of the environment) and
-parses it with the terminal tool's own reader (``_get_env_config`` under a bound terminal
-scope). It never mutates ``os.environ``, starts Docker, opens the network or touches the
-session store.
+the binary itself. It resolves the terminal policy with ``apply_terminal_config_to_env`` on a
+COPY of the environment -- the bridge the terminal tool's own ``_ensure_terminal_env_bridged``
+runs. ``hermes chat`` projects config.yaml earlier through a DIFFERENT function,
+``cli_config_load._mirror_config_to_env``; both follow the same precedence rule (a config.yaml
+with a ``terminal`` section overrides ``TERMINAL_*`` env, otherwise env wins), but they are two
+code paths, so equality is pinned by tests, not by construction. ``--sandbox-config`` (WB-1176)
+avoids the question: there the run pins one policy that the probe reads back. The result is
+parsed with the terminal tool's own reader (``_get_env_config`` under a bound terminal scope).
+It never mutates ``os.environ``, starts Docker, opens the network or touches the session store.
 
 Contract (``hermes -p <profile> sandbox-probe --config <file> --json``), one JSON object:
 
 - ``strict``: True only when ``terminal.docker_strict`` is on AND the backend is Docker.
 - ``config_sha256``: sha256 of the config.yaml this profile really runs with; ``None`` when
   no such file governs the run, or when env/managed overrides make the effective terminal
-  policy differ from that file plus defaults (``overrides`` names them).
+  policy differ from that file plus defaults (``overrides`` names them). The Docker runtime
+  selection (``HERMES_DOCKER_BINARY``, ``DOCKER_HOST``, ``DOCKER_CONTEXT``, ``DOCKER_CONFIG``)
+  counts as an override when set: another daemon resolves bind paths on another host, another
+  binary is other code. ``docker_binary`` is the CLI ``find_docker()`` resolves.
 - ``docker_network``: False only for a Docker backend with ``docker_network: false``.
 - ``auth_exposed``: False only when strict and no credential path into the container is
   configured (no forwarded env, no credential-named ``docker_env``, no extra Docker args, no
   bind of the Hermes home or a host credential directory, and a ``docker_board_socket`` only
   when it passes the container start's own socket rules). ``auth_reasons`` explains.
+  ``docker_env`` is judged by variable NAME; values are only screened for a few well-known
+  key shapes (``ghp_``/``github_pat_``, ``sk-``, ``AKIA``, ``xox?-``, ``scheme://user:pw@``).
+  A secret in any other shape under a harmless name is NOT detected -- the launcher that
+  writes ``docker_env`` owns its values. Home-relative credential paths are taken from both
+  ``$HOME`` and the passwd entry, and the real default Hermes root from the passwd home.
 - ``board_socket``: the one approved board-door socket (``source``/``target``/``present``) or
   ``None``; ``labels``: the ``werkbank.*`` container labels (WB-1177).
 
@@ -41,6 +53,13 @@ from typing import Any, Dict, List, Mapping, Optional
 _CREDENTIAL_NAME = re.compile(
     r"(KEY|TOKEN|SECRET|PASSW|PASSPHRASE|CREDENTIAL|AUTH|COOKIE|SESSION|PRIVATE|BEARER|_PAT$)",
     re.IGNORECASE)
+# Well-known secret shapes in a docker_env VALUE (the name check is primary; this is a backstop).
+_CREDENTIAL_VALUE = re.compile(
+    r"(?:\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bsk-[A-Za-z0-9_-]{20,}"
+    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bxox[abposr]-[A-Za-z0-9-]{10,}"
+    r"|[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@)")
+# Environment that selects WHICH container runtime/daemon runs the sandbox (find_docker + docker CLI).
+DOCKER_RUNTIME_ENV = ("DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_HOST", "HERMES_DOCKER_BINARY")
 # Host paths whose bind (or a bind of an ancestor / descendant) hands credentials to the container.
 _CREDENTIAL_HOME_ENTRIES = (
     ".ssh", ".aws", ".azure", ".config", ".docker", ".gnupg", ".kube", ".netrc",
@@ -130,13 +149,32 @@ def _parse_policy(effective: Dict[str, str]) -> Dict[str, Any]:
     return cfg
 
 
+def _user_homes() -> List[Path]:
+    """``$HOME`` AND the passwd home: a moved ``$HOME`` must not hide the real ``~/.ssh``."""
+    homes = [Path.home()]
+    try:
+        import pwd
+        homes.append(Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (ImportError, KeyError):  # no passwd database (Windows, stripped containers)
+        pass
+    result: List[Path] = []
+    for h in homes:
+        real = Path(os.path.realpath(h))
+        if real not in result:
+            result.append(real)
+    return result
+
+
 def _sensitive_paths(home: Path) -> List[Path]:
     from hermes_constants import get_default_hermes_root
 
-    user_home = Path.home()
+    suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
     paths = [home, get_default_hermes_root()]
-    paths += [user_home / entry for entry in _CREDENTIAL_HOME_ENTRIES]
-    return [Path(os.path.realpath(p)) for p in paths]
+    for user_home in _user_homes():
+        # The real default Hermes root, independent of $HOME and HERMES_HOME.
+        paths += [user_home / ".hermes", user_home / (".hermes" + suffix)]
+        paths += [user_home / entry for entry in _CREDENTIAL_HOME_ENTRIES]
+    return list(dict.fromkeys(Path(os.path.realpath(p)) for p in paths))
 
 
 def _overlaps(source: Path, sensitive: Path) -> bool:
@@ -151,12 +189,18 @@ def _auth_reasons(cfg: Dict[str, Any], home: Path) -> List[str]:
     if cfg.get("docker_forward_env"):
         reasons.append("docker_forward_env forwards host values: "
                        + ", ".join(map(str, cfg["docker_forward_env"])))
-    env_names = [str(k) for k in (cfg.get("docker_env") or {}) if _CREDENTIAL_NAME.search(str(k))]
+    docker_env = cfg.get("docker_env") or {}
+    env_names = [str(k) for k in docker_env if _CREDENTIAL_NAME.search(str(k))]
     if env_names:
         reasons.append("docker_env sets credential-named variables: " + ", ".join(sorted(env_names)))
+    if isinstance(docker_env, dict):
+        shaped = [str(k) for k, v in docker_env.items()
+                  if str(k) not in env_names and _CREDENTIAL_VALUE.search(str(v))]
+        if shaped:  # name only: the value is the secret
+            reasons.append("docker_env values look like credentials: " + ", ".join(sorted(shaped)))
     if cfg.get("docker_extra_args"):
         reasons.append("docker_extra_args can override every guard")
-    user_home = Path(os.path.realpath(Path.home()))
+    user_homes = _user_homes()
     sensitive = _sensitive_paths(home)
     for volume in cfg.get("docker_volumes") or []:
         source = str(volume).split(":", 1)[0]
@@ -164,7 +208,8 @@ def _auth_reasons(cfg: Dict[str, Any], home: Path) -> List[str]:
             reasons.append(f"non-absolute volume source {source!r}")
             continue
         src = Path(os.path.realpath(source))
-        if src == user_home or src in user_home.parents or any(_overlaps(src, p) for p in sensitive):
+        if any(src == h or src in h.parents for h in user_homes) or any(
+                _overlaps(src, p) for p in sensitive):
             reasons.append(f"volume {source} overlaps the Hermes home or a host credential path")
     reasons += _board_socket_reasons(cfg, sensitive)
     if cfg.get("docker_labels"):
@@ -205,6 +250,20 @@ def _board_socket_reasons(cfg: Dict[str, Any], sensitive: List[Path]) -> List[st
     return []
 
 
+def _docker_runtime_overrides(environ: Mapping[str, str]) -> List[str]:
+    """Runtime-selection variables that are set: the config file cannot vouch for them."""
+    return [var for var in DOCKER_RUNTIME_ENV if str(environ.get(var) or "").strip()]
+
+
+def _docker_binary() -> Optional[str]:
+    """The container CLI this process would run (``find_docker()``), ``None`` when absent."""
+    try:
+        from tools.environments.docker import find_docker
+        return find_docker()
+    except Exception:  # an unresolvable runtime is reported, not raised
+        return None
+
+
 def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Build the report for this process' HERMES_HOME (``-p`` already re-homed it)."""
     from hermes_constants import get_hermes_home
@@ -222,7 +281,8 @@ def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None
     ignored = environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
 
     effective = _effective_terminal_env(environ, raw)
-    overrides = _overrides(effective, _file_only_terminal_env(None if ignored else raw))
+    overrides = sorted(_overrides(effective, _file_only_terminal_env(None if ignored else raw))
+                       + _docker_runtime_overrides(environ))
     strict_reason = None
     cfg: Dict[str, Any]
     try:
@@ -254,10 +314,15 @@ def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None
         "overrides": overrides,
         "auth_reasons": auth_reasons,
         "board_socket": _board_socket(cfg) if backend == "docker" else None,
-        "labels": (dict(cfg["docker_labels"]) if backend == "docker"
-                   and isinstance(cfg.get("docker_labels"), dict) else {}),
+        "labels": _labels(cfg) if backend == "docker" else {},
+        "docker_binary": _docker_binary(),
         "strict_reason": strict_reason,
     }
+
+
+def _labels(cfg: Dict[str, Any]) -> Dict[str, str]:
+    labels = cfg.get("docker_labels")
+    return {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
 
 
 def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
@@ -280,8 +345,9 @@ def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
     names = sorted(set(TERMINAL_CONFIG_ENV_MAP.values()) | set(cfg.policy))
     with process_terminal_pin(cfg.policy):
         seen = {name: terminal_env(name, missing) for name in names}  # type: ignore[arg-type]
-    overrides = sorted(name for name in names
-                       if (None if seen[name] is missing else seen[name]) != cfg.policy.get(name))
+    overrides = sorted([name for name in names
+                        if (None if seen[name] is missing else seen[name]) != cfg.policy.get(name)]
+                       + _docker_runtime_overrides(os.environ))
     policy = sandbox_config.read_policy(cfg.policy)
     home = Path(get_hermes_home())
     auth_reasons = _auth_reasons(policy, home)
@@ -301,6 +367,9 @@ def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
         "config_matches": effective_sha is not None,
         "overrides": overrides,
         "auth_reasons": auth_reasons,
+        "board_socket": _board_socket(policy),
+        "labels": _labels(policy),
+        "docker_binary": _docker_binary(),
         "strict_reason": None,
     }
 
@@ -335,6 +404,7 @@ def cmd_sandbox_probe(args) -> int:
               + ("" if board["present"] else "  (not bound yet)"))
     for key, value in sorted(report["labels"].items()):
         print(f"label:            {key}={value}")
+    print(f"docker_binary:    {report['docker_binary'] or '-'}")
     print(f"config_sha256:    {report['config_sha256'] or '-'}")
     print(f"config_matches:   {yes[report['config_matches']]}")
     if report["overrides"]:

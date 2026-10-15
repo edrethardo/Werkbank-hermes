@@ -104,8 +104,14 @@ def sandbox_terminal_policy(terminal: Dict[str, Any]) -> Dict[str, str]:
 
 
 def read_policy(policy: Dict[str, str]) -> Dict[str, Any]:
-    """The terminal tool's own reading of *policy* (raises ValueError where it would refuse)."""
-    from tools.docker_strict import strict_enabled, validate_extra_args, validate_volumes
+    """The terminal tool's own reading of *policy* (raises ValueError where it would refuse).
+
+    Runs the container start's strict checks too, including the WB-1177 board socket (all rules
+    except presence: the broker may bind it after the probe, the container start re-checks the
+    live socket) and the ``werkbank.*`` labels.
+    """
+    from tools.docker_strict import (
+        strict_enabled, validate_board_socket, validate_extra_args, validate_labels, validate_volumes)
     from tools.terminal_scope import process_terminal_pin
     from tools.terminal_tool import _get_env_config
 
@@ -116,6 +122,11 @@ def read_policy(policy: Dict[str, str]) -> Dict[str, Any]:
         raise ValueError("the terminal tool does not read this as strict Docker")
     validate_extra_args(cfg.get("docker_extra_args"))
     validate_volumes(cfg.get("docker_volumes"))
+    try:
+        validate_board_socket(cfg.get("docker_board_socket") or None, require_present=False)
+    except OSError as exc:  # e.g. the socket's directory does not exist
+        raise ValueError(f"docker_board_socket: {exc}") from exc
+    validate_labels(cfg.get("docker_labels"))
     return cfg
 
 
@@ -127,7 +138,7 @@ def load_sandbox_config(path: os.PathLike | str) -> SandboxConfig:
     policy = sandbox_terminal_policy(terminal)
     try:
         read_policy(policy)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise SandboxConfigError(f"{path} is not a valid strict-Docker config: {exc}") from exc
     return SandboxConfig(path=str(path), sha256=hashlib.sha256(data).hexdigest(),
                          terminal=terminal, policy=policy)
