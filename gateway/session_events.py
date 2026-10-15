@@ -501,6 +501,22 @@ def user_message(session_key: Optional[str], event: Any, delivery: str, *, sessi
         logger.debug("user.message emit failed", exc_info=True)
 
 
+def folded_part(event: Any, text: str) -> dict:  # fork: werkbank-chat (WB-1175)
+    """The part a message folded into the running turn contributes to its row
+    (``agent.folded_messages``): the id its ``user.message`` is announced under and the sender's
+    own words; an internal gateway event (no sender id, not a synthetic turn) only as a marker."""
+    from gateway.run_plugin_injection import client_message_metadata
+    sender = client_message_metadata(event)
+    synthetic = getattr(event, _SYNTHETIC_ATTR, None)
+    ref = _message_ref(event)
+    if getattr(event, "internal", False) and not sender and not synthetic:
+        return {"ref": ref, "internal": True}
+    part = {"ref": ref, "text": str(text), **sender}
+    if synthetic:
+        part["synthetic"] = synthetic
+    return part
+
+
 def queued_into_slot(session_key: Optional[str], event: Any, head: Any, slot: Any) -> None:
     """``eingereiht`` after *event* was written into an adapter's pending slot that held *head* before.
 

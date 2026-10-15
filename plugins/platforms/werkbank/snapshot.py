@@ -86,6 +86,35 @@ def row_client_message_id(row: Dict[str, Any]) -> Optional[str]:
     return _row_meta(row, "client_message_id")
 
 
+# Gateway-made user rows (``display_kind``): never the owner's words — unless the row names a
+# sender's own id (a board message is injected as an internal event, WB-1128).
+INTERNAL_KINDS = frozenset({"hidden", "internal_notification", "async_delegation_complete",
+                            "process_complete"})
+FOLDED_KEY = "folded_messages"   # agent.folded_messages.FOLDED_MESSAGES_KEY (WB-1175)
+
+
+def _meta(row: Dict[str, Any]) -> Dict[str, Any]:
+    meta = row.get("display_metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _human_view(row: Dict[str, Any]) -> Optional[Any]:
+    """The owner's part of a user row the core marked as a compaction handoff
+    (``_compressed_summary``), by the core's own split; ``None`` when it holds none."""
+    try:
+        from agent.context_compressor import user_originated_turn_view
+    except Exception:
+        return row.get("content")                    # no core to ask: show it as it is
+    view = user_originated_turn_view({"role": "user", "content": row.get("content"),
+                                      "_compressed_summary": True})
+    return None if view is None else view.get("content")
+
+
 def _row_origin(row: Dict[str, Any], origin: Optional[str], plugin_id: str) -> Optional[str]:
     """``werkbank`` for a row THIS plugin injected (``display_metadata.hermes_plugin_id``), another
     plugin's id for its rows — the names the stream uses (``Buffers.on_event``) — else *origin*."""
@@ -95,6 +124,54 @@ def _row_origin(row: Dict[str, Any], origin: Optional[str], plugin_id: str) -> O
         cmid = row_client_message_id(row)
         return "werkbank" if cmid is not None and cmid.startswith(BOARD_ID_PREFIX) else origin
     return "werkbank" if injected_by == plugin_id else injected_by
+
+
+def message_items(row: Dict[str, Any], origin: Optional[str] = None,
+                  plugin_id: str = "platforms/werkbank") -> List[Dict[str, Any]]:
+    """The chat items one SessionDB row stands for (WB-1175), all by markers the core wrote:
+
+    * a row that names the messages folded into it (``display_metadata.folded_messages``: steer,
+      redirect, leftover steer) — one item per part, under the part's ``ref`` (the id its
+      ``user.message`` was announced under), with the sender's own words; an internal part none;
+    * a compaction handoff (``_compressed_summary``) — only the owner's part, else nothing;
+    * a gateway-internal user row (``INTERNAL_KINDS``) without a sender's id — nothing;
+    * every other row — :func:`message_item`.
+    """
+    if row.get("role") == "user":
+        meta = _meta(row)
+        parts = meta.get(FOLDED_KEY)
+        if isinstance(parts, list) and parts:
+            return _folded_items(row, parts, origin, plugin_id)
+        if row.get("_compressed_summary"):
+            human = _human_view(row)
+            if human is None or not _text(human).strip():
+                return []
+            row = {**row, "content": human}
+        elif row.get("display_kind") in INTERNAL_KINDS and row_client_message_id(row) is None:
+            return []
+    item = message_item(row, origin, plugin_id)
+    return [] if item is None else [item]
+
+
+def _folded_items(row: Dict[str, Any], parts: List[Any], origin: Optional[str],
+                  plugin_id: str) -> List[Dict[str, Any]]:
+    items = []
+    for n, part in enumerate(parts, 1):
+        if not isinstance(part, dict) or part.get("internal") or not isinstance(part.get("text"), str):
+            continue
+        ref = part.get("ref")
+        ref = str(ref) if isinstance(ref, (str, int)) and not isinstance(ref, bool) and str(ref) else None
+        cmid = part.get("client_message_id") if isinstance(part.get("client_message_id"), str) else None
+        sender = {"display_metadata": {k: part[k] for k in ("client_message_id", "hermes_plugin_id")
+                                       if isinstance(part.get(k), str) and part[k]}}
+        items.append({"id": ref or f"db:{row.get('id')}#{n}", "client_message_id": cmid,
+                      "message_id": ref if ref != cmid else None, "db_id": row.get("id"),
+                      "role": "user", "ts": row.get("timestamp"),
+                      "origin": _row_origin(sender, origin, plugin_id),
+                      "tool_call_id": None, "tool_name": None, "is_error": False, "truncated": False,
+                      "text": part["text"], **({"synthetic": part["synthetic"]}
+                                                if isinstance(part.get("synthetic"), str) else {})})
+    return items
 
 
 def message_item(row: Dict[str, Any], origin: Optional[str] = None,
@@ -202,6 +279,7 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
     row_ids = {m["id"] for m in messages}                  # ids the history rows stand for
     have_ids = set(row_ids)
     confirmed: Dict[str, List[int]] = {"users": [], "answers": []}
+    waiting: List[tuple] = []                              # (mark, entry) not confirmed yet
 
     for user in pos.get("recent_users") or []:
         board_id = user.get("client_message_id") or user.get("id") or user.get("message_id")
@@ -215,13 +293,15 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
             continue
         if below(user.get("mark")):
             continue                                       # its row lies before the active history
-        messages.append({"id": str(board_id), "client_message_id": user.get("client_message_id"),
+        waiting.append((_int(user.get("mark")),
+                        {"id": str(board_id), "client_message_id": user.get("client_message_id"),
                          "message_id": user.get("message_id"), "db_id": None, "role": "user",
                          "text": user.get("text") or "", "ts": user.get("ts"), "origin": user.get("origin"),
                          "delivery": user.get("delivery"), "synthetic": user.get("synthetic"),
                          "tool_call_id": None, "tool_name": None, "is_error": False, "truncated": False,
-                         "from_buffer": True})
+                         "from_buffer": True}))
         have_ids.add(str(board_id))
+    _place(messages, waiting)
 
     answer_ids = [rid for rid in (_row_id(r) for r in rows if _is_answer_row(r)) if rid is not None]
     uids = _row_uids(rows)
@@ -263,6 +343,23 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
     return confirmed
 
 
+def _place(messages: List[Dict[str, Any]], waiting: List[tuple]) -> None:
+    """Put each buffered entry where its row mark says it arrived (WB-1175): before the first
+    history item whose row id lies above the mark — row ids only grow, the clock is never read.
+    Without a mark it goes to the end, as before; equal marks keep their arrival order."""
+    for mark, entry in waiting:
+        at = len(messages)
+        if mark is not None:
+            for i, item in enumerate(messages):
+                rid = _int(item.get("db_id"))
+                if rid is not None and rid > mark and not item.get("from_buffer"):
+                    at = i
+                    break
+            while at < len(messages) and messages[at].get("from_buffer"):
+                at += 1                                    # behind earlier entries of that mark
+        messages.insert(at, entry)
+
+
 def _lineage(host, session_key: str, session_id: Optional[str]) -> List[str]:
     """*session_id* and its compression ancestors (``SessionDB`` resume lineage), never a session
     that ``/new`` replaced."""
@@ -298,9 +395,7 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
     rows = [r for r in host.history(session_key, session_id, HISTORY_LIMIT) or [] if isinstance(r, dict)]
     messages: List[Dict[str, Any]] = []
     for row in rows:
-        item = message_item(row, pos["platform"], buffers.plugin_id)
-        if item is not None:
-            messages.append(item)
+        messages.extend(message_items(row, pos["platform"], buffers.plugin_id))
     confirmed = _complete(messages, rows, pos, _lineage(host, session_key, session_id))
     buffers.confirm(session_key, answers=confirmed["answers"], users=confirmed["users"])
     running = bool(pos["turn_id"]) or bool(host.is_running(session_key))

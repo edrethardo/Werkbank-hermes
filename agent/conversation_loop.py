@@ -349,7 +349,10 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         # as assistant text the model echoes it (#81841).
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    # fork: werkbank-chat — the row names the redirected messages by id (WB-1175)
+    from agent import folded_messages
+    append_message(messages, folded_messages.with_metadata(
+        {"role": "user", "content": str(text), "api_content": correction}, text))
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
