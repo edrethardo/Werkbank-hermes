@@ -27,6 +27,19 @@ def _client_message_id_meta(client_message_id: Optional[str]) -> dict:  # fork: 
     return {"client_message_id": client_message_id} if client_message_id else {}  # fork: werkbank-chat
 
 
+def _with_media(event: MessageEvent, media_urls: Optional[list], media_types: Optional[list]) -> MessageEvent:  # fork: werkbank-chat
+    """Plugin attachments (validated by ``plugins_injection``) on *event*: all images → a PHOTO event,
+    else DOCUMENT; ``media_text_inlined`` False — the content is not in the text, the agent reads the
+    cached file (the document note says so). Without media the text event stays as it is."""
+    if media_urls:  # fork: werkbank-chat
+        types = list(media_types or [])  # fork: werkbank-chat
+        event.message_type = (MessageType.PHOTO if all(t.startswith("image/") for t in types)  # fork: werkbank-chat
+                              else MessageType.DOCUMENT)  # fork: werkbank-chat
+        event.media_urls, event.media_types = list(media_urls), types  # fork: werkbank-chat
+        event.media_text_inlined = [False] * len(media_urls)  # fork: werkbank-chat
+    return event  # fork: werkbank-chat
+
+
 def client_message_metadata(event: Any) -> dict:  # fork: werkbank-chat
     """``{"client_message_id": …, "hermes_plugin_id": …}`` for a plugin-injected event that carries
     a client id, else ``{}``.
@@ -71,6 +84,7 @@ class GatewayPluginInjectionMixin:
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
         reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
+        media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
@@ -87,7 +101,8 @@ class GatewayPluginInjectionMixin:
             target = f"origin={source.platform.value}/{source.chat_id}"
             coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id,
                                                           client_message_id=client_message_id,  # fork: werkbank-chat
-                                                          reply_to_message_id=reply_to_message_id)  # fork: werkbank-chat
+                                                          reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
+                                                          media_urls=media_urls, media_types=media_types)  # fork: werkbank-chat
         else:
             if not isinstance(session_key, str) or not self._plugin_session_in_own_profile(  # fork: werkbank-chat
                     session_key, plugin_home=plugin_home, plugin_id=plugin_id,  # fork: werkbank-chat
@@ -98,6 +113,7 @@ class GatewayPluginInjectionMixin:
                 session_key=session_key, content=content, plugin_id=plugin_id,
                 client_message_id=client_message_id,  # fork: werkbank-chat
                 reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
+                media_urls=media_urls, media_types=media_types,  # fork: werkbank-chat
             )
         return self._submit_plugin_coroutine(coro, loop, plugin_id=plugin_id, target=target,  # fork: werkbank-chat
                                              what="Plugin message injection")  # fork: werkbank-chat
@@ -175,6 +191,7 @@ class GatewayPluginInjectionMixin:
         self, *, session_key: str, content: str, plugin_id: str,
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
         reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
+        media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter. ``reply_to_message_id``
         becomes the turn's reply anchor (``reply_anchor_override``); ``message_id`` stays unset."""
@@ -194,7 +211,7 @@ class GatewayPluginInjectionMixin:
             return False
 
         async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
+            await adapter.handle_message(_with_media(MessageEvent(  # fork: werkbank-chat
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,
                 reply_anchor_override=reply_to_message_id,  # fork: werkbank-chat
@@ -204,7 +221,7 @@ class GatewayPluginInjectionMixin:
                     "gateway_session_strict": True,
                     **_client_message_id_meta(client_message_id),  # fork: werkbank-chat
                 },
-            ))
+            ), media_urls, media_types))  # fork: werkbank-chat
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,
@@ -272,6 +289,7 @@ class GatewayPluginInjectionMixin:
         self, *, source: SessionSource, content: str, plugin_id: str,
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
         reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
+        media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
     ) -> bool:
         """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
@@ -286,7 +304,7 @@ class GatewayPluginInjectionMixin:
             return False
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
+            await adapter.handle_message(_with_media(MessageEvent(  # fork: werkbank-chat
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,
                 reply_anchor_override=reply_to_message_id,  # fork: werkbank-chat
@@ -296,7 +314,7 @@ class GatewayPluginInjectionMixin:
                     "gateway_session_key": session_key,
                     **_client_message_id_meta(client_message_id),  # fork: werkbank-chat
                 },
-            ))
+            ), media_urls, media_types))  # fork: werkbank-chat
         logger.info("Plugin message injection dispatched: plugin=%s %s session=%s", plugin_id, target, session_key)
         return True
 

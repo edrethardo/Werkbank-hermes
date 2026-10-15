@@ -12,6 +12,8 @@ logger = logging.getLogger("hermes_cli.plugins")
 
 _CLIENT_MESSAGE_ID_MAX = 256  # fork: werkbank-chat
 _REPLY_TO_MESSAGE_ID_RE = re.compile(r"[0-9]{1,20}")  # fork: werkbank-chat — a platform message id: ASCII digits only
+_MEDIA_MAX = 10  # fork: werkbank-chat — attachments per injected message
+_MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,127}")  # fork: werkbank-chat
 
 
 def _valid_client_message_id(value: Any) -> bool:  # fork: werkbank-chat
@@ -20,10 +22,44 @@ def _valid_client_message_id(value: Any) -> bool:  # fork: werkbank-chat
             and value.isprintable())  # fork: werkbank-chat
 
 
+def _valid_media(urls: Any, types: Any, home: Any) -> bool:  # fork: werkbank-chat
+    """Attachments a plugin may hand to a turn: equally long lists (1..10) of absolute paths of regular
+    files whose real path lies in the plugin profile's media cache (``<home>/cache``, or a populated
+    legacy ``image_cache``/``document_cache``; never a link) and ``type/subtype``
+    strings. The plugin is host code; this keeps a slip from handing the agent an arbitrary file."""
+    if not isinstance(urls, list) or not isinstance(types, list) or not 0 < len(urls) <= _MEDIA_MAX:  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    if len(types) != len(urls) or home is None:  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    import os  # fork: werkbank-chat
+    from pathlib import Path  # fork: werkbank-chat
+    try:  # fork: werkbank-chat
+        from hermes_constants import get_hermes_dir  # fork: werkbank-chat
+        roots = [Path(home).resolve() / "cache"] + [  # fork: werkbank-chat — + a populated legacy media dir
+            get_hermes_dir(new, old, home=Path(home)).resolve()  # fork: werkbank-chat
+            for new, old in (("cache/images", "image_cache"), ("cache/documents", "document_cache"))]  # fork: werkbank-chat
+    except (OSError, RuntimeError):  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
+    for url, mtype in zip(urls, types):  # fork: werkbank-chat
+        if not isinstance(url, str) or not os.path.isabs(url) or not isinstance(mtype, str):  # fork: werkbank-chat
+            return False  # fork: werkbank-chat
+        if not _MEDIA_TYPE_RE.fullmatch(mtype):  # fork: werkbank-chat
+            return False  # fork: werkbank-chat
+        try:  # fork: werkbank-chat
+            real = Path(url).resolve(strict=True)  # fork: werkbank-chat
+        except (OSError, RuntimeError):  # fork: werkbank-chat
+            return False  # fork: werkbank-chat
+        if (not real.is_file() or Path(url).is_symlink()  # fork: werkbank-chat
+                or not any(real.is_relative_to(root) for root in roots)):  # fork: werkbank-chat
+            return False  # fork: werkbank-chat
+    return True  # fork: werkbank-chat
+
+
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
     origin: Optional[Mapping[str, Any]], client_message_id: Optional[str] = None,  # fork: werkbank-chat
     reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
+    media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
 ) -> bool:
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
@@ -49,6 +85,10 @@ def inject_plugin_message(
                                                 and _REPLY_TO_MESSAGE_ID_RE.fullmatch(reply_to_message_id)):  # fork: werkbank-chat
         logger.warning("inject_message: reply_to_message_id must be 1-20 ASCII digits")  # fork: werkbank-chat
         return False  # fork: werkbank-chat
+    media = media_urls is not None or media_types is not None  # fork: werkbank-chat
+    if media and not _valid_media(media_urls, media_types, manager.home_path):  # fork: werkbank-chat
+        logger.warning("inject_message: media_urls/media_types must name files in the profile's cache")  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
     if not ctx._gateway_injection_allowed():
         logger.warning("inject_message: gateway injection denied for plugin %s; set "
                        "plugins.entries.%s.allow_gateway_injection: true to allow it",
@@ -58,7 +98,7 @@ def inject_plugin_message(
     # session_key; a miss falls through so a co-resident messaging gateway
     # still receives its own keys. An exception fails closed — do not also
     # hand the same text to the gateway.
-    if session_key and manager.has_tui_message_injector:
+    if session_key and manager.has_tui_message_injector and not media:  # fork: werkbank-chat — TUI takes no media
         try:
             if manager.inject_tui_message(session_key=session_key, content=msg, plugin_id=ctx.plugin_id,
                                           plugin_home=manager.home_path):  # fork: werkbank-chat
@@ -81,6 +121,8 @@ def inject_plugin_message(
         target["client_message_id"] = client_message_id  # fork: werkbank-chat
     if reply_to_message_id is not None:  # fork: werkbank-chat
         target["reply_to_message_id"] = reply_to_message_id  # fork: werkbank-chat
+    if media:  # fork: werkbank-chat
+        target["media_urls"], target["media_types"] = list(media_urls), list(media_types)  # fork: werkbank-chat
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:
