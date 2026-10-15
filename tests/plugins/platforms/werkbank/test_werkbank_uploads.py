@@ -238,3 +238,84 @@ def test_unbound_uploads_expire_and_their_files_go(tmp_path):
     now[0] += OPEN_TTL_S + 1
     store.sweep()
     assert store.file(KEY_SESSION, rec["id"]) is None and not os.path.exists(path)
+
+
+# ── WB-1174 Schliff ──────────────────────────────────────────────────────────────────────────────
+
+def test_a_long_unicode_name_fits_the_file_system(tmp_path):
+    """ENAMETOOLONG: 76 four-byte characters are 304 bytes, ``doc_<id>_`` on top — over 255."""
+    from plugins.platforms.werkbank.uploads import NAME_BYTES, Uploads
+    store = Uploads(tmp_path)
+    rec = store.store(KEY_SESSION, "\U00020000" * 100 + ".pdf", b"%PDF-1.4 x")
+    assert rec["name"].endswith(".pdf") and len(rec["name"].encode("utf-8")) <= NAME_BYTES <= 200
+    path = store.file(KEY_SESSION, rec["id"])[0]
+    assert os.path.isfile(path) and len(os.path.basename(path).encode("utf-8")) < 255
+    assert rec["name"] == "\U00020000" * ((NAME_BYTES - 4) // 4) + ".pdf"   # whole characters only
+
+
+def test_a_storage_failure_is_a_500_with_a_reason(srv, monkeypatch):
+    from plugins.platforms.werkbank import uploads
+    def full(*_a, **_k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(uploads, "_write", full)
+    status, answer = _upload(srv, PNG)
+    assert status == 500 and answer["error"] == "storage failed"
+    assert "speichern" in answer["grund"] and "ENOSPC" in answer["grund"]
+    assert "/" not in answer["grund"]                                   # never a path
+
+
+def _delete(s, upload_id, key=None, body=None):
+    import http.client, json as _json
+    conn = http.client.HTTPConnection("127.0.0.1", s.port, timeout=5)
+    data = None if body is None else _json.dumps(body).encode()
+    conn.request("DELETE", session_path("uploads", upload_id, **({"key": key} if key else {})), body=data,
+                 headers={"Authorization": "Bearer " + s.key})
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    return resp.status, (_json.loads(raw) if raw else {})
+
+
+def test_delete_removes_an_unbound_upload_and_its_file(srv, tmp_path):
+    a = _upload(srv, PNG)[1]
+    path = srv.uploads.file(KEY_SESSION, a["upload_id"])[0]
+    assert _delete(srv, a["upload_id"]) == (200, {"deleted": a["upload_id"]})
+    assert not os.path.exists(path)
+    assert _delete(srv, a["upload_id"])[0] == 404
+    assert _send(srv, "x", "wb-20", [a["upload_id"]])[0] == 400
+
+
+def test_delete_frees_the_open_quota(srv, monkeypatch):
+    from plugins.platforms.werkbank import uploads
+    monkeypatch.setattr(uploads, "MAX_OPEN", 1)
+    a = _upload(srv, PNG)[1]
+    assert _upload(srv, PNG)[0] == 429
+    assert _delete(srv, a["upload_id"])[0] == 200
+    assert _upload(srv, PNG)[0] == 200
+
+
+def test_delete_never_touches_a_sent_or_foreign_upload(tmp_path):
+    host = FakeHost()
+    other_key, other_sid = "agent:main:telegram:dm:4711:52", "20261013_130000_aaaaaa"
+    host.sessions[other_sid] = {"session_key": other_key, "session_id": other_sid, "platform": "telegram",
+                                "live": True}
+    s = running_server(tmp_path, host)
+    try:
+        call(s.port, "GET", f"/v1/resolve?session_id={SID}", s.key)
+        call(s.port, "GET", f"/v1/resolve?session_id={other_sid}", s.key)
+        a = _upload(s, PNG)[1]
+        b = _upload(s, PNG)[1]
+        assert _send(s, "x", "wb-21", [b["upload_id"]])[0] == 200
+        assert _delete(s, a["upload_id"], key=other_key)[0] == 404          # another session
+        assert _delete(s, b["upload_id"])[0] == 409                         # already sent
+        assert s.uploads.file(KEY_SESSION, a["upload_id"]) is not None
+        assert s.uploads.file(KEY_SESSION, b["upload_id"]) is not None
+        assert _delete(s, "up_x")[0] == 400
+    finally:
+        s.server.stop()
+
+
+def test_delete_with_a_body_is_refused(srv):
+    a = _upload(srv, PNG)[1]
+    assert _delete(srv, a["upload_id"], body={"x": 1})[0] == 400
+    assert srv.uploads.file(KEY_SESSION, a["upload_id"]) is not None

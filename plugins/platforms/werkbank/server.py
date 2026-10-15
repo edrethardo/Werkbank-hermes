@@ -511,6 +511,42 @@ def _handler(app: WerkbankServer):
                 return self._answer(key, what[0], urllib.parse.unquote(what[1]), body)
             self._refuse(404, "not found", "Unbekannter Pfad.")
 
+        # -- DELETE -----------------------------------------------------------------------------
+        def do_DELETE(self):  # noqa: N802
+            """WB-1174: ``DELETE /v1/s/{key}/uploads/{id}`` — an unsent attachment of THIS session
+            goes (the board chip's ✕). No body; a sent one stays (409)."""
+            if not self._auth():
+                return
+            if (self.headers.get("Content-Length") or "0").strip() != "0" or self.headers.get("Transfer-Encoding"):
+                self.close_connection = True       # the body is never read
+                return self._refuse(400, "body not allowed", "DELETE ohne Inhalt.")
+            self._in_time()
+            try:
+                parts = urllib.parse.urlsplit(self.path).path.split("/")[1:]
+                if len(parts) != 5 or parts[:2] != ["v1", "s"] or parts[3] != "uploads":
+                    return self._refuse(404, "not found", "Unbekannter Pfad.")
+                key = self._session(parts)
+                if key is None:
+                    return
+                upload_id = urllib.parse.unquote(parts[4])
+                if not uploads_mod.ID_RE.fullmatch(upload_id):
+                    return self._refuse(400, "bad upload id", "Ungültige Anhang-ID.")
+                state = app.uploads.discard(key, upload_id) if app.uploads is not None else "unknown"
+                if state == "bound":
+                    return self._refuse(409, "already sent", "Dieser Anhang ist schon gesendet und bleibt.")
+                if state != "deleted":
+                    return self._refuse(404, "unknown upload", "Diesen Anhang gibt es (nicht mehr).")
+                logger.info("werkbank: unsent attachment removed")
+                self._json(200, {"deleted": upload_id})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception:
+                logger.warning("werkbank: DELETE failed (%s)", "internal", exc_info=False)
+                try:
+                    self._refuse(500, "internal", "Interner Fehler im Hermes-Plugin werkbank.")
+                except Exception:
+                    pass
+
         def _answer(self, key: str, kind: str, item_id: str, body: Dict[str, Any]):
             """WB-1129: one approval / clarify prompt of THIS session, by its exact id."""
             if not ID_RE.fullmatch(item_id or ""):

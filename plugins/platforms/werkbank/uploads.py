@@ -21,6 +21,7 @@ shows its ``media_count`` again, nothing more. Unbound uploads go after ``OPEN_T
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import secrets
@@ -37,6 +38,7 @@ OPEN_TTL_S = 3600                  # an unbound upload is deleted after this
 KEEP_S = 24 * 3600                 # = the gateway's media cache age (MEDIA_CACHE_MAX_AGE_HOURS)
 MAX_INDEX = 500                    # uploads kept in the index (oldest bound ones are forgotten first)
 NAME_MAX = 80
+NAME_BYTES = 200                   # UTF-8 bytes of a name: ``doc_<12>_<name>`` stays below NAME_MAX of ext4 (255)
 ID_RE = re.compile(r"up_[0-9a-f]{24}")
 
 IMAGE, DOCUMENT = "image", "document"
@@ -91,15 +93,17 @@ def sniff(data: bytes, name: str = "") -> Optional[Tuple[str, str, str]]:
 
 def clean_name(name: Any, ext: str) -> str:
     """A display/file name: base name only, no control/format (bidi, zero-width) characters, only
-    letters, digits, space and ``._()-``, at most ``NAME_MAX`` characters, ending in *ext*."""
+    letters, digits, space and ``._()-``, at most ``NAME_MAX`` characters and ``NAME_BYTES`` UTF-8 bytes
+    (whole characters), ending in *ext*."""
     raw = name if isinstance(name, str) else ""
     raw = unicodedata.normalize("NFC", raw).replace("\\", "/").rsplit("/", 1)[-1]
     raw = "".join(ch for ch in raw if unicodedata.category(ch)[0] != "C")
     stem = os.path.splitext(raw)[0] if _ext(raw) else raw
     stem = re.sub(r"[^\w .()-]", "_", stem, flags=re.UNICODE)
     stem = re.sub(r"\s+", " ", stem).strip(" ._")
-    stem = stem[:NAME_MAX - len(ext)].rstrip(" ._") or "anhang"
-    return stem + ext
+    stem = stem[:NAME_MAX - len(ext)]
+    stem = stem.encode("utf-8")[:NAME_BYTES - len(ext.encode("utf-8"))].decode("utf-8", "ignore")
+    return (stem.rstrip(" ._") or "anhang") + ext
 
 
 def _secure_dir(folder: Path) -> None:
@@ -172,10 +176,15 @@ class Uploads:
         shown = clean_name(name, ext)
         upload_id = "up_" + secrets.token_hex(12)
         folder = _cache_dir(self.home, kind)
-        _secure_dir(folder)
         filename = (f"img_{upload_id[3:15]}{ext}" if kind == IMAGE
                     else f"doc_{upload_id[3:15]}_{shown}")      # doc_<id>_<name>: the gateway shows <name>
-        path = _write(folder, filename, data)
+        try:
+            _secure_dir(folder)
+            path = _write(folder, filename, data)
+        except OSError as exc:                                  # disk full, name too long, permissions
+            code = errno.errorcode.get(exc.errno or 0, "OSError")
+            raise UploadError(500, "storage failed",
+                              f"Die Datei ließ sich im Medien-Cache von Hermes nicht speichern ({code}).") from None
         rec = {"id": upload_id, "session_key": session_key, "name": shown, "type": media_type,
                "size": len(data), "kind": kind, "path": str(path), "created": self.clock(), "bound": None}
         with self._lock:
@@ -215,6 +224,18 @@ class Uploads:
                     self._forget(upload_id, delete=True)
                 elif age > KEEP_S or not os.path.exists(rec["path"]):
                     self._forget(upload_id, delete=False)
+
+    def discard(self, session_key: str, upload_id: str) -> str:
+        """The owner took an unsent attachment back (the chip's ✕): ``"deleted"`` (index entry and file
+        gone), ``"unknown"`` (none of THIS session) or ``"bound"`` (already part of a message — stays)."""
+        with self._lock:
+            rec = self._items.get(upload_id)
+            if rec is None or rec["session_key"] != session_key:
+                return "unknown"
+            if rec["bound"]:
+                return "bound"
+            self._forget(upload_id, delete=True)
+            return "deleted"
 
     # -- read ----------------------------------------------------------------------------------
     def file(self, session_key: str, upload_id: str) -> Optional[Tuple[str, str, str, str]]:

@@ -98,14 +98,18 @@ produced; its fields are in the snapshot's `session`.
   HEIC/HEIF → `kind: document`, `type: application/octet-stream` (the vision path cannot decode HEIC
   without `pillow_heif`); PDF; docx/xlsx/pptx (ZIP head + that extension); UTF-8 text without NUL for
   `.txt .md .csv .json .log .yaml .yml`. Anything else `415` (SVG, executables, archives). `name` is
-  cleaned (base name only, control/bidi/format characters removed, only `[\w .()-]`, ≤ 80 characters,
-  the extension of the detected type). `400` bad base64 / empty, `429` more than 20 uploads of this
-  session not sent yet, `501` uploads not set up. Stored in the profile's media cache like a Telegram
+  cleaned (base name only, control/bidi/format characters removed, only `[\w .()-]`, ≤ 80 characters
+  and ≤ 200 UTF-8 bytes, the extension of the detected type). `400` bad base64 / empty, `429` more than
+  20 uploads of this session not sent yet, `501` uploads not set up, `500 storage failed` with the errno
+  name in `grund` when the cache cannot take the file (disk full, permissions). Stored in the profile's media cache like a Telegram
   download (`get_hermes_dir("cache/images"|"cache/documents", home=<plugin home>)`; directory 0700, file
   0600 with `O_EXCL`); the gateway's hourly housekeeping removes files older than 24 h, the plugin
   deletes an upload not bound to a message after 1 h. The index lives in the plugin process only.
 * `GET /v1/s/{key}/uploads/{upload_id}` → the file of an upload of THIS session (else `404`), an image
   with its own type, everything else `application/octet-stream`; `X-Content-Type-Options: nosniff`.
+* `DELETE /v1/s/{key}/uploads/{upload_id}` (no body, else `400`) → `{deleted: upload_id}`: an upload of
+  THIS session not sent yet goes, file included (the board chip's ✕; frees the `429` quota). Sent → `409`,
+  unknown or another session's → `404`.
 * `POST /v1/s/{key}/messages {text, client_message_id, attachments: [upload_id, …]}` (WB-1174): 1–10
   upload ids of this session, not sent yet, no repeats (else `400`, nothing sent); `text` may then be
   empty. Sent with `inject_message(…, media_urls=[paths], media_types=[types])` — the turn gets them like
