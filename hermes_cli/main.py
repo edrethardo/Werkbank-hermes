@@ -1732,8 +1732,32 @@ _CHAT_PASSTHROUGH = (
 )
 
 
+def _apply_sandbox_config(args) -> None:
+    """``--sandbox-config FILE`` (WB-1176): pin FILE's strict-Docker terminal policy before ANY
+    provider/model work, or exit 2. No-op without the flag."""
+    path = getattr(args, "sandbox_config", None)
+    if not path:
+        return
+    # TUI and --worktree hand the run to a child process / another cwd the pin does not cover.
+    for flag, attr in (("--tui", "tui"), ("--tui-native", "tui_native"), ("--dev", "tui_dev"),
+                       ("--worktree", "worktree")):
+        if getattr(args, attr, False):
+            print(f"Error: --sandbox-config cannot be combined with {flag}", file=sys.stderr)
+            sys.exit(2)
+    from hermes_cli import sandbox_config
+
+    try:
+        cfg = sandbox_config.load_sandbox_config(path)
+    except sandbox_config.SandboxConfigError as exc:
+        print(f"Error: --sandbox-config refused: {exc}", file=sys.stderr)
+        sys.exit(2)
+    sandbox_config.apply_sandbox_config(cfg)
+    args.cli = True  # classic in-process REPL/one-shot only (display.interface: tui must not win)
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    _apply_sandbox_config(args)
     _apply_safe_mode(args)
     _apply_user_config_bypass(args)
     _guard_noninteractive_user_config(args)

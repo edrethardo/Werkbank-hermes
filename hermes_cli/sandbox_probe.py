@@ -218,10 +218,58 @@ def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None
     }
 
 
+def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
+    """Report for ``hermes chat --sandbox-config FILE`` (WB-1176): same loader as the start path.
+
+    The effective policy is READ through the terminal tool's own accessor under the run's pin,
+    then compared with the file's projection; ``config_sha256`` is FILE's hash only when every
+    terminal setting the run reads comes from FILE (else ``overrides`` names the drift).
+    """
+    from hermes_cli import sandbox_config
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+    from hermes_constants import get_hermes_home
+    from tools.terminal_scope import process_terminal_pin, terminal_env
+
+    try:
+        cfg = sandbox_config.load_sandbox_config(run_config)
+    except sandbox_config.SandboxConfigError as exc:
+        raise ProbeError(str(exc)) from exc
+    missing = object()
+    names = sorted(set(TERMINAL_CONFIG_ENV_MAP.values()) | set(cfg.policy))
+    with process_terminal_pin(cfg.policy):
+        seen = {name: terminal_env(name, missing) for name in names}  # type: ignore[arg-type]
+    overrides = sorted(name for name in names
+                       if (None if seen[name] is missing else seen[name]) != cfg.policy.get(name))
+    policy = sandbox_config.read_policy(cfg.policy)
+    home = Path(get_hermes_home())
+    auth_reasons = _auth_reasons(policy, home)
+    effective_sha = None if overrides else cfg.sha256
+    return {
+        "mode": "sandbox-config",
+        "strict": bool(policy.get("docker_strict")) and policy.get("env_type") == "docker",
+        "config_sha256": effective_sha,
+        "docker_network": policy.get("docker_network") is not False,
+        "auth_exposed": bool(auth_reasons),
+        "backend": "docker",
+        "profile": _profile_name(home),
+        "hermes_home": str(home),
+        "config_path": cfg.path,
+        "requested_config": cfg.path,
+        "requested_config_sha256": cfg.sha256,
+        "config_matches": effective_sha is not None,
+        "overrides": overrides,
+        "auth_reasons": auth_reasons,
+        "strict_reason": None,
+    }
+
+
 def cmd_sandbox_probe(args) -> int:
     as_json = bool(getattr(args, "json", False))
     try:
-        report = probe(Path(args.config))
+        if getattr(args, "sandbox_config", None):
+            report = probe_sandbox_config(Path(args.sandbox_config))
+        else:
+            report = probe(Path(args.config))
     except ProbeError as exc:
         if as_json:
             print(json.dumps({"error": str(exc)}))

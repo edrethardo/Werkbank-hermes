@@ -44,6 +44,42 @@ class TerminalPolicyRefusal(Dict[str, str]):
         self.reason = reason
 
 
+# Process-wide run pin (``hermes chat --sandbox-config``, WB-1176): a COMPLETE ``TERMINAL_*`` policy
+# that outranks every per-turn scope and the process env for the rest of this process. A plain
+# global, not a ContextVar: agent worker threads must see it too. None = no pin (legacy behavior).
+_process_terminal_pin: Optional[Dict[str, str]] = None
+
+
+def pin_process_terminal_policy(mapping: Dict[str, str]) -> None:
+    """Make *mapping* the only terminal policy of this process (never widened afterwards)."""
+    global _process_terminal_pin
+    if _process_terminal_pin is not None and _process_terminal_pin != mapping:
+        raise RuntimeError("a different terminal policy is already pinned for this process")
+    _process_terminal_pin = dict(mapping)
+
+
+def get_process_terminal_pin() -> Optional[Dict[str, str]]:
+    return None if _process_terminal_pin is None else dict(_process_terminal_pin)
+
+
+def _clear_process_terminal_pin() -> None:
+    """Tests and the read-only probe only: a running chat never drops its pin."""
+    global _process_terminal_pin
+    _process_terminal_pin = None
+
+
+@contextmanager
+def process_terminal_pin(mapping: Dict[str, str]) -> Iterator[None]:
+    """Pin *mapping* for a bounded read (``sandbox-probe``), restoring the previous pin after."""
+    global _process_terminal_pin
+    previous = _process_terminal_pin
+    _process_terminal_pin = dict(mapping)
+    try:
+        yield
+    finally:
+        _process_terminal_pin = previous
+
+
 def set_terminal_scope(mapping: Optional[Dict[str, str]]) -> Token:
     """Install *mapping* as the current context's terminal policy."""
     return _terminal_scope_var.set(mapping)
@@ -54,7 +90,9 @@ def reset_terminal_scope(token: Token) -> None:
 
 
 def get_terminal_scope() -> Optional[Dict[str, str]]:
-    """The active scope mapping/refusal, or ``None`` when no scope is bound."""
+    """The active scope mapping/refusal, or ``None`` when no scope is bound (a process pin counts)."""
+    if _process_terminal_pin is not None:
+        return _process_terminal_pin
     return _terminal_scope_var.get()
 
 
@@ -76,8 +114,12 @@ def terminal_env(name: str, default: str = "") -> str:
     """Authoritative read of a ``TERMINAL_*`` variable.
 
     No scope: process env, then *default*. Refusal scope: raise. Policy scope: ONLY the
-    policy; a missing key yields *default*, never os.environ.
+    policy; a missing key yields *default*, never os.environ. A process pin outranks both.
     """
+    pin = _process_terminal_pin
+    if pin is not None:
+        value = pin.get(name)
+        return default if value is None else str(value)
     scope = _terminal_scope_var.get()
     if scope is None:
         return os.environ.get(name, default)
