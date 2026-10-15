@@ -22,15 +22,17 @@ def _valid_client_message_id(value: Any) -> bool:  # fork: werkbank-chat
             and value.isprintable())  # fork: werkbank-chat
 
 
-def _valid_media(urls: Any, types: Any, home: Any) -> bool:  # fork: werkbank-chat
+def _checked_media(urls: Any, types: Any, home: Any) -> Optional[list]:  # fork: werkbank-chat
     """Attachments a plugin may hand to a turn: equally long lists (1..10) of absolute paths of regular
     files whose real path lies in the plugin profile's media cache (``<home>/cache``, or a populated
     legacy ``image_cache``/``document_cache``; never a link) and ``type/subtype``
-    strings. The plugin is host code; this keeps a slip from handing the agent an arbitrary file."""
+    strings. The plugin is host code; this keeps a slip from handing the agent an arbitrary file.
+    Returns the CHECKED real paths (``str(real)``) — what was checked is what reaches the turn — or
+    ``None``."""
     if not isinstance(urls, list) or not isinstance(types, list) or not 0 < len(urls) <= _MEDIA_MAX:  # fork: werkbank-chat
-        return False  # fork: werkbank-chat
+        return None  # fork: werkbank-chat
     if len(types) != len(urls) or home is None:  # fork: werkbank-chat
-        return False  # fork: werkbank-chat
+        return None  # fork: werkbank-chat
     import os  # fork: werkbank-chat
     from pathlib import Path  # fork: werkbank-chat
     try:  # fork: werkbank-chat
@@ -39,20 +41,22 @@ def _valid_media(urls: Any, types: Any, home: Any) -> bool:  # fork: werkbank-ch
             get_hermes_dir(new, old, home=Path(home)).resolve()  # fork: werkbank-chat
             for new, old in (("cache/images", "image_cache"), ("cache/documents", "document_cache"))]  # fork: werkbank-chat
     except (OSError, RuntimeError):  # fork: werkbank-chat
-        return False  # fork: werkbank-chat
+        return None  # fork: werkbank-chat
+    checked = []  # fork: werkbank-chat
     for url, mtype in zip(urls, types):  # fork: werkbank-chat
         if not isinstance(url, str) or not os.path.isabs(url) or not isinstance(mtype, str):  # fork: werkbank-chat
-            return False  # fork: werkbank-chat
+            return None  # fork: werkbank-chat
         if not _MEDIA_TYPE_RE.fullmatch(mtype):  # fork: werkbank-chat
-            return False  # fork: werkbank-chat
+            return None  # fork: werkbank-chat
         try:  # fork: werkbank-chat
             real = Path(url).resolve(strict=True)  # fork: werkbank-chat
         except (OSError, RuntimeError):  # fork: werkbank-chat
-            return False  # fork: werkbank-chat
+            return None  # fork: werkbank-chat
         if (not real.is_file() or Path(url).is_symlink()  # fork: werkbank-chat
                 or not any(real.is_relative_to(root) for root in roots)):  # fork: werkbank-chat
-            return False  # fork: werkbank-chat
-    return True  # fork: werkbank-chat
+            return None  # fork: werkbank-chat
+        checked.append(str(real))  # fork: werkbank-chat — the checked path, not the plugin's spelling
+    return checked  # fork: werkbank-chat
 
 
 def inject_plugin_message(
@@ -86,7 +90,8 @@ def inject_plugin_message(
         logger.warning("inject_message: reply_to_message_id must be 1-20 ASCII digits")  # fork: werkbank-chat
         return False  # fork: werkbank-chat
     media = media_urls is not None or media_types is not None  # fork: werkbank-chat
-    if media and not _valid_media(media_urls, media_types, manager.home_path):  # fork: werkbank-chat
+    real_media = _checked_media(media_urls, media_types, manager.home_path) if media else None  # fork: werkbank-chat
+    if media and real_media is None:  # fork: werkbank-chat
         logger.warning("inject_message: media_urls/media_types must name files in the profile's cache")  # fork: werkbank-chat
         return False  # fork: werkbank-chat
     if not ctx._gateway_injection_allowed():
@@ -122,7 +127,7 @@ def inject_plugin_message(
     if reply_to_message_id is not None:  # fork: werkbank-chat
         target["reply_to_message_id"] = reply_to_message_id  # fork: werkbank-chat
     if media:  # fork: werkbank-chat
-        target["media_urls"], target["media_types"] = list(media_urls), list(media_types)  # fork: werkbank-chat
+        target["media_urls"], target["media_types"] = real_media, list(media_types)  # fork: werkbank-chat
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:

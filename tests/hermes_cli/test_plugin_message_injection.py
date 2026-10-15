@@ -1,5 +1,6 @@
 """Tests for plugin message injection across CLI and gateway hosts."""
 
+from pathlib import Path
 from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -476,3 +477,17 @@ def test_gateway_injection_rejects_malformed_media(tmp_path, monkeypatch):
         assert context.inject_message("x", session_key="agent:main:telegram:dm:42",
                                       media_urls=urls, media_types=types) is False, (urls, types)
     injector.assert_not_called()
+
+
+def test_gateway_injection_forwards_the_checked_real_path(tmp_path, monkeypatch):
+    """The path the gateway gets is the one that was checked (``resolve``), not the plugin's spelling:
+    ``…/cache/images/../images/x`` or a linked parent directory never reach the turn as given."""
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    path = _cached_file(manager)
+    detour = str(manager.home_path / "cache" / "images" / ".." / "images" / "img_abc.png")
+    assert context.inject_message("x", session_key="agent:main:telegram:dm:42",
+                                  media_urls=[detour], media_types=["image/png"]) is True
+    assert injector.call_args.kwargs["media_urls"] == [str(Path(path).resolve())]
