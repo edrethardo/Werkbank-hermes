@@ -14,7 +14,11 @@ def build_sandbox_probe_parser(subparsers, *, cmd_sandbox_probe: Callable) -> No
         description="Report the terminal policy a run of this profile would ACTUALLY use "
             "(strict Docker on/off, sha256 of the governing config.yaml, network, credential "
             "exposure). Read-only: starts nothing, changes nothing.")
-    parser.add_argument("--config", required=True, metavar="FILE",
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config", metavar="FILE",
         help="The run's config file to compare against the effective config")
+    source.add_argument("--sandbox-config", dest="sandbox_config", metavar="FILE",
+        help="Report the policy `hermes chat --sandbox-config FILE` would run with (WB-1176); "
+             "config_sha256 is FILE's hash only when exactly that policy governs the terminal")
     add_json_flag(parser, "Print one JSON object")
     parser.set_defaults(func=cmd_sandbox_probe)

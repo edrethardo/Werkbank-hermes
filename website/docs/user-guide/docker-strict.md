@@ -154,3 +154,26 @@ hermes -p <profile> sessions reserve --json
 
 This inserts exactly one new, empty session row through the session store's own write path
 and never adopts an existing id. Start that session afterwards with `--resume <id>`.
+
+## Starting a run with its own config (`chat --sandbox-config`)
+
+`--config` above checks the profile's own `config.yaml`. A launcher that writes a per-run
+file instead starts the worker with it and probes exactly that path:
+
+```bash
+hermes -p <profile> sandbox-probe --sandbox-config <run>/config.yaml --json
+hermes -p <profile> chat --resume <session> --sandbox-config <run>/config.yaml --oneshot -q "<prompt>"
+```
+
+Both go through the same loader. The file may contain only a `terminal:` section with known
+`terminal.*` keys, must say `backend: docker` and `docker_strict: true`, and must pass the
+strict volume/extra-args checks; otherwise `chat` exits 2 before any provider or model work
+and the probe exits 2. The file's section plus shipped defaults becomes the complete terminal
+policy of the process: the profile's `terminal.*`, its `.env` and `TERMINAL_*` in the
+environment no longer reach the terminal tool, also not after later config reloads. Model
+access, memory, skills and the session store stay the profile's, on the host.
+
+With `--sandbox-config` the probe's `config_sha256` is the run file's hash (and
+`"mode": "sandbox-config"`); it is `null` when any terminal setting the run reads differs from
+the file (`overrides`). `--tui` and `--worktree` are refused with `--sandbox-config`: both
+leave the process the policy is pinned in. Without the flag nothing changes.
