@@ -2829,7 +2829,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "usage", "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
-        "verify",
+        "verify", "sandbox-probe",
         # Plugin commands missing from top-level --help is an accepted trade-off.
         "help",
     }

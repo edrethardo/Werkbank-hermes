@@ -217,3 +217,11 @@ def test_cli_unparseable_config_exits_nonzero(home, monkeypatch, capsys):
     code, out = _main(monkeypatch, capsys,
                       ["sandbox-probe", "--config", str(home / "config.yaml"), "--json"])
     assert code != 0
+
+
+def test_probe_is_builtin_so_no_plugin_code_runs(monkeypatch):
+    """A probe that imported plugins first would report on a process plugins could change."""
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "-p", "werkbank", "sandbox-probe", "--config", "x"])
+    assert main_mod._plugin_cli_discovery_needed() is False

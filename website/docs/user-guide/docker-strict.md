@@ -117,3 +117,40 @@ and backend configuration wiring. Existing Docker environment/cgroup/network/
 session-isolation/config-bridge tests are run alongside them. The parent task
 performs independent real-container acceptance; mocked constructor tests alone
 are not proof of live Docker isolation.
+
+## Proving the effective policy to a launcher (`sandbox-probe`, `sessions reserve`)
+
+A config file a launcher wrote proves nothing by itself: a profile `.env`, the ambient
+environment, a managed-scope overlay or `--ignore-user-config` can change what Hermes
+actually runs with. Ask the binary instead:
+
+```bash
+hermes -p <profile> sandbox-probe --config <run-config.yaml> --json
+```
+
+It resolves the terminal policy through the same config-to-env bridge a run of that profile
+uses (on a copy of the environment) and the terminal tool's own parser, then prints one JSON
+object. Read the fields, not the exit code (non-zero only means nothing was provable):
+
+| Field | Meaning |
+|---|---|
+| `strict` | `true` only when `docker_strict` is on and the backend is Docker |
+| `config_sha256` | sha256 of the profile's `config.yaml`; `null` when no file governs the run or `overrides` is non-empty |
+| `docker_network` | `false` only for a Docker backend with `docker_network: false` |
+| `auth_exposed` | `false` only when strict and nothing forwards credentials (no `docker_forward_env`, no credential-named `docker_env`, no extra args, no bind of the Hermes home or a host credential directory); see `auth_reasons` |
+| `config_matches` | the `--config` file's bytes equal the effective `config.yaml` |
+| `overrides` | `TERMINAL_*` values where env/.env/managed scope differ from file plus defaults |
+
+The probe is read-only: it starts no container, opens no network and does not touch the
+session store. It does not prove Docker itself is healthy; a launch still fails closed when
+the container cannot be created.
+
+A trusted launcher that must bind a session id before the run starts reserves one:
+
+```bash
+hermes -p <profile> sessions reserve --json
+# {"session_id": "20261015_212739_6e2990", "profile": "<profile>", "state_db": ".../state.db"}
+```
+
+This inserts exactly one new, empty session row through the session store's own write path
+and never adopts an existing id. Start that session afterwards with `--resume <id>`.
