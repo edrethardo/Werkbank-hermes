@@ -4,8 +4,8 @@ Field names are the ones the Werkbank chat view reads (``hermes_view.js`` ``hvSn
 board ``docs/plugins.md`` "The Hermes chat view")::
 
     {epoch, seq, session_key, session_id, state: "arbeitet"|"wartet", turn_id,
-     messages: [{id, role: user|assistant|tool, text, origin, ts, tool_call_id, tool_name,
-                 is_error, truncated, message_id?, tool_calls?}],
+     messages: [{id, role: user|assistant|tool|system, text, origin, ts, tool_call_id, tool_name,
+                 is_error, truncated, message_id?, tool_calls?, kind?: system, herkunft?}],
      pending_approvals: [approval.request payload shape],
      pending_clarify:   [clarify.request payload shape],
      subagents: [{id, parent_id, status, goal?, …}],
@@ -126,6 +126,12 @@ def _row_origin(row: Dict[str, Any], origin: Optional[str], plugin_id: str) -> O
     return "werkbank" if injected_by == plugin_id else injected_by
 
 
+def _system_item(item: Dict[str, Any], plugin: str) -> Dict[str, Any]:
+    """*item* as a plugin's system line (WB-1182): its own words under the plugin's name, never a
+    user item — a board before WB-1182 skips ``role: system`` and stays as it was."""
+    return {**item, "role": "system", "kind": "system", "herkunft": plugin, "origin": plugin}
+
+
 def message_items(row: Dict[str, Any], origin: Optional[str] = None,
                   plugin_id: str = "platforms/werkbank") -> List[Dict[str, Any]]:
     """The chat items one SessionDB row stands for (WB-1175), all by markers the core wrote:
@@ -134,7 +140,9 @@ def message_items(row: Dict[str, Any], origin: Optional[str] = None,
       redirect, leftover steer) — one item per part, under the part's ``ref`` (the id its
       ``user.message`` was announced under), with the sender's own words; an internal part none;
     * a compaction handoff (``_compressed_summary``) — only the owner's part, else nothing;
-    * a gateway-internal user row (``INTERNAL_KINDS``) without a sender's id — nothing;
+    * a gateway-internal user row (``INTERNAL_KINDS``) a plugin injected without a sender's id
+      (``display_metadata.hermes_plugin_id``, WB-1182) — one system line (:func:`_system_item`);
+    * any other gateway-internal user row without a sender's id — nothing;
     * every other row — :func:`message_item`.
     """
     if row.get("role") == "user":
@@ -148,7 +156,9 @@ def message_items(row: Dict[str, Any], origin: Optional[str] = None,
                 return []
             row = {**row, "content": human}
         elif row.get("display_kind") in INTERNAL_KINDS and row_client_message_id(row) is None:
-            return []
+            plugin = _row_meta(row, "hermes_plugin_id")      # the injecting plugin (WB-1182)
+            item = message_item(row, origin, plugin_id) if plugin else None
+            return [_system_item(item, plugin)] if plugin and item is not None else []
     item = message_item(row, origin, plugin_id)
     return [] if item is None else [item]
 
@@ -164,13 +174,16 @@ def _folded_items(row: Dict[str, Any], parts: List[Any], origin: Optional[str],
         cmid = part.get("client_message_id") if isinstance(part.get("client_message_id"), str) else None
         sender = {"display_metadata": {k: part[k] for k in ("client_message_id", "hermes_plugin_id")
                                        if isinstance(part.get(k), str) and part[k]}}
-        items.append({"id": ref or f"db:{row.get('id')}#{n}", "client_message_id": cmid,
-                      "message_id": ref if ref != cmid else None, "db_id": row.get("id"),
-                      "role": "user", "ts": row.get("timestamp"),
-                      "origin": _row_origin(sender, origin, plugin_id),
-                      "tool_call_id": None, "tool_name": None, "is_error": False, "truncated": False,
-                      "text": part["text"], **({"synthetic": part["synthetic"]}
-                                                if isinstance(part.get("synthetic"), str) else {})})
+        item = {"id": ref or f"db:{row.get('id')}#{n}", "client_message_id": cmid,
+                "message_id": ref if ref != cmid else None, "db_id": row.get("id"),
+                "role": "user", "ts": row.get("timestamp"),
+                "origin": _row_origin(sender, origin, plugin_id),
+                "tool_call_id": None, "tool_name": None, "is_error": False, "truncated": False,
+                "text": part["text"], **({"synthetic": part["synthetic"]}
+                                         if isinstance(part.get("synthetic"), str) else {})}
+        plugin = sender["display_metadata"].get("hermes_plugin_id")
+        # a plugin's part without a sender's id (a wake order folded into the turn, WB-1182)
+        items.append(_system_item(item, plugin) if plugin and not cmid else item)
     return items
 
 

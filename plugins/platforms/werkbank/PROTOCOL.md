@@ -42,7 +42,7 @@ WB-1126 event types, the WB-1132 field names and snapshot obligations). The boar
 
 | type | id | payload |
 |---|---|---|
-| `user.message` | client_message_id, else platform message id | `delivery` (`turn`\|`nachgeschoben`\|`eingereiht`), `text`, `client_message_id`, `message_id`, `internal`, `media_count`, optional `merged_into`, `interrupt`, `synthetic` (`goal_kickoff`\|`goal_continuation`) |
+| `user.message` | client_message_id, else platform message id | `delivery` (`turn`\|`nachgeschoben`\|`eingereiht`), `text`, `client_message_id`, `message_id`, `internal`, `media_count`, optional `merged_into`, `interrupt`, `synthetic` (`goal_kickoff`\|`goal_continuation`), `injected_by` (the injecting plugin's id for a plugin injection, also without `client_message_id` — WB-1182) |
 | `turn.start` | turn id | `message_id`, `run_generation` |
 | `text.delta` | – (parent = turn) | `text` |
 | `text.interim` | – | `text`, `already_streamed` |
@@ -118,9 +118,10 @@ produced; its fields are in the snapshot's `session`.
 ```json
 {"epoch": 91926958000, "seq": 25, "session_key": "…", "session_id": "…",
  "state": "arbeitet|wartet", "turn_id": "turn_…|null",
- "messages": [{"id", "client_message_id", "message_id", "db_id", "role": "user|assistant|tool",
+ "messages": [{"id", "client_message_id", "message_id", "db_id", "role": "user|assistant|tool|system",
                "text", "origin", "ts", "tool_call_id", "tool_name", "is_error", "truncated",
-               "tool_calls?": [{"id", "name"}], "delivery?", "from_buffer?"}],
+               "tool_calls?": [{"id", "name"}], "delivery?", "from_buffer?",
+               "kind?": "system", "herkunft?": "<plugin id>"}],
  "pending_approvals": [approval.request payload], "pending_clarify": [clarify.request payload + awaiting_text],
  "subagents": [{"id", "parent_id", "status", "goal?", …}],
  "session": {"model", "context_percent", "tool_count", "errors"}}
@@ -159,6 +160,14 @@ produced; its fields are in the snapshot's `session`.
   a standalone handoff nothing; a user row with `display_kind` `hidden`, `internal_notification`,
   `async_delegation_complete` or `process_complete` is not shown unless it names a sender's
   `client_message_id` (a board message is injected as an internal event).
+* **A plugin's own words (WB-1182): a system line.** A plugin injection WITHOUT a
+  `client_message_id` (the Werkbank wake order `werkbank_admin_wake`: `ctx.inject_message(text,
+  origin=…)`) still names its plugin: the gateway stores `hermes_plugin_id` on the row (via
+  `client_message_metadata`), sets `injected_by` on its `user.message`, and a folded part keeps
+  `hermes_plugin_id` with the plugin's text. Such a gateway-internal row (or folded part) becomes
+  `{role: "system", kind: "system", herkunft: <plugin id>, origin: <plugin id>, text, id: db:<row>}`
+  — never a user message, never by its text. A board before WB-1182 skips `role: system`. Internal
+  rows without a plugin stay hidden; the board's own messages (with a client id) stay user messages.
 * **Where a buffered message stands (WB-1175):** before the first history row whose id lies above
   its mark (the session's highest row id when it was announced) — row ids only grow, the clock is
   never read; without a mark at the end.
