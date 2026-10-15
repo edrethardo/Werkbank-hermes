@@ -300,3 +300,29 @@ def test_probe_config_mode_requires_exactly_one_source():
         _parse(["sandbox-probe", "--json"])
     with pytest.raises(SystemExit):
         _parse(["sandbox-probe", "--config", "a", "--sandbox-config", "b"])
+
+
+def test_a_strict_profile_with_other_mounts_still_loses_to_the_run_file(run, monkeypatch, docker_calls,
+                                                                      tmp_path):
+    """Profile AND env describe valid strict Docker, but with other mounts: the file still wins,
+    and the probe's hash is the file's (a swapped merge passes validation here and must still fail)."""
+    other = tmp_path / "profile_mount"
+    other.mkdir()
+    (run["home"] / "config.yaml").write_text(json.dumps({"terminal": {
+        "backend": "docker", "docker_strict": True, "docker_network": True,
+        "docker_volumes": [f"{other}:/other:rw"], "container_disk": 0}}), encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_STRICT", "true")
+    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "true")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{other}:/env:rw"]))
+    rc, report = _probe_json(["--sandbox-config", str(run["config"])])
+    assert rc == 0, report
+    assert report["overrides"] == []
+    assert report["config_sha256"] == hashlib.sha256(run["config"].read_bytes()).hexdigest()
+    assert report["docker_network"] is False
+
+    seen: dict = {}
+    _start(monkeypatch, run["config"], seen, docker_calls)
+    assert seen["mounts"] == run["terminal"]["docker_volumes"]
+    assert seen["cfg"]["docker_network"] is False and seen["network_none"] is True
+    assert report["config_sha256"] == seen["applied"].sha256
