@@ -8,6 +8,7 @@ import logging
 import threading
 from typing import Optional
 
+from agent import folded_messages  # fork: werkbank-chat
 from agent.interrupt_compat import request_hard_interrupt
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
@@ -272,7 +273,8 @@ class InterruptControlMixin:
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            # fork: werkbank-chat — the folded messages' ids ride with the text (WB-1175)
+            self._pending_steer = folded_messages.join(existing, text, cleaned, "\n")
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
         return True
@@ -305,7 +307,7 @@ class InterruptControlMixin:
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = self.steer(cleaned)
+            accepted = self.steer(folded_messages.strip(text))  # fork: werkbank-chat — keeps the parts
             if accepted:
                 tracker = getattr(self, "_tool_worker_threads", None)
                 tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
@@ -323,9 +325,8 @@ class InterruptControlMixin:
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
                 return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
-            )
+            self._pending_redirect = folded_messages.join(  # fork: werkbank-chat (WB-1175)
+                existing, text, cleaned, "\n\n[Additional user correction]\n")
             self._interrupt_requested = True
             self._interrupt_message = None
             self._turn_user_intervened = True

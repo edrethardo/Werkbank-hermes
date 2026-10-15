@@ -3747,16 +3747,15 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
     # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
     # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
     # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
+    # fork: werkbank-chat — folded_messages.join keeps the folded messages' ids (WB-1175)
+    from agent import folded_messages
     _lock = getattr(agent, "_pending_steer_lock", None)
     if _lock is not None:
         with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
+            agent._pending_steer = folded_messages.join(agent._pending_steer, steer_text, steer_text, "\n")
     else:
         existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+        agent._pending_steer = folded_messages.join(existing, steer_text, steer_text, "\n")
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:

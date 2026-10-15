@@ -62,7 +62,8 @@ def test_an_unnamed_row_never_absorbs_an_announced_message_by_its_text(plugin_se
     # same text, written right after, but not this message's row (no id on it): both stay
     srv.host.messages = [{"id": 5, "role": "user", "content": "[Werkbank] weiter", "timestamp": S1 + 5}]
     snap = call(srv.port, "GET", session_path("snapshot"), srv.key)[1]
-    assert [m["id"] for m in _users(snap)] == ["db:5", "wb-9"]
+    # WB-1175: the buffered one stands at its row mark (announced before row 5 was written)
+    assert [m["id"] for m in _users(snap)] == ["wb-9", "db:5"]
 
 
 def test_a_platform_row_keeps_its_platform_id(plugin_server):

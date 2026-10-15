@@ -30,6 +30,7 @@ from gateway.response_filters import (
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.run_plugin_injection import client_message_metadata  # fork: werkbank-chat
+from agent import folded_messages as _folded  # fork: werkbank-chat
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -3682,7 +3683,8 @@ class GatewayTurnMixin:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
-        leftover_steer = (result.get("pending_steer") or "").strip() if result else None
+        # fork: werkbank-chat — strip keeps the folded messages' ids (WB-1175)
+        leftover_steer = _folded.strip(result.get("pending_steer") or "") if result else None
         if leftover_steer:
             if not pending and not pending_event:
                 pending = leftover_steer
@@ -3963,7 +3965,10 @@ class GatewayTurnMixin:
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
-                    **client_message_metadata(pending_event)} or None,  # fork: werkbank-chat
+                    **client_message_metadata(pending_event),  # fork: werkbank-chat
+                    # fork: werkbank-chat — a leftover steer names the messages it holds (WB-1175)
+                    **_folded.metadata(getattr(pending_event, "text", None) if pending_event is not None
+                                      else next_message)} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(

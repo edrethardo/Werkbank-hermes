@@ -145,6 +145,23 @@ produced; its fields are in the snapshot's `session`.
   `user.message` with a higher `seq`. A buffered message counts as written only when a row with its
   id exists — a row without an id (e.g. a turn that failed before the agent persisted) and the
   buffered message are BOTH shown rather than paired by guesswork.
+* **Folded messages (WB-1175).** A message steered or redirected into the running turn shares a
+  row with others and its `content` carries the gateway's origin preamble (a redirect also the
+  interruption scaffold in `api_content`). The core names them on the row:
+  `display_metadata.folded_messages = [{ref, text, client_message_id?, hermes_plugin_id?,
+  synthetic?} | {ref, internal: true}]` (`agent/folded_messages.py`, set by
+  `gateway/session_events.folded_part`; `ref` = the id the `user.message` was announced under).
+  Such a row becomes one user message per part — `id` = `ref` (without one `db:<row id>#<n>`),
+  `text` = the sender's own words, same `db_id`; an internal part none. That confirms the buffered
+  entry by its id. A row without the marker (an older core) stays as it is — never matched by text.
+* **Not the owner's words (WB-1175), by markers only:** a compaction handoff
+  (`_compressed_summary`) shows only the human part the core's `user_originated_turn_view` returns,
+  a standalone handoff nothing; a user row with `display_kind` `hidden`, `internal_notification`,
+  `async_delegation_complete` or `process_complete` is not shown unless it names a sender's
+  `client_message_id` (a board message is injected as an internal event).
+* **Where a buffered message stands (WB-1175):** before the first history row whose id lies above
+  its mark (the session's highest row id when it was announced) — row ids only grow, the clock is
+  never read; without a mark at the end.
 * **Final answer after `turn.done`:** the board re-syncs once after `turn.done`. When the turn's
   assistant row is not in the SessionDB yet, the snapshot carries the `final_response` of that
   `turn.done` as an assistant message (`id` = turn id, `from_buffer: true`) until an answer row of
