@@ -191,11 +191,34 @@ hermes -p <profile> sessions reserve --json
 
 This inserts exactly one new, empty session row through the session store's own write path
 and never adopts an existing id. Start that session afterwards with `--resume <id>`. The row is
-marked `created_source = reserve`; the empty-session sweep (`DELETE /api/sessions/empty`) skips
-it even when an orphan reap has ended it before the run started. A reservation that never runs
-therefore stays until it is deleted explicitly (`hermes sessions delete <id>`). A store
-outside the Hermes profile tree (no owning profile) is refused with a non-zero exit and nothing
-is written.
+marked `created_source = reserve`; for 24 hours after the reservation the empty-session sweep
+(`DELETE /api/sessions/empty`) skips it, even when an orphan reap has ended it before the run
+started. After that grace window an ended, empty reservation is swept like any other empty
+session. A store outside the Hermes profile tree (no owning profile) is refused with a non-zero
+exit and nothing is written.
+
+When the run will not start after all (for example the board refuses the worker grant), the
+launcher releases the reservation instead of waiting for the sweep:
+
+```bash
+hermes -p <profile> sessions release <session_id> --json
+# {"released": true, "session_id": "20261015_212739_6e2990", "profile": "<profile>"}
+```
+
+`release` deletes the row in one write transaction, and only when all of these hold: the id
+matches exactly (no prefix or title lookup), the row was created by `sessions reserve`, it
+belongs to this profile, and it never started (no message row, including rewound or compacted
+ones, no child session, no title, no live turn lease or compression lock). Anything else exits
+non-zero, changes nothing, prints the reason on stderr and, with `--json`, returns
+`{"released": false, "session_id": ..., "profile": ..., "reason": ...}`. The reason is one of
+`not_found`, `not_reserved`, `no_profile`, `other_profile`, `started` or `active`.
+
+Launcher contract: call `reserve`, bind the id, then either `--resume <id>` or, if the start is
+refused before any model call, `release <id>`. Treat a non-zero `release` as "keep the
+session": `started` or `active` means a run picked the id up and its transcript must not be
+deleted. The sweep only removes reservations that have been ended (and are older than 24
+hours); a launcher that crashes between the two calls leaves an open, empty row that stays until
+it is released, so a restarting launcher should `release` the ids it reserved but never started.
 
 ## Starting a run with its own config (`chat --sandbox-config`)
 

@@ -105,6 +105,15 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "its id; never reuses an existing session. Start it later with --resume <id>.")
     add_json_flag(sessions_reserve, "Print {\"session_id\", \"profile\", \"state_db\"} as JSON")
 
+    sessions_release = sessions_subparsers.add_parser(
+        "release", help="Delete a reserved session that never started (undo of reserve)",
+        description="Atomically delete one session created by `sessions reserve` in this profile "
+            "that never started (no messages, no children, no title, no live turn). Anything else is "
+            "refused with a non-zero exit and a reason; nothing is changed.")
+    sessions_release.add_argument("session_id", help="Exact reserved session id (no prefix match)")
+    add_json_flag(sessions_release,
+        "Print {\"released\", \"session_id\", \"profile\"} (+ \"reason\" on refusal) as JSON")
+
     sessions_delete = sessions_subparsers.add_parser("delete", help="Delete a specific session")
     sessions_delete.add_argument("session_id", help="Session ID to delete")
     add_yes_flag(sessions_delete, "Skip confirmation")

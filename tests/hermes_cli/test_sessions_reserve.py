@@ -182,3 +182,152 @@ def test_reserved_empty_session_survives_orphan_reap_and_empty_sweep(db):
     assert db.delete_empty_sessions() == 1
     assert db.get_session(sid) is not None
     assert db.get_session(other) is None
+
+
+# -- WB-1090 review: a refused reservation must not stay forever -------------------------------
+
+def _age(db, sid, seconds):
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET started_at = started_at - ? WHERE id = ?", (seconds, sid)))
+
+
+def test_reserved_session_older_than_24h_is_swept_when_ended_empty(db):
+    """The keep-guard is a grace window, not forever: after 24 h an ended, empty reservation is
+    an ordinary empty session (a launcher that never resumed it in a day will not)."""
+    young = db.reserve_session()
+    old = db.reserve_session()
+    _age(db, old, 24 * 3600 + 60)
+    for sid in (young, old):
+        db._execute_write(lambda conn, sid=sid: conn.execute(
+            "UPDATE sessions SET ended_at = ?, end_reason = 'startup_orphan_reap' WHERE id = ?",
+            (1.0, sid)))
+    assert db.count_empty_sessions() == 1
+    assert db.delete_empty_sessions() == 1
+    assert db.get_session(old) is None
+    assert db.get_session(young) is not None
+
+
+def test_reserved_session_just_inside_24h_is_kept(db):
+    sid = db.reserve_session()
+    _age(db, sid, 24 * 3600 - 120)
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET ended_at = ? WHERE id = ?", (1.0, sid)))
+    assert db.count_empty_sessions() == 0
+
+
+def test_release_deletes_an_unstarted_reservation(db):
+    sid = db.reserve_session()
+    assert db.release_reserved_session(sid) == (True, None)
+    assert db.get_session(sid) is None
+
+
+def test_release_allows_an_orphan_reaped_reservation(db):
+    sid = db.reserve_session()
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET ended_at = ?, end_reason = 'startup_orphan_reap' WHERE id = ?", (1.0, sid)))
+    assert db.release_reserved_session(sid) == (True, None)
+    assert db.get_session(sid) is None
+
+
+def test_release_refuses_an_unknown_id(db):
+    assert db.release_reserved_session("20261015_120000_dddddd") == (False, "not_found")
+
+
+def test_release_refuses_a_non_reserved_session(db):
+    sid = db.create_session("20261015_120000_eeeeee", source="cli")
+    assert db.release_reserved_session(sid) == (False, "not_reserved")
+    assert db.get_session(sid) is not None
+
+
+def test_release_refuses_a_started_reservation(db):
+    sid = db.reserve_session()
+    db.append_message(sid, role="user", content="hi")
+    assert db.release_reserved_session(sid) == (False, "started")
+    assert db.get_session(sid) is not None
+    assert db.message_count(sid) == 1
+
+
+def test_release_refuses_when_only_inactive_messages_remain(db):
+    """message_count counts live rows only; any message row (also active = 0) means it ran."""
+    sid = db.reserve_session()
+    db.append_message(sid, role="user", content="hi")
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE messages SET active = 0 WHERE session_id = ?", (sid,)))
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET message_count = 0 WHERE id = ?", (sid,)))
+    assert db.release_reserved_session(sid) == (False, "started")
+    assert db.get_session(sid) is not None
+
+
+def test_release_refuses_another_profiles_reservation(db):
+    sid = db.reserve_session()
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET profile_name = 'other' WHERE id = ?", (sid,)))
+    assert db.release_reserved_session(sid) == (False, "other_profile")
+    assert db.get_session(sid) is not None
+
+
+def test_release_refuses_a_reservation_with_children(db):
+    sid = db.reserve_session()
+    db.create_session("20261015_120000_ffffff", source="cli", parent_session_id=sid)
+    assert db.release_reserved_session(sid) == (False, "started")
+    assert db.get_session(sid) is not None
+
+
+def test_release_refuses_a_titled_reservation(db):
+    sid = db.reserve_session()
+    db.set_session_title(sid, "picked up")
+    assert db.release_reserved_session(sid) == (False, "started")
+    assert db.get_session(sid) is not None
+
+
+def test_release_refuses_a_reservation_with_a_live_turn_lease(db):
+    """A resumed run that holds the turn lease but has not written a message yet IS started."""
+    import os
+
+    sid = db.reserve_session()
+    holder = f"pid={os.getpid()}:turn=1"
+    assert db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=300.0) is True
+    assert db.release_reserved_session(sid) == (False, "active")
+    assert db.get_session(sid) is not None
+    db.release_session_turn_lease(sid, holder)
+    assert db.release_reserved_session(sid) == (True, None)
+
+
+def test_cli_release_json_reports_released(monkeypatch, capsys):
+    code, out = _main(monkeypatch, capsys, ["sessions", "reserve", "--json"])
+    assert code == 0, out.err
+    sid = json.loads(out.out)["session_id"]
+    code, out = _main(monkeypatch, capsys, ["sessions", "release", sid, "--json"])
+    assert code == 0, out.err
+    assert json.loads(out.out) == {"released": True, "session_id": sid, "profile": "default"}
+    db = SessionDB()
+    try:
+        assert db.get_session(sid) is None
+    finally:
+        db.close()
+
+
+def test_cli_release_refusal_exits_nonzero_with_reason(monkeypatch, capsys):
+    db = SessionDB()
+    try:
+        sid = db.create_session("20261015_120000_abcdef", source="cli")
+    finally:
+        db.close()
+    code, out = _main(monkeypatch, capsys, ["sessions", "release", sid, "--json"])
+    assert code != 0
+    rep = json.loads(out.out)
+    assert rep["released"] is False and rep["session_id"] == sid and rep["profile"] == "default"
+    assert rep["reason"] == "not_reserved"
+    assert "not_reserved" in out.err
+    db = SessionDB()
+    try:
+        assert db.get_session(sid) is not None
+    finally:
+        db.close()
+
+
+def test_cli_release_plain_unknown_id_fails(monkeypatch, capsys):
+    code, out = _main(monkeypatch, capsys, ["sessions", "release", "20261015_120000_000000"])
+    assert code != 0
+    assert "not_found" in out.err
