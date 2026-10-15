@@ -45,6 +45,9 @@ class FakeHost:
         self.outputs: dict = {}
         self.running = False
         self.lineages: dict = {}           # session_id -> compression lineage root → tip
+        self.supports_media = True          # WB-1174: inject_message(media_urls=…) known to the core
+        self.media: list = []               # attachments handed to each inject (WB-1174)
+        self.photos: list = []              # (session_key, paths, anchor) of mirror_photos (WB-1174)
 
     def posted(self, session_key, message_id):
         """A mirror the host posted (``host.PostedMirror`` shape): its id, and ``take_back``."""
@@ -60,10 +63,15 @@ class FakeHost:
                 return info["session_id"]
         return None
 
-    def inject(self, session_key, text, client_message_id, reply_to_message_id=None):
+    def inject(self, session_key, text, client_message_id, reply_to_message_id=None, **kw):
         self.injected.append((session_key, text, client_message_id))
         self.anchors.append(reply_to_message_id)
+        self.media.append(kw.get("media"))
         return self.inject_answer, self.supports_client_message_id
+
+    def mirror_photos(self, session_key, paths, anchor=None):
+        self.photos.append((session_key, list(paths), anchor))
+        return len(paths)
 
     def interrupt(self, session_key):
         self.interrupts.append(session_key)
@@ -99,15 +107,18 @@ class FakeHost:
         return self.outputs.get(tool_call_id)
 
 
-def running_server(tmp_path, fake_host, *, ring=5000, mirror=True):
-    """(server, key, buffers, host) — a running plugin server on a free port."""
+def running_server(tmp_path, fake_host, *, ring=5000, mirror=True, uploads=True):
+    """(server, key, buffers, host, uploads) — a running plugin server on a free port. Uploads (WB-1174)
+    land in ``tmp_path/cache``."""
     from plugins.platforms.werkbank import buffer, keyfile, server
+    from plugins.platforms.werkbank import uploads as uploads_mod
 
     key = keyfile.ensure_key(tmp_path)
     buffers = buffer.Buffers(plugin_id="platforms/werkbank", ring=ring, watermark=fake_host.row_watermark)
+    store = uploads_mod.Uploads(tmp_path) if uploads else None
     srv = server.WerkbankServer(key, buffers, fake_host, port=0, heartbeat=0.1,
-                                mirror_enabled=lambda: mirror).start()
-    return SimpleNamespace(server=srv, key=key, buffers=buffers, host=fake_host, port=srv.port)
+                                mirror_enabled=lambda: mirror, uploads=store).start()
+    return SimpleNamespace(server=srv, key=key, buffers=buffers, host=fake_host, port=srv.port, uploads=store)
 
 
 def call(port, method, path, key=None, body=None, timeout=5.0):

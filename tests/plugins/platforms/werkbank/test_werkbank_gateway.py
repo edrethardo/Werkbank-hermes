@@ -762,3 +762,98 @@ def test_host_row_marks_and_lineage_come_from_the_real_sessiondb(tmp_path):
         assert host.lineage(KEY_SESSION, fresh) == [fresh]
     finally:
         owner.close()
+
+
+# ── WB-1174: attachments reach the real GatewayHost and the Telegram topic ────────────────────
+
+
+class CtxMedia(CtxReply):
+    """A core with inject_message(media_urls=, media_types=) (WB-1174)."""
+
+    def inject_message(self, content, role="user", *, session_key=None, origin=None, client_message_id=None,
+                       reply_to_message_id=None, media_urls=None, media_types=None):
+        self.injected.append({"text": content, "session_key": session_key, "client_message_id": client_message_id,
+                              "reply_to_message_id": reply_to_message_id, "media_urls": media_urls,
+                              "media_types": media_types})
+        return self.accept
+
+
+class PhotoAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.photos = []
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None, **kw):
+        self.photos.append((chat_id, image_path, caption, reply_to, metadata))
+        return SimpleNamespace(success=True, message_id="901")
+
+
+def _start_with_uploads(tmp_path, ctx):
+    from plugins.platforms.werkbank import buffer, keyfile, server, uploads
+    from plugins.platforms.werkbank.host import GatewayHost
+
+    key = keyfile.ensure_key(tmp_path)
+    host = GatewayHost(ctx, tmp_path)
+    buffers = buffer.Buffers(plugin_id=PLUGIN_ID, watermark=host.row_watermark)
+    srv = server.WerkbankServer(key, buffers, host, port=0, heartbeat=0.1, mirror_enabled=lambda: True,
+                                mirror_name="Aaron", uploads=uploads.Uploads(tmp_path)).start()
+    return SimpleNamespace(server=srv, key=key, buffers=buffers, host=host, port=srv.port)
+
+
+def test_real_plugin_context_offers_media_urls():
+    from hermes_cli.plugins import PluginContext
+    from plugins.platforms.werkbank.host import accepts_kwarg
+
+    assert accepts_kwarg(PluginContext.inject_message, "media_urls")
+    assert accepts_kwarg(PluginContext.inject_message, "media_types")
+
+
+def test_an_attached_image_reaches_inject_message_and_the_topic_as_a_photo(tmp_path):
+    import base64
+
+    owner = FakeOwner()
+    owner.adapter = PhotoAdapter()
+    ctx = CtxMedia(owner)
+    srv = _start_with_uploads(tmp_path, ctx)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    try:
+        call(srv.port, "GET", f"/v1/resolve?session_id={SID}", srv.key)
+        status, up = call(srv.port, "POST", session_path("uploads"), srv.key,
+                          {"name": "bild.png", "data": base64.b64encode(png).decode()})
+        assert status == 200, up
+        status, answer = call(srv.port, "POST", session_path("messages"), srv.key,
+                              {"text": "was siehst du?", "client_message_id": "wb-1", "attachments": [up["upload_id"]]})
+        assert (status, answer) == (200, {"accepted": True})
+        sent = ctx.injected[0]
+        assert sent["media_types"] == ["image/png"] and len(sent["media_urls"]) == 1
+        assert Path(sent["media_urls"][0]).read_bytes() == png
+        assert sent["reply_to_message_id"] == "900"
+        assert owner.adapter.sent[0][1].startswith("👤 *Aaron · Werkbank*\n>was siehst du?")
+        assert "📷 bild" in owner.adapter.sent[0][1]           # the file is named in the mirror
+        deadline = time.monotonic() + 3
+        while not owner.adapter.photos and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert owner.adapter.photos == [("4711", sent["media_urls"][0], None, "900", {"thread_id": "51"})]
+    finally:
+        srv.server.stop()
+        owner.close()
+
+
+def test_a_core_without_media_support_refuses_attachments_but_not_text(tmp_path):
+    import base64
+
+    owner = FakeOwner()
+    ctx = CtxReply(owner)                   # inject_message without media_urls
+    srv = _start_with_uploads(tmp_path, ctx)
+    try:
+        call(srv.port, "GET", f"/v1/resolve?session_id={SID}", srv.key)
+        up = call(srv.port, "POST", session_path("uploads"), srv.key,
+                  {"name": "a.png", "data": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()})[1]
+        status, answer = call(srv.port, "POST", session_path("messages"), srv.key,
+                              {"text": "x", "client_message_id": "wb-2", "attachments": [up["upload_id"]]})
+        assert status == 501 and ctx.injected == [] and owner.adapter.sent == []
+        assert call(srv.port, "POST", session_path("messages"), srv.key,
+                    {"text": "x", "client_message_id": "wb-2"}) == (200, {"accepted": True})
+    finally:
+        srv.server.stop()
+        owner.close()

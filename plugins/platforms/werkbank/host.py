@@ -13,6 +13,9 @@ Feature detection against WB-1127 (built in parallel):
   server answers 501 with the reason.
 * ``PluginContext.inject_message(..., reply_to_message_id=…)`` (WB-1148) — present: Hermes' answer
   replies to the mirrored message. Missing: the answer goes out as before, without a reply.
+* ``PluginContext.inject_message(..., media_urls=…, media_types=…)`` (WB-1174) — present: board
+  attachments reach the turn like a Telegram photo/document. Missing: the server answers 501 for a
+  message with attachments; text goes on as before.
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ class GatewayHost:
         self.supports_interrupt = callable(getattr(ctx, "interrupt_session", None))
         self.supports_reply_anchor = accepts_kwarg(getattr(ctx, "inject_message", None),
                                                    "reply_to_message_id")      # WB-1148
+        self.supports_media = accepts_kwarg(getattr(ctx, "inject_message", None), "media_urls")   # WB-1174
 
     # -- the live gateway -------------------------------------------------------------------------
     def owner(self) -> Any:
@@ -79,10 +83,17 @@ class GatewayHost:
 
     # -- send / stop ----------------------------------------------------------------------------
     def inject(self, session_key: str, text: str, client_message_id: str,
-               reply_to_message_id: Optional[str] = None) -> Tuple[bool, bool]:
+               reply_to_message_id: Optional[str] = None,
+               media: Optional[List[Tuple[str, str]]] = None) -> Tuple[bool, bool]:
         """(accepted, the id travels with the message). ``reply_to_message_id``: the message Hermes'
-        answer replies to, passed only when this core knows the parameter."""
+        answer replies to, passed only when this core knows the parameter. ``media``: ``(path, type)``
+        attachments (WB-1174); refused (False) when this core cannot take them."""
         kwargs: Dict[str, Any] = {}
+        if media:
+            if not self.supports_media:
+                return False, self.supports_client_message_id
+            kwargs["media_urls"] = [path for path, _ in media]
+            kwargs["media_types"] = [mtype for _, mtype in media]
         if self.supports_client_message_id:
             kwargs["client_message_id"] = client_message_id
         if self.supports_reply_anchor and _ANCHOR_RE.fullmatch(reply_to_message_id or ""):
@@ -165,6 +176,31 @@ class GatewayHost:
         posted.message_id = message_id
         posted._landed(message_id)
         return posted
+
+    def mirror_photos(self, session_key: str, paths: List[str], anchor: Optional[str] = None) -> int:
+        """WB-1174: post the attached images into the session's chat as photos, replying to the mirror
+        (*anchor*), one after the other. Best effort, not awaited; returns how many were scheduled."""
+        chat = self._chat(session_key)
+        send = getattr(chat[0], "send_image_file", None) if chat else None
+        if not callable(send) or not paths:
+            return 0
+        _adapter, source, loop = chat
+        thread_id = getattr(source, "thread_id", None)
+        metadata = {"thread_id": str(thread_id)} if thread_id else None
+
+        async def _all():
+            for path in paths:
+                try:
+                    await send(str(source.chat_id), path, caption=None, reply_to=anchor, metadata=metadata)
+                except Exception:
+                    logger.info("werkbank: mirror photo not delivered")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_all(), loop)
+        except Exception:
+            logger.info("werkbank: mirror photos not scheduled")
+            return 0
+        return len(paths)
 
     def unmirror(self, session_key: str, message_id: str) -> bool:
         """Delete a posted mirror message. Best effort, not awaited."""
