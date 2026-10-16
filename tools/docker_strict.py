@@ -198,3 +198,20 @@ def validate_labels(labels) -> dict[str, str]:
             raise ValueError(f"docker_labels label value for {key} must match [A-Za-z0-9_.-]{{1,63}}")
         result[key] = value
     return result
+
+
+# WB-1198: the daemon a Docker environment talks to, named explicitly (e.g. a rootless daemon's
+# ``unix://$XDG_RUNTIME_DIR/docker.sock``). Only a local Unix socket: tcp/ssh would put the
+# sandbox's daemon on the network, and an unnormalized path could name another socket than the
+# one the probe reported.
+_DOCKER_HOST_RE = re.compile(r"unix:///[A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+-]+)*")
+
+
+def validate_docker_host(host) -> str:
+    """``""`` for the default daemon (``None``/empty), else the normalized ``unix:///abs/path``."""
+    if host is None or host == "":
+        return ""
+    if not isinstance(host, str) or not _DOCKER_HOST_RE.fullmatch(host) or any(
+            part in {".", ".."} for part in host[len("unix://"):].split("/")[1:]):
+        raise ValueError(f"docker_host must be a normalized unix:///absolute/path socket (got {host!r})")
+    return host

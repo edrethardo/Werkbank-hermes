@@ -35,7 +35,7 @@ def exec_prefix(env: BaseEnvironment, *, user: Optional[str] = None, interactive
         container = getattr(env, "_container_id", None)
         if not container:
             return None
-        argv = [env._docker_exe, "exec"]
+        argv = [*env._docker, "exec"]
         if interactive:
             argv.append("-i")
         if user:

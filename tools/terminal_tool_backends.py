@@ -67,6 +67,7 @@ _CONTAINER_KEYS = (
     ("docker_shm_size", "1g"), ("docker_network", True), ("docker_persist_across_processes", True),
     ("docker_shared_container_key", ""), ("docker_orphan_reaper", True), ("docker_snap_compat", False),
     ("docker_image_pinned", False), ("docker_board_socket", ""), ("docker_labels", {}),
+    ("docker_host", ""),
 )
 _DOCKER_KWARGS = (
     ("volumes", "docker_volumes", []), ("auto_mount_cwd", "docker_mount_cwd_to_workspace", False),
@@ -76,7 +77,7 @@ _DOCKER_KWARGS = (
     ("shared_container_key", "docker_shared_container_key", ""), ("shm_size", "docker_shm_size", "1g"),
     ("snap_compat", "docker_snap_compat", False), ("image_pinned", "docker_image_pinned", False),
     ("strict", "docker_strict", False), ("board_socket", "docker_board_socket", ""),
-    ("labels", "docker_labels", {}),
+    ("labels", "docker_labels", {}), ("docker_host", "docker_host", ""),
 )
 
 

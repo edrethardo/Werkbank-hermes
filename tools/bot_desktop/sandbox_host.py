@@ -71,6 +71,8 @@ def _owner_identity(env: Any) -> Dict[str, Any]:
     if container:
         ident["container"] = container
         ident["docker"] = getattr(env, "_docker_exe", "docker")
+        if getattr(env, "_docker_host", ""):  # WB-1198: the container lives on THAT daemon
+            ident["docker_host"] = env._docker_host
     return ident
 
 
@@ -90,10 +92,13 @@ def marker_sandbox_alive(marker: Dict[str, Any]) -> bool:
     if cached and now - cached[0] < 5.0:
         return cached[1]
     try:
-        proc = subprocess.run([marker.get("docker") or "docker", "inspect", "-f", "{{.State.Running}}", container],
+        from tools.docker_strict import validate_docker_host
+        host = validate_docker_host(marker.get("docker_host"))
+        argv = [marker.get("docker") or "docker", *(["--host", host] if host else [])]
+        proc = subprocess.run([*argv, "inspect", "-f", "{{.State.Running}}", container],
                               capture_output=True, text=True, timeout=15, check=False, stdin=subprocess.DEVNULL)
         alive = proc.returncode == 0 and proc.stdout.strip() == "true"
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         alive = False
     _ALIVE_CACHE[container] = (now, alive)
     return alive

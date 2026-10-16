@@ -145,6 +145,42 @@ Both keys require `docker_strict: true`; without them the `docker run` arguments
 `sandbox-probe` reports them as `board_socket` and `labels` and counts an invalid socket or label
 as `auth_exposed`.
 
+## Choosing the daemon (`docker_host`, rootless Docker)
+
+By default the Docker backend uses whatever daemon the `docker` CLI picks (`DOCKER_HOST`, the
+current CLI context, else `/var/run/docker.sock`). `docker_host` names the daemon explicitly:
+
+```yaml
+terminal:
+  backend: docker
+  docker_strict: true
+  docker_host: "unix:///run/user/1000/docker.sock"   # e.g. a rootless daemon of this user
+```
+
+Every docker CLI call of that environment (availability check, image inspect, cgroup and
+storage probes, `run`, `exec`, `inspect`, `ps`, `rm`, stream/exec helpers) then runs as
+`docker --host <docker_host> ...`; the explicit flag beats `DOCKER_HOST` and the CLI context.
+Only a normalized `unix:///absolute/path` socket is accepted (no `tcp://`/`ssh://`: the sandbox's
+daemon stays off the network); anything else is refused before Docker is called. The value is
+never a container variable. The podman CLI is refused with `docker_host` (podman uses `--url`).
+Cgroup/storage capability verdicts are cached per daemon.
+
+Why a rootless daemon: with the root daemon, a container breakout (runc/kernel bug) lands as
+root on the host. A rootless daemon runs as the user, and the container's uid 0 is that user;
+other container uids map to the user's subordinate ids (`/etc/subuid`). A breakout then lands as
+that user or a subuid, never as root. It does not protect the user's own files: bind mounts are
+still the user's, and strict Docker's own rules (no credential mounts, no network, cap-drop)
+remain the boundary for what the container sees.
+
+Caveat for `docker_run_as_host_user` on a rootless daemon: `--user <uid>:<gid>` of the host user
+is NOT the host user inside a user namespace — it maps to a subuid (`100000 + uid - 1` with the
+usual `/etc/subuid`), which cannot write bind mounts that only the host user may write (0700).
+The host user is container uid 0 there. Check the mapping before relying on writable mounts.
+
+`sandbox-probe` reports `docker_host` (the run's daemon, `null` for the default) and `rootless`
+(`true`/`false` from `docker info` of THAT daemon, whose SecurityOptions list `name=rootless`;
+`null` when it cannot be asked). That `docker info` is the probe's only Docker call.
+
 ## Proving the effective policy to a launcher (`sandbox-probe`, `sessions reserve`)
 
 A config file a launcher wrote proves nothing by itself: a profile `.env`, the ambient
@@ -172,14 +208,16 @@ plugin code. Read the fields, not the exit code (non-zero only means nothing was
 | `docker_binary` | the container CLI `find_docker()` resolves, or `null` |
 | `board_socket` | the one board socket (`source`, `target`, `present`) or `null` |
 | `labels` | the `werkbank.*` container labels |
+| `docker_host` | the daemon the run talks to (`terminal.docker_host`), `null` = CLI default |
+| `rootless` | `true`/`false`: whether that daemon runs rootless (`docker info`); `null` = could not ask |
 
 `docker_env` is checked by variable **name** (`*_KEY`, `*TOKEN*`, `*SECRET*`, …). Values are
 only screened for a few well-known key shapes (`ghp_`/`github_pat_`, `sk-`, `AKIA`/`ASIA`,
 `xoxb-`-style Slack tokens, `scheme://user:password@`); a secret in any other shape under a
 harmless name is not detected. The launcher that writes `docker_env` owns its values.
 
-The probe is read-only: it starts no container, opens no network and does not touch the
-session store. It does not prove Docker itself is healthy; a launch still fails closed when
+The probe is read-only: it starts no container (its only Docker call is a `docker info` for
+`rootless`), opens no network and does not touch the session store. It does not prove Docker itself is healthy; a launch still fails closed when
 the container cannot be created.
 
 A trusted launcher that must bind a session id before the run starts reserves one:

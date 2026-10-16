@@ -108,10 +108,11 @@ def read_policy(policy: Dict[str, str]) -> Dict[str, Any]:
 
     Runs the container start's strict checks too, including the WB-1177 board socket (all rules
     except presence: the broker may bind it after the probe, the container start re-checks the
-    live socket) and the ``werkbank.*`` labels.
+    live socket), the ``werkbank.*`` labels and the ``docker_host`` daemon (WB-1198).
     """
     from tools.docker_strict import (
-        strict_enabled, validate_board_socket, validate_extra_args, validate_labels, validate_volumes)
+        strict_enabled, validate_board_socket, validate_docker_host, validate_extra_args, validate_labels,
+        validate_volumes)
     from tools.terminal_scope import process_terminal_pin
     from tools.terminal_tool import _get_env_config
 
@@ -127,6 +128,7 @@ def read_policy(policy: Dict[str, str]) -> Dict[str, Any]:
     except OSError as exc:  # e.g. the socket's directory does not exist
         raise ValueError(f"docker_board_socket: {exc}") from exc
     validate_labels(cfg.get("docker_labels"))
+    validate_docker_host(cfg.get("docker_host"))  # WB-1198: a unix:/// socket or the default daemon
     return cfg
 
 

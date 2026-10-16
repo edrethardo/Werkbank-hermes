@@ -390,6 +390,10 @@ DEFAULT_CONFIG = {
         # never a Docker/Podman socket), and up to 4 extra "werkbank.*" container labels.
         "docker_board_socket": "",
         "docker_labels": {},
+        # WB-1198: the Docker daemon to use, as a "unix:///abs/path" socket (e.g. a rootless daemon's
+        # "unix:///run/user/1000/docker.sock"); "" = the CLI's default. Every docker call of the Docker
+        # backend passes it as `--host`; it never becomes a container variable.
+        "docker_host": "",
         # Trusted profiles sharing one Docker container identity; empty = per-profile boundary.
         "docker_shared_container_key": "",
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.

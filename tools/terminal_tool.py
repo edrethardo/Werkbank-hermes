@@ -741,9 +741,11 @@ def _get_env_config() -> Dict[str, Any]:
         docker_shm_size = _tenv("TERMINAL_DOCKER_SHM_SIZE", "1g")
         docker_board_socket = _tenv("TERMINAL_DOCKER_BOARD_SOCKET", "").strip()
         docker_labels = _parse_env_var("TERMINAL_DOCKER_LABELS", "{}", json.loads, "valid JSON")
+        docker_host = _tenv("TERMINAL_DOCKER_HOST", "").strip()
     else:
         docker_forward_env, docker_volumes, docker_env, docker_extra_args, docker_shm_size = [], [], {}, [], "1g"
         docker_board_socket, docker_labels = "", {}
+        docker_host = ""
 
     cwd, host_cwd = _resolve_config_cwd(env_type, mount_docker_cwd)
     if docker_strict and cwd in {"~", "/root"}:
@@ -792,6 +794,8 @@ def _get_env_config() -> Dict[str, Any]:
         # WB-1177: strict-only board-door socket and werkbank.* container labels.
         "docker_board_socket": docker_board_socket,
         "docker_labels": docker_labels,
+        # WB-1198: the daemon (unix:/// socket), passed to every docker call as --host.
+        "docker_host": docker_host,
         # Cross-process reuse: attach to a labeled container at startup
         # instead of starting fresh; false = per-process isolation.
         "docker_persist_across_processes": _tenv_bool("TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"),

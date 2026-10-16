@@ -283,6 +283,38 @@ def find_docker() -> Optional[str]:
     return found
 
 
+def _docker_argv(executable: str, docker_host: str = "") -> list[str]:
+    """argv prefix of every docker CLI call: ``[exe]`` or, with ``terminal.docker_host`` (WB-1198),
+    ``[exe, "--host", host]`` - the explicit flag beats ``DOCKER_HOST`` and the CLI context."""
+    return [executable, "--host", docker_host] if docker_host else [executable]
+
+
+def _as_argv(docker) -> list[str]:
+    """A docker executable (str) or an argv prefix (list) as an argv prefix."""
+    return list(docker) if isinstance(docker, (list, tuple)) else [docker]
+
+
+def docker_rootless(docker_host: str = "") -> Optional[bool]:
+    """Whether the daemon at *docker_host* (default daemon when empty) runs rootless (WB-1198):
+    ``docker info`` lists ``name=rootless`` in its SecurityOptions. ``None`` when that daemon cannot
+    be asked (no CLI, unreachable, unparseable answer) - unknown is never reported as rootless."""
+    exe = find_docker()
+    if not exe:
+        return None
+    result = _docker_query(
+        [*_docker_argv(exe, docker_host), "info", "--format", "{{json .SecurityOptions}}"], timeout=10,
+        fail="docker info (rootless check) failed: %s", nonzero="docker info (rootless check) returned %d: %s")
+    if result is None:
+        return None
+    try:
+        options = json.loads((result.stdout or "").strip() or "null")
+    except ValueError:
+        return None
+    if not isinstance(options, list):
+        return None
+    return any(str(opt).split(",", 1)[0] == "name=rootless" for opt in options)
+
+
 def docker_runtime_name(executable: str) -> str:
     """User-facing runtime name (``"Podman"`` / ``"Docker"``) for the CLI at *executable*, so
     diagnostics and pickers name the runtime actually in use."""
@@ -388,12 +420,12 @@ def _build_security_args(run_as_host_user: bool, run_exec: bool = False, snap_co
     return args if run_as_host_user else args + list(_PRIVDROP_CAP_ARGS)
 
 
-def _image_uses_init_entrypoint(docker_exe: str, image: str) -> bool:
+def _image_uses_init_entrypoint(docker_exe, image: str) -> bool:
     """True if ``image``'s entrypoint is the s6-overlay ``/init`` (own PID 1: incompatible
     with ``--init`` and a noexec /run). Any inspection failure, including an image not yet
     pulled, returns False and keeps the hardened defaults."""
     result = _docker_query(
-        [docker_exe, "image", "inspect", image, "--format", "{{json .Config.Entrypoint}}"], timeout=15,
+        [*_as_argv(docker_exe), "image", "inspect", image, "--format", "{{json .Config.Entrypoint}}"], timeout=15,
         fail="Docker: could not inspect entrypoint for %s: %s", fail_args=(image,),
         nonzero="Docker: image inspect for %s returned %d (stderr=%s)",
         exc_types=(subprocess.SubprocessError, OSError))
@@ -426,9 +458,13 @@ def _resolve_host_user_spec() -> Optional[str]:
 
 _storage_opt_ok: Optional[bool] = None  # cached result across instances
 _cgroup_limits_ok: Optional[bool] = None  # cached result across instances
+# WB-1198: the same verdicts for an explicit ``docker_host`` - a host property of THAT daemon (a
+# rootless daemon often lacks delegated cgroup controllers the root daemon has).
+_storage_opt_by_host: dict[str, bool] = {}
+_cgroup_limits_by_host: dict[str, bool] = {}
 
 
-def _cgroup_limits_available(image: str, *, strict: bool = False) -> bool:
+def _cgroup_limits_available(image: str, *, strict: bool = False, docker_host: str = "") -> bool:
     """Probe once per process whether ``--cpus``/``--memory``/``--pids-limit`` work here, via a
     throwaway ``sleep 0`` container from *image* (no extra pull). Without delegated cgroup
     controllers (unprivileged LXCs, rootless) these flags fail every start with exit 126;
@@ -436,12 +472,21 @@ def _cgroup_limits_available(image: str, *, strict: bool = False) -> bool:
     that could not run (auto-pull past the timeout, daemon cold-start, manifest/pull error)
     says nothing about cgroup support, so it degrades this spawn and is retried on the next."""
     global _cgroup_limits_ok
-    if _cgroup_limits_ok is not None:
-        return _cgroup_limits_ok
+    cached = _cgroup_limits_by_host.get(docker_host) if docker_host else _cgroup_limits_ok
+    if cached is not None:
+        return cached
 
-    docker_exe = find_docker()
-    if not docker_exe or not image:
+    def remember(verdict: bool) -> None:
+        global _cgroup_limits_ok
+        if docker_host:
+            _cgroup_limits_by_host[docker_host] = verdict
+        else:
+            _cgroup_limits_ok = verdict
+
+    found = find_docker()
+    if not found or not image:
         return False  # not cached: docker may appear later in this process
+    docker_exe = _docker_argv(found, docker_host)
 
     probe_name = f"hermes-strict-probe-{uuid.uuid4().hex[:12]}" if strict else None
     probe_args = (["--name", probe_name, "--user", _resolve_host_user_spec(),
@@ -449,7 +494,7 @@ def _cgroup_limits_available(image: str, *, strict: bool = False) -> bool:
                    "--network", "none", "--entrypoint", "sleep"] if strict else [])
     try:
         result = run_capture(
-            [docker_exe, "run", "--rm", "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
+            [*docker_exe, "run", "--rm", "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
              *probe_args, image, *(["0"] if strict else ["sleep", "0"])],
             timeout=60)
     except Exception as e:
@@ -458,9 +503,9 @@ def _cgroup_limits_available(image: str, *, strict: bool = False) -> bool:
         return False
     finally:
         if probe_name:
-            run_capture([docker_exe, "rm", "-f", probe_name], timeout=15)
+            run_capture([*docker_exe, "rm", "-f", probe_name], timeout=15)
     if result.returncode == 0:
-        _cgroup_limits_ok = True
+        remember(True)
         return True
     stderr = (result.stderr or "").strip()
     if "cgroup" not in stderr.lower():
@@ -470,7 +515,7 @@ def _cgroup_limits_available(image: str, *, strict: bool = False) -> bool:
             "Containers run without CPU/memory/PID limits until a probe succeeds.",
             result.returncode, stderr[:500])
         return False
-    _cgroup_limits_ok = False
+    remember(False)
     logger.warning(
         "Cgroup resource limits (--cpus/--memory/--pids-limit) not "
         "available in this environment. Containers will run without "
@@ -485,8 +530,9 @@ def _docker_unavailable(log_msg: str, *log_args, error: str, hint: str, exc_info
     return EnvironmentConnectionError(error, retry_hint=hint)
 
 
-def _ensure_docker_available() -> None:
-    """Fail fast with an ``EnvironmentConnectionError`` when the docker CLI/daemon is unusable."""
+def _ensure_docker_available(docker_host: str = "") -> None:
+    """Fail fast with an ``EnvironmentConnectionError`` when the docker CLI/daemon is unusable
+    (WB-1198: the daemon at *docker_host* when one is configured)."""
     docker_exe = find_docker()
     if not docker_exe:
         raise _docker_unavailable(
@@ -496,7 +542,7 @@ def _ensure_docker_available() -> None:
                   "Install Docker and ensure the 'docker' command is available.",
             hint="Install Docker (or fix PATH) and retry, or run `hermes setup terminal` to switch to Local.")
     try:
-        result = run_capture([docker_exe, "version"], timeout=5)
+        result = run_capture([*_docker_argv(docker_exe, docker_host), "version"], timeout=5)
     except FileNotFoundError:
         raise _docker_unavailable(
             "Docker backend selected but the resolved docker executable '%s' could not be executed.",
@@ -635,6 +681,11 @@ class DockerEnvironment(BaseEnvironment):
     _sudo_nopasswd_probe_supported = True
     _profile_scoped_passthrough = True
 
+    @property
+    def _docker(self) -> list[str]:
+        """argv prefix of this environment's docker CLI calls (WB-1198: with ``--host``)."""
+        return _docker_argv(getattr(self, "_docker_exe", None) or "docker", getattr(self, "_docker_host", ""))
+
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """Keep explicit docker_forward_env values out of shared snapshots."""
         return tuple(self._forward_env)
@@ -664,7 +715,14 @@ class DockerEnvironment(BaseEnvironment):
         image_pinned: bool = False,
         strict: bool = False,
         board_socket: str = "",
-        labels: dict | None = None):
+        labels: dict | None = None,
+        docker_host: str = ""):
+        # WB-1198: the daemon, named explicitly (``terminal.docker_host``, a unix:/// socket). Checked
+        # before anything talks to Docker; every CLI call then goes ``docker --host <it>``.
+        from tools.docker_strict import validate_docker_host
+        self._docker_host = validate_docker_host(docker_host)
+        if self._docker_host and docker_runtime_name(find_docker() or "docker") == "Podman":
+            raise ValueError("docker_host needs the docker CLI; podman selects its service with --url")
         self._strict = strict
         self._board_socket = board_socket or ""  # re-validated on container recreation
         board_volume: list[str] = []
@@ -713,11 +771,12 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning("docker_volumes config is not a list: %r", volumes)
             volumes = []
 
-        _ensure_docker_available()
+        _ensure_docker_available(self._docker_host)
         if strict:
             # Docker creates anonymous mounts for image VOLUME declarations.
             # Require an already-present, inspectable image rather than silently pulling.
-            inspection = run_capture([find_docker() or "docker", "image", "inspect", image,
+            inspection = run_capture([*_docker_argv(find_docker() or "docker", self._docker_host),
+                                      "image", "inspect", image,
                                       "--format", "{{json .Config.Volumes}}"], timeout=15, check=True)
             if json.loads(inspection.stdout) not in (None, {}):
                 raise ValueError("docker_strict rejects images declaring implicit VOLUME mounts")
@@ -747,7 +806,7 @@ class DockerEnvironment(BaseEnvironment):
         # competing PID-1 inits) and (b) mount /run with exec instead of noexec, or s6 stage0 dies with exit
         # 126 "Permission denied". Detected once here; defaults are kept on any inspection failure. See
         # issue #34628.
-        image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        image_uses_s6_init = _image_uses_init_entrypoint(self._docker, image)
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -840,8 +899,9 @@ class DockerEnvironment(BaseEnvironment):
     def _resource_args(self, image, cpu, memory, disk, network, shm_size, extra_args) -> list[str]:
         """cgroup-gated CPU/memory/pids limits, shm size, disk quota and network mode."""
         args: list[str] = []
-        limits_available = (_cgroup_limits_available(image, strict=True) if getattr(self, "_strict", False)
-                            else _cgroup_limits_available(image))
+        host = getattr(self, "_docker_host", "")
+        limits_available = (_cgroup_limits_available(image, strict=True, docker_host=host)
+                            if getattr(self, "_strict", False) else _cgroup_limits_available(image, docker_host=host))
         if getattr(self, "_strict", False) and not limits_available:
             raise RuntimeError("docker_strict: cgroup CPU/memory/PID limit probe failed; refusing container start")
         if limits_available:
@@ -856,7 +916,7 @@ class DockerEnvironment(BaseEnvironment):
         if shm and shm != "0" and not _extra_args_set_shm_size(extra_args):
             args.extend(["--shm-size", shm])
         if disk > 0 and sys.platform != "darwin":
-            if self._storage_opt_supported():
+            if self._storage_opt_supported(getattr(self, "_docker_host", "")):
                 args.extend(["--storage-opt", f"size={disk}m"])
             else:
                 logger.warning(
@@ -998,7 +1058,7 @@ class DockerEnvironment(BaseEnvironment):
                     "starting fresh (task=%s, profile=%s).",
                     container_id[:12], actual_image, self._image, task_label, profile_name)
                 try:
-                    run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
+                    run_capture([*self._docker, "rm", "-f", container_id], timeout=30)
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
                 return False
@@ -1011,7 +1071,7 @@ class DockerEnvironment(BaseEnvironment):
                     "container — removing it and starting fresh (task=%s, profile=%s).",
                     container_id[:12], actual_mode or "unknown", task_label, profile_name)
                 try:
-                    run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
+                    run_capture([*self._docker, "rm", "-f", container_id], timeout=30)
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
                 return False
@@ -1034,11 +1094,11 @@ class DockerEnvironment(BaseEnvironment):
         """True once ``self._image`` is in the local image store, pulling it when it is not. Called BEFORE a
         container replacement removes anything: a pull that fails must leave the old sandbox intact."""
         try:
-            probe = run_capture([self._docker_exe, "image", "inspect", self._image, "--format", "{{.Id}}"],
+            probe = run_capture([*self._docker, "image", "inspect", self._image, "--format", "{{.Id}}"],
                                 timeout=30)
             if probe.returncode == 0:
                 return True
-            pull = run_capture([self._docker_exe, "pull", self._image], timeout=900)
+            pull = run_capture([*self._docker, "pull", self._image], timeout=900)
             return pull.returncode == 0
         except (subprocess.SubprocessError, OSError) as e:
             logger.warning("Docker: could not pull %s: %s", self._image, e)
@@ -1047,7 +1107,7 @@ class DockerEnvironment(BaseEnvironment):
     def _start_container(self, container_id: str) -> Exception | None:
         """``docker start`` a stopped container; returns the failure instead of raising."""
         try:
-            run_capture([self._docker_exe, "start", container_id], timeout=30, check=True)
+            run_capture([*self._docker, "start", container_id], timeout=30, check=True)
             return None
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             return e
@@ -1060,7 +1120,7 @@ class DockerEnvironment(BaseEnvironment):
             # tini/catatonit as PID 1 reaps zombie children — but s6-overlay images already provide their
             # own /init PID 1, so adding --init there creates two competing inits and breaks startup
             # (#34628).
-            self._docker_exe, "run", "-d",
+            *self._docker, "run", "-d",
             *([] if self._image_uses_s6_init or self._snap_compat else ["--init"]),
             "--name", name,
             *label_args,
@@ -1083,7 +1143,7 @@ class DockerEnvironment(BaseEnvironment):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning("docker run failed for %s, cleaning up orphaned container: %s", container_name, e)
             subprocess.run(
-                [self._docker_exe, "rm", "-f", container_name],
+                [*self._docker, "rm", "-f", container_name],
                 capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
             raise
         container_id = result.stdout.strip()
@@ -1142,7 +1202,7 @@ class DockerEnvironment(BaseEnvironment):
         values are re-injected on every command because one container can be shared by
         multiple routed profiles in a gateway process."""
         assert self._container_id, "Container not started"
-        cmd = [self._docker_exe, "exec"]
+        cmd = [*self._docker, "exec"]
         if stdin_data is not None:
             cmd.append("-i")
 
@@ -1240,42 +1300,55 @@ class DockerEnvironment(BaseEnvironment):
         return result
 
     @staticmethod
-    def _storage_opt_supported() -> bool:
+    def _storage_opt_supported(docker_host: str = "") -> bool:
         """Whether ``--storage-opt size=`` works (only overlay2 on XFS with pquota; ext4 errors out).
         Only definitive answers are cached: a probe that could not run (daemon cold-start,
-        hello-world pull timeout) says nothing about pquota support and is retried next spawn."""
+        hello-world pull timeout) says nothing about pquota support and is retried next spawn.
+        WB-1198: with *docker_host* the probe asks THAT daemon and caches per daemon."""
         global _storage_opt_ok
-        if _storage_opt_ok is not None:
-            return _storage_opt_ok
+        cached = _storage_opt_by_host.get(docker_host) if docker_host else _storage_opt_ok
+        if cached is not None:
+            return cached
+
+        def remember(verdict: bool) -> None:
+            global _storage_opt_ok
+            if docker_host:
+                _storage_opt_by_host[docker_host] = verdict
+            else:
+                _storage_opt_ok = verdict
+
+        verdict = None
         try:
-            docker = find_docker() or "docker"
-            result = run_capture([docker, "info", "--format", "{{.Driver}}"], timeout=10)
+            docker = _docker_argv(find_docker() or "docker", docker_host)
+            result = run_capture([*docker, "info", "--format", "{{.Driver}}"], timeout=10)
             if result.returncode != 0:
                 return False  # daemon unreachable etc. is transient; retry next spawn
             if result.stdout.strip().lower() != "overlay2":
-                _storage_opt_ok = False  # storage driver is a host property
+                remember(False)  # storage driver is a host property
                 return False
             # Probe with a real create — the fastest reliable check.
-            probe = run_capture([docker, "create", "--storage-opt", "size=1m", "hello-world"], timeout=15)
+            probe = run_capture([*docker, "create", "--storage-opt", "size=1m", "hello-world"], timeout=15)
             if probe.returncode == 0:
-                _storage_opt_ok = True
+                verdict = True
+                remember(True)
                 if probe.stdout.strip():
-                    subprocess.run([docker, "rm", probe.stdout.strip()],
+                    subprocess.run([*docker, "rm", probe.stdout.strip()],
                                    capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
             elif "storage" in (probe.stderr or "").lower():
-                _storage_opt_ok = False  # daemon rejected --storage-opt: a host property
+                verdict = False
+                remember(False)  # daemon rejected --storage-opt: a host property
             # else: pull/daemon failure unrelated to storage-opt; not cached, retried next spawn
         except Exception:
             return False  # TimeoutExpired, missing binary; transient, retried next spawn
-        logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
-        return _storage_opt_ok or False
+        logger.debug("Docker --storage-opt support: %s", verdict)
+        return verdict or False
 
     def _container_image(self, container_id: str) -> Optional[str]:
         """The image reference a container was created from (``Config.Image``: the tag as given
         to ``docker run``, so it compares directly with ``docker_image``), or ``None`` when
         inspection fails (callers then keep the container: a failed probe must not churn)."""
         result = _docker_query(
-            [self._docker_exe, "inspect", "--format", "{{.Config.Image}}", container_id], timeout=10,
+            [*self._docker, "inspect", "--format", "{{.Config.Image}}", container_id], timeout=10,
             fail="docker inspect Image failed: %s", nonzero="docker inspect Image returned %d: %s")
         return (result.stdout.strip() or None) if result is not None else None
 
@@ -1283,7 +1356,7 @@ class DockerEnvironment(BaseEnvironment):
         """``HostConfig.NetworkMode`` of a container, or ``None`` when inspection fails (callers
         treat ``None`` as a mismatch under lockdown, so a failed inspect fails closed)."""
         result = _docker_query(
-            [self._docker_exe, "inspect", "--format", "{{.HostConfig.NetworkMode}}", container_id], timeout=10,
+            [*self._docker, "inspect", "--format", "{{.HostConfig.NetworkMode}}", container_id], timeout=10,
             fail="docker inspect NetworkMode failed: %s", nonzero="docker inspect NetworkMode returned %d: %s")
         return (result.stdout.strip() or None) if result is not None else None
 
@@ -1304,7 +1377,7 @@ class DockerEnvironment(BaseEnvironment):
         if environment_label := self._labels.get(_ENVIRONMENT_LABEL_KEY):
             filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={environment_label}"])
         result = _docker_query(
-            [self._docker_exe, "ps", "-a", *filters, "--format", "{{.ID}}\t{{.State}}"], timeout=10,
+            [*self._docker, "ps", "-a", *filters, "--format", "{{.ID}}\t{{.State}}"], timeout=10,
             fail="docker ps probe failed: %s — will start a fresh container",
             nonzero="docker ps probe returned %d: %s — will start a fresh container")
         if result is None:
@@ -1355,7 +1428,7 @@ class DockerEnvironment(BaseEnvironment):
             return
 
         # Capture what the worker needs — the thread can outlive ``self``.
-        docker_exe = self._docker_exe
+        docker_cmd = list(self._docker)
         log_id = container_id[:12]
 
         def _do_cleanup() -> None:
@@ -1363,7 +1436,7 @@ class DockerEnvironment(BaseEnvironment):
                                    (["rm", "-f"], "docker rm -f %s failed: %s")):
                 try:
                     subprocess.run(
-                        [docker_exe, *argv, container_id],
+                        [*docker_cmd, *argv, container_id],
                         capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning(fail_msg, log_id, e)

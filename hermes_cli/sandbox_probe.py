@@ -36,6 +36,10 @@ Contract (``hermes -p <profile> sandbox-probe --config <file> --json``), one JSO
   ``$HOME`` and the passwd entry, and the real default Hermes root from the passwd home.
 - ``board_socket``: the one approved board-door socket (``source``/``target``/``present``) or
   ``None``; ``labels``: the ``werkbank.*`` container labels (WB-1177).
+- ``docker_host`` (WB-1198): the daemon the run's docker calls name with ``--host``
+  (``terminal.docker_host``), ``None`` = the CLI default; ``rootless``: whether THAT daemon runs
+  rootless (``docker info`` SecurityOptions ``name=rootless``), ``None`` when it cannot be asked.
+  This is the probe's one Docker call: a read-only ``docker info``, no container is started.
 
 ``--config`` names the run's config file; ``config_matches`` says whether its bytes equal the
 effective config. Exit 0 = report printed (read the fields, not the exit code); non-zero =
@@ -266,6 +270,17 @@ def _docker_binary() -> Optional[str]:
         return None
 
 
+def _docker_daemon(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """``docker_host`` and ``rootless`` of the daemon a Docker run of *cfg* talks to (WB-1198)."""
+    host = str(cfg.get("docker_host") or "").strip()
+    try:
+        from tools.environments.docker import docker_rootless
+        rootless = docker_rootless(host)
+    except Exception:  # an unanswerable daemon is reported as unknown, not raised
+        rootless = None
+    return {"docker_host": host or None, "rootless": rootless if isinstance(rootless, bool) else None}
+
+
 def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Build the report for this process' HERMES_HOME (``-p`` already re-homed it)."""
     from hermes_constants import get_hermes_home
@@ -318,6 +333,7 @@ def probe(requested_config: Path, *, environ: Optional[Mapping[str, str]] = None
         "board_socket": _board_socket(cfg) if backend == "docker" else None,
         "labels": _labels(cfg) if backend == "docker" else {},
         "docker_binary": _docker_binary(),
+        **(_docker_daemon(cfg) if backend == "docker" else {"docker_host": None, "rootless": None}),
         "strict_reason": strict_reason,
     }
 
@@ -413,6 +429,7 @@ def probe_sandbox_config(run_config: Path) -> Dict[str, Any]:
         "board_socket": _board_socket(policy),
         "labels": _labels(policy),
         "docker_binary": _docker_binary(),
+        **_docker_daemon(policy),
         "strict_reason": None,
     }
 
@@ -448,6 +465,9 @@ def cmd_sandbox_probe(args) -> int:
     for key, value in sorted(report["labels"].items()):
         print(f"label:            {key}={value}")
     print(f"docker_binary:    {report['docker_binary'] or '-'}")
+    print(f"docker_host:      {report.get('docker_host') or '-'}")
+    rootless = report.get("rootless")
+    print(f"rootless:         {'unknown' if rootless is None else yes[rootless]}")
     print(f"config_sha256:    {report['config_sha256'] or '-'}")
     print(f"config_matches:   {yes[report['config_matches']]}")
     if report["overrides"]:
