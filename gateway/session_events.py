@@ -40,7 +40,8 @@ Callback contract (kwargs; narrow signatures receive only what they declare)::
     event = {"v": 1, "session_key", "session_id", "platform", "origin", "core_seq", "type", "id",
              "parent_id", "ts", "payload": {...}}
 
-Event types: ``user.message`` (delivery turn|nachgeschoben|eingereiht, client_message_id),
+Event types: ``user.message`` (delivery turn|nachgeschoben|eingereiht, client_message_id,
+``injected_by`` = the injecting plugin's id for a plugin injection),
 ``turn.start``, ``text.delta``, ``text.interim``, ``tool.start``, ``tool.progress``, ``tool.end``
 (output capped to 4 KB, ``truncated``), ``subagent.start|progress|end``, ``status``,
 ``approval.request|resolved|expired|cancelled``, ``clarify.request|resolved|expired``,
@@ -495,6 +496,10 @@ def user_message(session_key: Optional[str], event: Any, delivery: str, *, sessi
         synthetic = getattr(event, _SYNTHETIC_ATTR, None)  # fork: werkbank-chat
         if synthetic:  # fork: werkbank-chat
             payload["synthetic"] = synthetic  # fork: werkbank-chat
+        from gateway.run_plugin_injection import injecting_plugin  # fork: werkbank-chat (WB-1182)
+        injected_by = injecting_plugin(sender)  # fork: werkbank-chat
+        if injected_by:  # fork: werkbank-chat — the plugin's own words, never the owner's
+            payload["injected_by"] = injected_by  # fork: werkbank-chat
         emit(session_key, session_id or meta.get("gateway_session_id"), _source_platform(getattr(sender, "source", None)),
              "user.message", client_message_id or message_id, None, payload, origin=event_origin(sender))
     except Exception:

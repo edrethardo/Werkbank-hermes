@@ -42,7 +42,7 @@ def _telegram_event():
 def test_client_message_metadata_only_for_plugin_injections():
     assert client_message_metadata(_plugin_event()) == {"client_message_id": "wb-1",
                                                         "hermes_plugin_id": "platforms/werkbank"}
-    assert client_message_metadata(_plugin_event(cmid=None)) == {}
+    assert client_message_metadata(_plugin_event(cmid=None)) == {"hermes_plugin_id": "platforms/werkbank"}  # WB-1182
     assert client_message_metadata(_telegram_event()) == {}
     internal_no_plugin = MessageEvent(text="wake", source=_source(), internal=True,
                                       metadata={"client_message_id": "x"})
