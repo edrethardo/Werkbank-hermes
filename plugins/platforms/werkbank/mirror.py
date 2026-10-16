@@ -139,6 +139,22 @@ def plain_block(text: str, name: str) -> str:
     return HEADER.format(name=plain_name(name)) + "\n```\n" + utf16_cap(body, MIRROR_MAX) + "\n```"
 
 
+def _size(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB".replace(".", ",")
+    return f"{max(1, round(n / 1024))} KB"
+
+
+def with_attachments(text: str, files) -> str:
+    """WB-1174: the mirrored text plus one line per attachment (``📷`` image, ``📎`` file, name and
+    size); the images follow as photos replying to the mirror. No attachments: *text* unchanged."""
+    if not files:
+        return text
+    lines = "\n".join(("📷 " if f.get("kind") == "image" else "📎 ") + f"{f.get('name')} ({_size(int(f.get('size') or 0))})"
+                      for f in files)
+    return f"{text.rstrip()}\n\n{lines}" if text.strip() else lines
+
+
 def for_platform(platform: Optional[str], text: str, name: str):
     """``(content, extra metadata)`` for a send into a chat on *platform*."""
     if platform == "telegram":

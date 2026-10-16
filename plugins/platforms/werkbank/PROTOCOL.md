@@ -42,7 +42,7 @@ WB-1126 event types, the WB-1132 field names and snapshot obligations). The boar
 
 | type | id | payload |
 |---|---|---|
-| `user.message` | client_message_id, else platform message id | `delivery` (`turn`\|`nachgeschoben`\|`eingereiht`), `text`, `client_message_id`, `message_id`, `internal`, `media_count`, optional `merged_into`, `interrupt`, `synthetic` (`goal_kickoff`\|`goal_continuation`), `injected_by` (the injecting plugin's id for a plugin injection, also without `client_message_id` — WB-1182) |
+| `user.message` | client_message_id, else platform message id | `delivery` (`turn`\|`nachgeschoben`\|`eingereiht`), `text`, `client_message_id`, `message_id`, `internal`, `media_count`, optional `merged_into`, `interrupt`, `synthetic` (`goal_kickoff`\|`goal_continuation`), `injected_by` (the injecting plugin's id for a plugin injection, also without `client_message_id` — WB-1182), `attachments` (WB-1174, plugin: a board message's uploads `[{id, name, type, size, kind}]`) |
 | `turn.start` | turn id | `message_id`, `run_generation` |
 | `text.delta` | – (parent = turn) | `text` |
 | `text.interim` | – | `text`, `already_streamed` |
@@ -91,6 +91,33 @@ produced; its fields are in the snapshot's `session`.
   to the turn replies to that message (WB-1148). The `200` waits for that mirror at most 5 s. No
   mirror when the gateway cannot take the message (not running, draining, injection not allowed);
   a mirror whose message is refused anyway is deleted, a late one as soon as it lands.
+* `POST /v1/s/{key}/uploads {name, data}` (WB-1174, `uploads.py`) → `{upload_id, name, type, size, kind}`.
+  ONE file, `data` base64; the request body may be up to 28 MiB (every other POST: 512 KiB), refused
+  `413` from `Content-Length` before it is read; the file ≤ 20 MiB (`413`). The bytes decide the type,
+  never the name or a declared type: JPEG/PNG/GIF/WebP → `kind: image` (`type` = its image type);
+  HEIC/HEIF → `kind: document`, `type: application/octet-stream` (the vision path cannot decode HEIC
+  without `pillow_heif`); PDF; docx/xlsx/pptx (ZIP head + that extension); UTF-8 text without NUL for
+  `.txt .md .csv .json .log .yaml .yml`. Anything else `415` (SVG, executables, archives). `name` is
+  cleaned (base name only, control/bidi/format characters removed, only `[\w .()-]`, ≤ 80 characters
+  and ≤ 200 UTF-8 bytes, the extension of the detected type). `400` bad base64 / empty, `429` more than
+  20 uploads of this session not sent yet, `501` uploads not set up, `500 storage failed` with the errno
+  name in `grund` when the cache cannot take the file (disk full, permissions). Stored in the profile's media cache like a Telegram
+  download (`get_hermes_dir("cache/images"|"cache/documents", home=<plugin home>)`; directory 0700, file
+  0600 with `O_EXCL`); the gateway's hourly housekeeping removes files older than 24 h, the plugin
+  deletes an upload not bound to a message after 1 h. The index lives in the plugin process only.
+* `GET /v1/s/{key}/uploads/{upload_id}` → the file of an upload of THIS session (else `404`), an image
+  with its own type, everything else `application/octet-stream`; `X-Content-Type-Options: nosniff`.
+* `DELETE /v1/s/{key}/uploads/{upload_id}` (no body, else `400`) → `{deleted: upload_id}`: an upload of
+  THIS session not sent yet goes, file included (the board chip's ✕; frees the `429` quota). Sent → `409`,
+  unknown or another session's → `404`.
+* `POST /v1/s/{key}/messages {text, client_message_id, attachments: [upload_id, …]}` (WB-1174): 1–10
+  upload ids of this session, not sent yet, no repeats (else `400`, nothing sent); `text` may then be
+  empty. Sent with `inject_message(…, media_urls=[paths], media_types=[types])` — the turn gets them like
+  a Telegram photo / document (all images: a PHOTO event, else DOCUMENT; the content is never inlined
+  into the text). A core without `media_urls` → `501`, nothing sent (text alone still works). The mirror
+  lists the files under the text (`📷 name (size)` / `📎 …`) and, once the message is accepted, posts each
+  image as a photo replying to the mirror. A refused message frees its uploads again. Without
+  `attachments` the request and its handling are exactly the text message above.
 * `POST /v1/s/{key}/stop` → `{stopped: bool}` via `ctx.interrupt_session(key)` (`false`: nothing
   running or refused). Without that API (core before WB-1127): `501` with `grund`.
 * `POST /v1/s/{key}/approvals/{request_id} {choice: once|session|always|deny}` →
@@ -211,6 +238,8 @@ produced; its fields are in the snapshot's `session`.
     message id is gone with the rewound row.
   - Rows written by a core before `hermes_plugin_id`: a `client_message_id` starting with `wb-`
     (the board's own ids) counts as origin `werkbank`.
+* A user message whose `client_message_id` has bound uploads carries `attachments` (WB-1174, same
+  shape as on `user.message`; only while the plugin process knows them).
 * History: newest 200 SessionDB rows via the store's read API (`get_messages`), tool output capped
   at 4 KB like `tool.end` (`truncated`). `pending_approvals` from `list_gateway_approvals`, commands
   redacted like the event; `pending_clarify` from `get_pending_for_session` (the oldest open one).

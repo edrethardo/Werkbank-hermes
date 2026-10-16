@@ -247,3 +247,51 @@ def test_ordinary_names_stay_as_they_are_on_other_platforms(name):
     from plugins.platforms.werkbank.mirror import plain_block
 
     assert plain_block("hi", name).split("\n", 1)[0] == f"👤 {name} · Werkbank"
+
+
+# ── WB-1174: attachments in the mirror; the real adapter sends the image as a photo ──────────────
+
+
+def test_attachments_are_listed_under_the_text_and_alone_without_text():
+    from plugins.platforms.werkbank.mirror import with_attachments
+
+    files = [{"kind": "image", "name": "bild.png", "size": 2048},
+             {"kind": "document", "name": "bericht.pdf", "size": 3 * 1024 * 1024 + 1}]
+    assert with_attachments("schau", files) == "schau\n\n📷 bild.png (2 KB)\n📎 bericht.pdf (3,0 MB)"
+    assert with_attachments("", files[:1]) == "📷 bild.png (2 KB)"
+    assert with_attachments("nur text", []) == "nur text"
+
+
+def test_real_telegram_adapter_sends_the_mirror_photo_into_the_topic_as_a_reply(tmp_path):
+    """``GatewayHost.mirror_photos`` against the real ``TelegramAdapter.send_image_file``: a photo in the
+    session's topic, replying to the mirror line."""
+    import threading
+    import time
+
+    from plugins.platforms.werkbank.host import GatewayHost
+
+    adapter = _adapter()
+    adapter._bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=901))
+    image = tmp_path / "img_1.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    source = SimpleNamespace(chat_id="4711", thread_id="51", platform=SimpleNamespace(value="telegram"))
+    owner = SimpleNamespace(_gateway_loop=loop, _restored_source=lambda entry: entry.origin,
+                            _delivery_adapter_for=lambda src: adapter,
+                            session_store=SimpleNamespace(lookup_by_session_key=lambda key: SimpleNamespace(origin=source)))
+    ctx = SimpleNamespace(_manager=SimpleNamespace(_gateway_message_injector=(owner, None)),
+                          inject_message=lambda *a, **k: True)
+    try:
+        host = GatewayHost(ctx, tmp_path)
+        assert host.mirror_photos("agent:main:telegram:dm:4711:51", [str(image)], "900") == 1
+        deadline = time.monotonic() + 5
+        while not adapter._bot.send_photo.await_count and time.monotonic() < deadline:
+            time.sleep(0.02)
+        kwargs = adapter._bot.send_photo.await_args.kwargs
+        assert str(kwargs["chat_id"]) == "4711" and kwargs.get("message_thread_id") in (51, "51")
+        assert str(kwargs.get("reply_to_message_id") or getattr(kwargs.get("reply_parameters"), "message_id", "")) == "900"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(2)

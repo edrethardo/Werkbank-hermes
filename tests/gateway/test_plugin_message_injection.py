@@ -797,3 +797,99 @@ async def test_plain_stop_still_reports_stop_requested():
         "agent_loop_stopped", session_key=entry.session_key, platform="telegram",
         reason="Stop requested", invalidation_reason="stop_command",
     )
+
+
+# ── WB-1174: media attachments from a plugin ──────────────────────────────────────────────────
+# fork: werkbank-chat
+
+
+@pytest.mark.asyncio
+async def test_dispatch_carries_media_as_a_photo_event():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="was siehst du?", plugin_id="werkbank", client_message_id="wb-8",
+        media_urls=["/h/cache/images/img_1.png"], media_types=["image/png"],
+    ) is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.PHOTO
+    assert event.media_urls == ["/h/cache/images/img_1.png"]
+    assert event.media_types == ["image/png"]
+    assert event.metadata["client_message_id"] == "wb-8"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_with_a_document_is_a_document_event_not_inlined():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="", plugin_id="werkbank",
+        media_urls=["/h/cache/images/img_1.png", "/h/cache/documents/doc_1_bericht.pdf"],
+        media_types=["image/png", "application/pdf"],
+    ) is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.DOCUMENT
+    assert event.media_text_inlined == [False, False]     # the content is NOT in the text: read the file
+
+
+@pytest.mark.asyncio
+async def test_dispatch_without_media_is_the_plain_text_event_as_before():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="nur text", plugin_id="werkbank") is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert event.media_urls == [] and event.media_types == [] and event.media_text_inlined == []
+
+
+@pytest.mark.asyncio
+async def test_plugin_context_media_reach_the_live_gateway_as_a_photo_event(tmp_path, monkeypatch):
+    """The whole seam: ``PluginContext.inject_message(media_urls=…)`` → published injector → dispatch →
+    the session's adapter holds a PHOTO event with the cached file (a turn runs, so it is queued)."""
+    hermes_home = tmp_path / "hermes"
+    (hermes_home / "cache" / "images").mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    image = hermes_home / "cache" / "images" / "img_abc.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(_entry().origin)
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._running = True
+    runner._draining = False
+    runner._background_tasks = set()
+    runner._queued_events = {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+
+    with patch("hermes_cli.plugins._plugin_manager", manager):
+        runner._install_plugin_message_injector()
+        assert context.inject_message("was siehst du?", session_key=entry.session_key, client_message_id="wb-9",
+                                      media_urls=[str(image)], media_types=["image/png"]) is True
+        await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
+        await asyncio.sleep(0)
+        runner._clear_plugin_message_injector()
+
+    held = [adapter._pending_messages.get(entry.session_key)] + list(runner._queued_events.get(entry.session_key, []))
+    event = next(e for e in held if e is not None and e.metadata.get("client_message_id") == "wb-9")
+    assert event.message_type == MessageType.PHOTO
+    assert event.media_urls == [str(image)] and event.media_types == ["image/png"]
+    assert event.text == "was siehst du?" and event.internal is True

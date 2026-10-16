@@ -1,5 +1,6 @@
 """Tests for plugin message injection across CLI and gateway hosts."""
 
+from pathlib import Path
 from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -407,3 +408,86 @@ def test_interrupt_session_fails_closed(tmp_path, monkeypatch):
     for bad in ("", None, 5):
         assert context.interrupt_session(bad) is False
     assert good.calls == []
+
+
+# ── WB-1174: media attachments (media_urls / media_types) ─────────────────────────────────────
+# fork: werkbank-chat
+
+
+def _cached_file(manager, name="img_abc.png", data=b"\x89PNG\r\n\x1a\n" + b"0" * 8):
+    folder = manager.home_path / "cache" / "images"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_gateway_injection_forwards_media_urls_and_types(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    path = _cached_file(manager)
+
+    assert context.inject_message(
+        "schau mal", session_key="agent:main:telegram:dm:42", client_message_id="wb-1",
+        media_urls=[path], media_types=["image/png"],
+    ) is True
+    injector.assert_called_once_with(
+        session_key="agent:main:telegram:dm:42", content="schau mal", plugin_id="notify-plugin",
+        plugin_home=manager.home_path, client_message_id="wb-1",
+        media_urls=[path], media_types=["image/png"],
+    )
+
+
+def test_gateway_injection_without_media_passes_no_media_keys(tmp_path, monkeypatch):
+    """A text message reaches the gateway exactly as before (no media keys at all)."""
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message("hallo", session_key="agent:main:telegram:dm:42") is True
+    assert "media_urls" not in injector.call_args.kwargs
+    assert "media_types" not in injector.call_args.kwargs
+
+
+def test_gateway_injection_rejects_malformed_media(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    good = _cached_file(manager)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\n")
+    link = manager.home_path / "cache" / "images" / "link.png"
+    link.symlink_to(outside)
+    bad_cases = [
+        ([good], None),                              # types missing
+        ([good], ["image/png", "image/png"]),        # length mismatch
+        (["relative.png"], ["image/png"]),           # not absolute
+        ([str(outside)], ["image/png"]),             # outside <home>/cache
+        ([str(link)], ["image/png"]),                # a link out of the cache
+        ([good + ".fehlt"], ["image/png"]),          # no such file
+        ([good], ["png"]),                           # not a MIME type
+        ([good] * 11, ["image/png"] * 11),           # too many
+        ("nicht-liste", ["image/png"]),
+    ]
+    for urls, types in bad_cases:
+        assert context.inject_message("x", session_key="agent:main:telegram:dm:42",
+                                      media_urls=urls, media_types=types) is False, (urls, types)
+    injector.assert_not_called()
+
+
+def test_gateway_injection_forwards_the_checked_real_path(tmp_path, monkeypatch):
+    """The path the gateway gets is the one that was checked (``resolve``), not the plugin's spelling:
+    ``…/cache/images/../images/x`` or a linked parent directory never reach the turn as given."""
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    path = _cached_file(manager)
+    detour = str(manager.home_path / "cache" / "images" / ".." / "images" / "img_abc.png")
+    assert context.inject_message("x", session_key="agent:main:telegram:dm:42",
+                                  media_urls=[detour], media_types=["image/png"]) is True
+    assert injector.call_args.kwargs["media_urls"] == [str(Path(path).resolve())]

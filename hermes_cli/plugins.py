@@ -608,6 +608,8 @@ class PluginContext:
         origin: Mapping[str, Any] | None = None,
         client_message_id: str | None = None,  # fork: werkbank-chat
         reply_to_message_id: str | None = None,  # fork: werkbank-chat
+        media_urls: list[str] | None = None,  # fork: werkbank-chat
+        media_types: list[str] | None = None,  # fork: werkbank-chat
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -628,11 +630,15 @@ class PluginContext:
         ``reply_to_message_id`` (gateway only; a platform message id of 1-20 ASCII digits, anything
         else is refused) is a message of that chat the turn's answer replies to — e.g. the plugin's
         own mirror of the text in the chat.
+        ``media_urls`` / ``media_types`` (gateway only, both or neither, same length, at most 10) are
+        attachments the turn gets like a photo or document sent in the chat: absolute paths of regular
+        files under the plugin profile's ``cache/`` (where adapters cache downloads) and their MIME types.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
         return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
                                      client_message_id=client_message_id,  # fork: werkbank-chat
-                                     reply_to_message_id=reply_to_message_id)  # fork: werkbank-chat
+                                     reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
+                                     media_urls=media_urls, media_types=media_types)  # fork: werkbank-chat
 
     def interrupt_session(self, session_key: str) -> bool:  # fork: werkbank-chat
         """Stop the running turn of a messaging-gateway session the way ``/stop`` does.
