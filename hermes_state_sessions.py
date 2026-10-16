@@ -239,6 +239,10 @@ SESSION_STATUS_COMPLETE = "complete"
 SESSION_STATUS_INTERRUPTED = "interrupted"
 SESSION_STATUS_ERROR = "error"
 SESSION_STATUS_EMPTY = "empty"
+# ``sessions.created_source`` of a ``reserve_session`` row (``hermes sessions reserve``, WB-1090).
+RESERVED_CREATED_SOURCE = "reserve"
+#: How long the empty-session sweep keeps an ended, empty reservation (WB-855/WB-1090).
+RESERVATION_GRACE_S = 24 * 3600
 
 # finish_reason values meaning the turn ended in a provider/agent error.
 _ERROR_FINISH_REASONS = frozenset({"error", "agent_error", "content_filter"})
@@ -465,6 +469,91 @@ class SessionSessionsMixin:
         """Ensure a session row exists (upsert). Accepts optional kwargs."""
         self._insert_session_row(session_id, source, model=model, **kwargs)
         return session_id
+
+    _RESERVE_ATTEMPTS = 5
+
+    def reserve_session(self, source: str = "cli") -> str:
+        """Atomically create a NEW empty session row and return its freshly minted id.
+
+        For trusted launchers (``hermes sessions reserve``, WB-1090) that must bind a session id
+        before the run starts and then ``--resume`` exactly that session. Unlike the
+        ``create_session`` upsert this never adopts an existing row: the insert is
+        ``ON CONFLICT DO NOTHING`` inside the store's write transaction, and a collision mints a
+        new id. The row carries ``created_source = RESERVED_CREATED_SOURCE`` (``source`` stays
+        *source*, so ``--resume`` treats it as a normal CLI session); the empty-session sweep skips
+        it for RESERVATION_GRACE_S even after an orphan reap ended it empty (undo with
+        :meth:`release_reserved_session`). Raises ``RuntimeError`` when no free id was found, or when this store lies outside
+        the profile tree (``_own_profile_name()`` is None): a reservation the launcher cannot
+        attribute to a profile proves nothing, so nothing is written.
+        """
+        import hermes_state_ids
+
+        profile_name = self._own_profile_name()
+        if profile_name is None:
+            raise RuntimeError(f"cannot reserve a session: {self.db_path} is not a Hermes profile "
+                               "store (no owning profile)")
+        for _ in range(self._RESERVE_ATTEMPTS):
+            session_id = hermes_state_ids.new_session_id()
+
+            def _do(conn, session_id=session_id):
+                cur = conn.execute(
+                    "INSERT INTO sessions (id, source, created_source, profile_name, started_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                    (session_id, source, RESERVED_CREATED_SOURCE, profile_name, time.time()))
+                return cur.rowcount == 1
+
+            if self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S):
+                return session_id
+        raise RuntimeError("could not reserve a fresh session id (every candidate already exists)")
+
+    def release_reserved_session(
+        self, session_id: str, sessions_dir: Optional[Path] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Undo :meth:`reserve_session` for a run that never started (WB-1090): the launcher's
+        counterpart when the board refuses the grant after the id was minted.
+
+        Deletes *session_id* only if, inside ONE write transaction, the row exists, carries
+        ``created_source = RESERVED_CREATED_SOURCE``, belongs to THIS store's profile and was never
+        started: no message row at all (also ``active = 0``), no child session, no title and no live
+        turn lease / compression lock. An exact id, never a prefix or title. Returns
+        ``(True, None)`` when deleted, else ``(False, reason)`` with reason one of ``not_found``,
+        ``not_reserved``, ``no_profile``, ``other_profile``, ``started``, ``active``; a refusal
+        changes nothing.
+        """
+        own = self._own_profile_name()
+        removed: List[str] = []
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT created_source, profile_name, title FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if (row["created_source"] or "") != RESERVED_CREATED_SOURCE:
+                return "not_reserved"
+            if own is None:
+                return "no_profile"
+            if row["profile_name"] != own:
+                return "other_profile"
+            started = (
+                row["title"] is not None
+                or conn.execute("SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (session_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM sessions WHERE parent_session_id = ? LIMIT 1",
+                                (session_id,)).fetchone()
+            )
+            if started:
+                return "started"
+            if self._guarded_ids(conn, [session_id]):
+                return "active"
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._delete_unreferenced_system_prompts(conn)
+            removed.append(session_id)
+            return None
+
+        reason = self._execute_write(_do)
+        for sid in removed:
+            self._remove_session_files(sessions_dir, sid)
+        return (reason is None, reason)
 
     def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
         """Mirror ``SessionEntry.expiry_finalized`` so it survives a lost sessions.json.
@@ -1866,9 +1955,15 @@ class SessionSessionsMixin:
     # counts live rows only (rewind/compaction keep dropped turns as active = 0): NOT EXISTS is authority.
     # The ``NOT EXISTS`` probe is the authority; : ``message_count = 0`` stays as a cheap prefilter. Same
     # shape as every : other emptiness guard in this module. (#95868)
+    # ``created_source = 'reserve'`` (``reserve_session``): a launcher already bound that id and will
+    # ``--resume`` it, so an ended-while-empty reservation (orphan reap) is kept for
+    # RESERVATION_GRACE_S after ``started_at`` (WB-855); after that it is an ordinary empty session —
+    # a reservation nobody resumed (e.g. the board refused the grant) must not stay forever (WB-1090).
     _EMPTY_SESSION_WHERE = (
-        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 AND NOT EXISTS ("
-        "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
+        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 "
+        f"AND NOT (COALESCE(created_source, '') = '{RESERVED_CREATED_SOURCE}' "
+        f"AND COALESCE(started_at, 0) > CAST(strftime('%s', 'now') AS REAL) - {RESERVATION_GRACE_S}) "
+        "AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
     )
 
     def count_empty_sessions(self) -> int:

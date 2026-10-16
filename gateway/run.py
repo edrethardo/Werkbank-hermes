@@ -2024,6 +2024,8 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
         "docker_strict": "TERMINAL_DOCKER_STRICT",
         "docker_snap_compat": "TERMINAL_DOCKER_SNAP_COMPAT",
+        "docker_board_socket": "TERMINAL_DOCKER_BOARD_SOCKET",
+        "docker_labels": "TERMINAL_DOCKER_LABELS",
         "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
         "docker_shared_container_key": "TERMINAL_DOCKER_SHARED_CONTAINER_KEY",
         "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",

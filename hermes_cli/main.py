@@ -362,6 +362,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.verify import build_verify_parser
+from hermes_cli.subcommands.sandbox_probe import build_sandbox_probe_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
@@ -1731,8 +1732,32 @@ _CHAT_PASSTHROUGH = (
 )
 
 
+def _apply_sandbox_config(args) -> None:
+    """``--sandbox-config FILE`` (WB-1176): pin FILE's strict-Docker terminal policy before ANY
+    provider/model work, or exit 2. No-op without the flag."""
+    path = getattr(args, "sandbox_config", None)
+    if not path:
+        return
+    # TUI and --worktree hand the run to a child process / another cwd the pin does not cover.
+    for flag, attr in (("--tui", "tui"), ("--tui-native", "tui_native"), ("--dev", "tui_dev"),
+                       ("--worktree", "worktree")):
+        if getattr(args, attr, False):
+            print(f"Error: --sandbox-config cannot be combined with {flag}", file=sys.stderr)
+            sys.exit(2)
+    from hermes_cli import sandbox_config
+
+    try:
+        cfg = sandbox_config.load_sandbox_config(path)
+    except sandbox_config.SandboxConfigError as exc:
+        print(f"Error: --sandbox-config refused: {exc}", file=sys.stderr)
+        sys.exit(2)
+    sandbox_config.apply_sandbox_config(cfg)
+    args.cli = True  # classic in-process REPL/one-shot only (display.interface: tui must not win)
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    _apply_sandbox_config(args)
     _apply_safe_mode(args)
     _apply_user_config_bypass(args)
     _guard_noninteractive_user_config(args)
@@ -2190,6 +2215,13 @@ def cmd_verify(args):
     from hermes_cli.verify_cmd import run_verify_command
 
     sys.exit(run_verify_command(args))
+
+
+def cmd_sandbox_probe(args):
+    """Report this profile's effective strict-Docker tool policy (WB-1090)."""
+    from hermes_cli.sandbox_probe import cmd_sandbox_probe as _run
+
+    return _run(args)
 
 
 def cmd_security(args):
@@ -2821,7 +2853,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "usage", "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
-        "verify",
+        "verify", "sandbox-probe",
         # Plugin commands missing from top-level --help is an accepted trade-off.
         "help",
     }
@@ -3422,6 +3454,7 @@ def _build_cli_parser():
     build_hooks_parser(subparsers, cmd_hooks=cmd_hooks)
     build_doctor_parser(subparsers, cmd_doctor=cmd_doctor)
     build_verify_parser(subparsers, cmd_verify=cmd_verify)
+    build_sandbox_probe_parser(subparsers, cmd_sandbox_probe=cmd_sandbox_probe)
     build_security_parser(subparsers, cmd_security=cmd_security)
     build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
     build_dump_parser(subparsers, cmd_dump=cmd_dump)

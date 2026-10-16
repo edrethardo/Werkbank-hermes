@@ -1173,6 +1173,36 @@ def _cmd_stats(db, args):
         print(f"Database size: {_size_mb(db.db_path):.1f} MB")
 
 
+def _cmd_reserve(db, args):
+    """Trusted-launcher reservation (WB-1090): one new empty row, id on stdout."""
+    try:
+        session_id = db.reserve_session()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps({"session_id": session_id, "profile": db._own_profile_name(),
+                          "state_db": str(db.db_path)}))
+    else:
+        print(session_id)
+    return 0
+
+
+def _cmd_release(db, args):
+    """Launcher undo of ``reserve`` (WB-1090): delete ONLY this profile's never-started reservation."""
+    session_id = args.session_id
+    released, reason = db.release_reserved_session(session_id, sessions_dir=_sessions_dir())
+    rep = {"released": released, "session_id": session_id, "profile": db._own_profile_name()}
+    if not released:
+        rep["reason"] = reason
+        print(f"Error: session '{session_id}' not released: {reason}", file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps(rep))
+    elif released:
+        print(f"Released reserved session '{session_id}'.")
+    return 0 if released else 1
+
+
 # -- dispatch -----------------------------------------------------------------
 
 def _cmd_repair_profiles(args):
@@ -1198,6 +1228,7 @@ _DB_HANDLERS = {
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
     "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
+    "reserve": _cmd_reserve, "release": _cmd_release,
 }
 
 

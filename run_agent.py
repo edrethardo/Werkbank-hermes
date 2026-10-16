@@ -46,7 +46,14 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
     Only local CLI sessions record one: gateway/cron/remote backends (non-"local" ``TERMINAL_ENV``) have no
     stable host cwd for the agent's tools.
     """
-    if source not in CLI_FAMILY_SOURCES or (os.environ.get("TERMINAL_ENV") or "local").strip().lower() not in ("", "local"):
+    if source not in CLI_FAMILY_SOURCES:
+        return None
+    from tools.terminal_scope import terminal_env  # pin/scope first, then os.environ (WB-855 review)
+    try:
+        backend = terminal_env("TERMINAL_ENV", "local")
+    except Exception:  # refusal scope: no provable backend, so no host cwd
+        return None
+    if (backend or "local").strip().lower() not in ("", "local"):
         return None
     try:
         return os.getcwd()

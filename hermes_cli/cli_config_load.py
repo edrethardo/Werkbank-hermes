@@ -88,7 +88,7 @@ _TERMINAL_ENV_MAPPINGS = {
         "ssh_host", "ssh_user", "ssh_port", "ssh_key", "container_cpu", "container_memory",
         "container_disk", "container_persistent", "docker_volumes", "docker_env", "docker_extra_args",
         "docker_shm_size", "docker_mount_cwd_to_workspace", "docker_network", "docker_run_as_host_user", "docker_strict",
-        "docker_snap_compat",
+        "docker_snap_compat", "docker_board_socket", "docker_labels",
         "docker_persist_across_processes", "docker_shared_container_key", "docker_orphan_reaper",
         "sandbox_dir", "persistent_shell",
     )
@@ -119,7 +119,14 @@ _CWD_PLACEHOLDERS = (".", "auto", "cwd")
 
 
 def _mirror_config_to_env(defaults, _file_has_terminal_config):
-    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions). Env always wins when already set."""
+    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions).
+
+    Env wins when already set, except that a config.yaml WITH a ``terminal`` section overrides
+    ``TERMINAL_*`` (``_file_has_terminal_config``). Under a ``--sandbox-config`` pin the profile's
+    terminal block is skipped and ``TERMINAL_*`` is re-mirrored from the pin. This is NOT the bridge the terminal tool and
+    ``hermes sandbox-probe`` run (``hermes_cli.config.apply_terminal_config_to_env``): the two
+    share the precedence rule, not the code, so keep them in step (WB-1090 review).
+    """
     from cli import _AUXILIARY_TASK_ENV, _CWD_PLACEHOLDERS, _TERMINAL_ENV_MAPPINGS
     terminal_config = defaults.get("terminal", {})
 
@@ -139,7 +146,15 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
     # TERMINAL_CWD is force-exported (beats stale .env) except inside a gateway process,
     # whose config bridge already set it.
     _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
-    for config_key, env_var in _TERMINAL_ENV_MAPPINGS.items():
+    # ``--sandbox-config`` pinned the process' terminal policy before ``import cli`` got here: the
+    # profile's terminal block must not reach os.environ (subprocesses inherit it). Re-mirror the
+    # pin instead, which also undoes a profile .env loaded since (WB-855 review).
+    from tools.terminal_scope import get_process_terminal_pin
+    _pin = get_process_terminal_pin()
+    if _pin is not None:
+        from hermes_cli.sandbox_config import mirror_policy_to_environ
+        mirror_policy_to_environ(_pin)
+    for config_key, env_var in (_TERMINAL_ENV_MAPPINGS.items() if _pin is None else ()):
         if config_key not in terminal_config:
             continue
         val = terminal_config[config_key]

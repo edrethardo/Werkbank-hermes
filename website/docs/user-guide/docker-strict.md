@@ -117,3 +117,148 @@ and backend configuration wiring. Existing Docker environment/cgroup/network/
 session-isolation/config-bridge tests are run alongside them. The parent task
 performs independent real-container acceptance; mocked constructor tests alone
 are not proof of live Docker isolation.
+
+## One board socket and run labels (`docker_board_socket`, `docker_labels`)
+
+`docker_volumes` rejects every Unix socket, including sockets inside a bound directory. A
+launcher that hands the container exactly one door back to its board uses a separate key:
+
+```yaml
+terminal:
+  docker_strict: true
+  docker_board_socket: "/abs/run-root/board.sock:/run/werkbank/board.sock"
+  docker_labels: {"werkbank.sandbox.run": "<run-id>"}
+```
+
+`docker_board_socket` accepts exactly one `source:target` pair (no mode suffix; the bind is
+`rw` because connecting needs write). The source must be the socket itself: an absolute,
+normalized path with no symlink anywhere, named `board.sock`, owned by the calling user with no
+group/other permission bits, inside a caller-owned `0700` directory. Known Docker/Podman socket
+paths, their parents, a hard link to one of them and `$SSH_AUTH_SOCK` are rejected. The target
+must be a file directly under `/run/werkbank/`. The socket is re-checked at container start.
+
+`docker_labels` adds at most four labels whose keys start with `werkbank.`; values must already
+be label-safe (`[A-Za-z0-9_.-]`, 1–63 characters) and are rejected instead of rewritten. They are
+added after the Hermes labels, which they cannot replace.
+
+Both keys require `docker_strict: true`; without them the `docker run` arguments are unchanged.
+`sandbox-probe` reports them as `board_socket` and `labels` and counts an invalid socket or label
+as `auth_exposed`.
+
+## Proving the effective policy to a launcher (`sandbox-probe`, `sessions reserve`)
+
+A config file a launcher wrote proves nothing by itself: a profile `.env`, the ambient
+environment, a managed-scope overlay or `--ignore-user-config` can change what Hermes
+actually runs with. Ask the binary instead:
+
+```bash
+hermes -p <profile> sandbox-probe --config <run-config.yaml> --json
+```
+
+It resolves the terminal policy with the config-to-env bridge the terminal tool itself runs
+(`apply_terminal_config_to_env`, on a copy of the environment; `hermes chat` projects
+`config.yaml` through a separate function with the same precedence rule) and the terminal
+tool's own parser, then prints one JSON object. The probe is a built-in command: it loads no
+plugin code. Read the fields, not the exit code (non-zero only means nothing was provable):
+
+| Field | Meaning |
+|---|---|
+| `strict` | `true` only when `docker_strict` is on and the backend is Docker |
+| `config_sha256` | sha256 of the profile's `config.yaml`; `null` when no file governs the run or `overrides` is non-empty |
+| `docker_network` | `false` only for a Docker backend with `docker_network: false` |
+| `auth_exposed` | `false` only when strict and nothing forwards credentials (no `docker_forward_env`, no credential-named `docker_env`, no extra args, no bind of the Hermes home or a host credential directory — taken from both `$HOME` and the passwd home); see `auth_reasons` |
+| `config_matches` | the `--config` file's bytes equal the effective `config.yaml` |
+| `overrides` | `TERMINAL_*` values where env/.env/managed scope differ from file plus defaults, plus any of `HERMES_DOCKER_BINARY`, `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` that is set (they pick another binary or daemon) |
+| `docker_binary` | the container CLI `find_docker()` resolves, or `null` |
+| `board_socket` | the one board socket (`source`, `target`, `present`) or `null` |
+| `labels` | the `werkbank.*` container labels |
+
+`docker_env` is checked by variable **name** (`*_KEY`, `*TOKEN*`, `*SECRET*`, …). Values are
+only screened for a few well-known key shapes (`ghp_`/`github_pat_`, `sk-`, `AKIA`/`ASIA`,
+`xoxb-`-style Slack tokens, `scheme://user:password@`); a secret in any other shape under a
+harmless name is not detected. The launcher that writes `docker_env` owns its values.
+
+The probe is read-only: it starts no container, opens no network and does not touch the
+session store. It does not prove Docker itself is healthy; a launch still fails closed when
+the container cannot be created.
+
+A trusted launcher that must bind a session id before the run starts reserves one:
+
+```bash
+hermes -p <profile> sessions reserve --json
+# {"session_id": "20261015_212739_6e2990", "profile": "<profile>", "state_db": ".../state.db"}
+```
+
+This inserts exactly one new, empty session row through the session store's own write path
+and never adopts an existing id. Start that session afterwards with `--resume <id>`. The row is
+marked `created_source = reserve`; for 24 hours after the reservation the empty-session sweep
+(`DELETE /api/sessions/empty`) skips it, even when an orphan reap has ended it before the run
+started. After that grace window an ended, empty reservation is swept like any other empty
+session. A store outside the Hermes profile tree (no owning profile) is refused with a non-zero
+exit and nothing is written.
+
+When the run will not start after all (for example the board refuses the worker grant), the
+launcher releases the reservation instead of waiting for the sweep:
+
+```bash
+hermes -p <profile> sessions release <session_id> --json
+# {"released": true, "session_id": "20261015_212739_6e2990", "profile": "<profile>"}
+```
+
+`release` deletes the row in one write transaction, and only when all of these hold: the id
+matches exactly (no prefix or title lookup), the row was created by `sessions reserve`, it
+belongs to this profile, and it never started (no message row, including rewound or compacted
+ones, no child session, no title, no live turn lease or compression lock). Anything else exits
+non-zero, changes nothing, prints the reason on stderr and, with `--json`, returns
+`{"released": false, "session_id": ..., "profile": ..., "reason": ...}`. The reason is one of
+`not_found`, `not_reserved`, `no_profile`, `other_profile`, `started` or `active`.
+
+Launcher contract: call `reserve`, bind the id, then either `--resume <id>` or, if the start is
+refused before any model call, `release <id>`. Treat a non-zero `release` as "keep the
+session": `started` or `active` means a run picked the id up and its transcript must not be
+deleted. The sweep only removes reservations that have been ended (and are older than 24
+hours); a launcher that crashes between the two calls leaves an open, empty row that stays until
+it is released, so a restarting launcher should `release` the ids it reserved but never started.
+
+## Starting a run with its own config (`chat --sandbox-config`)
+
+`--config` above checks the profile's own `config.yaml`. A launcher that writes a per-run
+file instead starts the worker with it and probes exactly that path:
+
+```bash
+hermes -p <profile> sandbox-probe --sandbox-config <run>/config.yaml --json
+hermes -p <profile> chat --resume <session> --sandbox-config <run>/config.yaml --oneshot -q "<prompt>"
+```
+
+Both go through the same loader. The file may contain only a `terminal:` section with known
+`terminal.*` keys, must say `backend: docker` and `docker_strict: true`, and must pass the
+strict volume/extra-args checks and the `docker_board_socket`/`docker_labels` rules (the socket
+itself may still be unbound); otherwise `chat` exits 2 before any provider or model work
+and the probe exits 2. The file's section plus shipped defaults becomes the complete terminal
+policy of the process: the profile's `terminal.*`, its `.env` and `TERMINAL_*` in the
+environment no longer reach the terminal tool, also not after later config reloads. Model
+access, memory, skills and the session store stay the profile's, on the host.
+
+`os.environ` mirrors the pinned policy, also after the CLI loads the profile config
+(`import cli` re-mirrors the pin instead of the profile's `terminal.*`), so subprocesses inherit
+the run's `TERMINAL_*`. Every `TERMINAL_*` key the policy defines is present, including the
+shipped defaults `TERMINAL_DOCKER_BOARD_SOCKET=''` and `TERMINAL_DOCKER_LABELS='{}'` when the file
+leaves them out. Code that reads the backend (`subagent_worktree.local_backend_active`, the
+session's launch cwd) reads it from the pin, so a pinned Docker run never offers host worktrees
+or stamps a host cwd. Container recreation after "No such container" re-validates the board
+socket with the start's rules (strict Docker also disables cross-process reuse, so this path is a
+second line, not the normal one).
+
+With `--sandbox-config` the probe's `config_sha256` is the run file's hash (and
+`"mode": "sandbox-config"`); it is `null` when any terminal setting the run reads differs from
+the file or a Docker runtime variable is set (`overrides`). Reading the pin back cannot differ
+by construction; the real check runs the start path in a child process (pin, then `import cli`
+with this profile's config and `.env`) and compares its `TERMINAL_*` environment with the
+policy. When that child fails, `overrides` contains `start_path_unverified`.
+
+Limit: the probe recognises another Docker daemon only through `DOCKER_HOST`, `DOCKER_CONTEXT`,
+`DOCKER_CONFIG` and `HERMES_DOCKER_BINARY`. A `currentContext` set in `~/.docker/config.json`
+(`docker context use …`) is **not** detected; the launcher must check the daemon itself (for
+example `docker context show` must print `default`) before it trusts `config_sha256`. `board_socket` and `labels` are
+reported as in the profile mode. `--tui` and `--worktree` are refused with `--sandbox-config`: both
+leave the process the policy is pinned in. Without the flag nothing changes.

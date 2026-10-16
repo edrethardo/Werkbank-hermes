@@ -308,6 +308,11 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
               help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
     add("--source", default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.")
+    add("--sandbox-config", dest="sandbox_config", metavar="FILE", default=None, help=(
+        "Run the terminal tool with FILE's 'terminal' section ONLY (strict Docker required; "
+        "the profile's terminal.* and TERMINAL_* env cannot override it). Model access, memory "
+        "and sessions stay the profile's. Verify first with `hermes sandbox-probe "
+        "--sandbox-config FILE`."))
     inherited(chat_parser, "--tui", action="store_true", default=SUPPRESS,
               help="Launch the modern TUI instead of the classic REPL")
     inherited(chat_parser, "--native", "--tui-native", dest="tui_native", action="store_true", default=SUPPRESS,
