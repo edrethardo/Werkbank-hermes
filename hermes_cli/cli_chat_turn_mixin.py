@@ -90,6 +90,9 @@ class CLIChatTurnMixin:
             from agent.message_sanitization import _sanitize_surrogates
             message = _sanitize_surrogates(message)
 
+        if not isinstance(message, TimelineNotification):
+            # WB-1212: secrets → placeholders before the turn is staged (session row, display) or sent.
+            message = self._chat_secret_intake(message)
         self._chat_stage_user_message(agent, message)
         if isinstance(message, TimelineNotification):
             message = str(message)  # UI metadata is on the staged row, never in model content.
@@ -124,6 +127,40 @@ class CLIChatTurnMixin:
                 return None
             finally:
                 self._chat_release_turn_audio(turn)
+
+    def _chat_secret_intake(self, message):
+        """Replace secrets in *message* with ``[GEHEIMNIS:…]`` placeholders (``agent/secret_intake.py``)
+        and ask, through the choice modal, whether to save them to the vault. The answer is handled
+        here, without the model; no answer (timeout, no prompt_toolkit app) leaves the value to expire."""
+        from agent import secret_intake
+        scope = str(getattr(getattr(self, "agent", None), "session_id", None)
+                    or getattr(self, "session_id", None) or "cli")
+        try:
+            res = secret_intake.intake(message, scope, surface="cli")
+        except Exception:
+            logging.warning("secret_intake: CLI scan failed", exc_info=True)
+            return message
+        entries = secret_intake.offer_candidates(scope, res.text) if res.new else []
+        if not entries:
+            return res.text
+        detail = secret_intake.card_text(entries)
+        if not getattr(self, "_app", None):
+            print(detail)
+            return res.text
+        ids = ",".join(e.id for e in entries)
+        choices = [("save", "Im Tresor speichern", "Name wie vorgeschlagen; der Agent sieht nur den Platzhalter"),
+                   ("drop", "Verwerfen", "Wert sofort löschen; der Platzhalter bleibt im Text")]
+        try:
+            raw = self._prompt_text_input_modal(title="Geheimnis erkannt", detail=detail, choices=choices)
+            choice = self._normalize_slash_confirm_choice(raw, choices)
+        except Exception:
+            logging.debug("secret_intake: CLI prompt failed", exc_info=True)
+            choice = None
+        if choice in ("save", "drop"):
+            print(secret_intake.apply_choice(f"{choice}:{ids}"))
+        else:
+            print(f"Keine Entscheidung: der Wert wird in {int(secret_intake.TTL_SECONDS // 60)} Minuten verworfen.")
+        return res.text
 
     def _chat_release_turn_audio(self, turn):
         """Every exit path: stop the thinking sound, send the TTS sentinel, cut TTS only if abnormal."""

@@ -89,6 +89,37 @@ Items live encrypted under `~/.hermes/vault/` (Fernet key + vault file, both
 visible metadata; passwords and card values never leave the vault except into
 the page.
 
+## Secrets in your messages
+
+When you paste a key, token or password into a chat message, Hermes replaces
+it **before** the message is stored, mirrored (Telegram mirror, Werkbank event
+stream) or sent to the model. The agent sees only a placeholder; every other
+character of your message stays as you wrote it:
+
+    Bitte richte [GEHEIMNIS:github-token-1] für das Repo ein.
+
+You then get a card — Telegram buttons, a prompt in the CLI, a text notice on
+platforms without buttons:
+
+- **Im Tresor speichern** stores a `secret` item (kind `secret`, no site
+  origin) named like `GitHub-Token · GEHEIMNIS:github-token-1 · 2026-10-18`. The
+  agent finds it by that label in `browser_vault_list` and refers to it by its
+  handle; it never sees the value. Saved secrets are not filled into web pages.
+- **Verwerfen** wipes the value at once. Without an answer the value is wiped
+  after 10 minutes. Either way the placeholder stays in the conversation.
+
+Detection: vendor-prefixed keys, Telegram bot tokens, PEM private keys,
+three-part JWTs, `Bearer` values, DSN/URL passwords and `password=` / `token:`
+style assignments with an opaque value. Commit SHAs, UUIDs and bare hashes are
+not reported. The audit log line (`hermes.secret_intake`) names kind,
+placeholder and a hashed session id, never the value. Turn it off with
+`security.secret_intake: false`.
+
+Limits: a file you attach is checked only when its text is inlined into the
+message; the copy on disk is not rewritten (tool output that reads it later is
+still redacted by `security.redact_secrets`). Your original message stays in
+the chat app's own history (e.g. Telegram) — delete it there if needed.
+
 ## Headless sessions
 
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a

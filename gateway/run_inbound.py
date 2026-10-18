@@ -1291,6 +1291,18 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        # WB-1212 backstop: events built by hand (interaction passthrough, tests, internal routes) skip
+        # BasePlatformAdapter.handle_message; redact before admission hooks see the text. Idempotent.
+        try:
+            from gateway.secret_intake_gateway import intake_inbound_event
+            _src = getattr(event, "source", None)
+            if _src is not None and not getattr(event, "internal", False):
+                _adapter = None
+                with suppress(Exception):
+                    _adapter = self._delivery_adapter_for(_src)
+                intake_inbound_event(_adapter, event, self._session_key_for_source(_src))
+        except Exception:
+            logger.debug("secret_intake backstop skipped", exc_info=True)
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None

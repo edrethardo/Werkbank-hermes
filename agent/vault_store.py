@@ -11,8 +11,9 @@ Design notes:
   file and vault file are created 0600 under ``<HERMES_HOME>/vault/``.
 - Ported design (opaque-handle vault fill) from Merit-Systems/OpenInstinct
   (MIT): lib/manager/server/secret-store.ts + vault services.
-- Three item kinds: ``login`` (password-only secret), ``payment`` (card fields) and
-  ``address``; ``PAYMENT_FIELDS`` / ``ADDRESS_FIELDS`` are the canonical payload names.
+- Four item kinds: ``login`` (password-only secret), ``payment`` (card fields),
+  ``address`` and ``secret`` (one opaque value saved from a chat message, WB-1212);
+  ``PAYMENT_FIELDS`` / ``ADDRESS_FIELDS`` are the canonical payload names.
 """
 
 from __future__ import annotations
@@ -32,7 +33,9 @@ from urllib.parse import urlsplit
 from hermes_constants import get_hermes_home
 from utils import atomic_write_bytes
 
-VAULT_KINDS = ("login", "payment", "address")
+# ``secret``: one opaque value (API token, password) saved from a chat message (WB-1212,
+# agent/secret_intake.py); origin optional, payload ``{"value": …}``.
+VAULT_KINDS = ("login", "payment", "address", "secret")
 
 LOGIN_IDENTIFIER_TYPES = ("email", "phone", "username")
 
@@ -343,6 +346,13 @@ class VaultStore:
             # metadata and any stray origin echo is dropped.
             otp_secret = normalize_otp_secret(str(secret.get("otp_secret") or ""))
             secret = {"password": secret["password"], **({"otp_secret": otp_secret} if otp_secret else {})}
+        elif kind == "secret":
+            value = str(secret.get("value") or "")
+            if not value.strip():
+                raise VaultError("secret items require a value")
+            secret = {"value": value}
+            if origin:
+                norm_origin = normalize_origin(origin)
         else:
             allowed = PAYMENT_FIELDS if kind == "payment" else ADDRESS_FIELDS
             secret = {k: str(v) for k, v in secret.items() if k in allowed and str(v or "").strip()}

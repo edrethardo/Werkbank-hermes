@@ -4065,6 +4065,10 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        # WB-1212: secrets in the user's text become placeholders HERE, before busy queues, the
+        # runner, the Werkbank stream, persistence or the model see it (gateway/secret_intake_gateway.py).
+        from gateway.secret_intake_gateway import intake_inbound_event
+        intake_inbound_event(self, event, session_key)
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)

@@ -1797,6 +1797,10 @@ DEFAULT_CONFIG = {
         # dials them instead of rejecting them as private. Empty = normal private-address verdict.
         "fake_ip_ranges": [],
         "redact_secrets": True,
+        # WB-1212: secrets in USER messages (API keys, tokens, `password=` values, PEM keys) become
+        # `[GEHEIMNIS:<art>-<n>]` placeholders before persistence, mirroring and the model; the user
+        # is offered a vault save (button card / CLI prompt). Values wait 10 min in memory only.
+        "secret_intake": True,
         # Persisted acknowledgement for unattended model overrides whose tier lets the vendor train
         # on prompts. The startup guard still warns every run; cost guards are unaffected.
         "allow_data_training_tiers_noninteractive": False,

@@ -20,6 +20,20 @@ from hermes_cli.commands_completion import SlashCommandAutoSuggest, SlashCommand
 from pathlib import Path
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
+
+
+class _SecretMaskingFileHistory(FileHistory):
+    """WB-1212: the composer history file (``~/.hermes/.hermes_history``) never stores a secret the
+    user typed; it keeps ``[GEHEIMNIS:<art>]`` in its place (``agent.secret_intake.mask_text``)."""
+
+    def store_string(self, string: str) -> None:
+        try:
+            from agent.secret_intake import enabled, mask_text
+            if enabled():
+                string = mask_text(string)
+        except Exception:
+            pass
+        super().store_string(string)
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
     ConditionalContainer,
@@ -2229,7 +2243,7 @@ class CLITuiMixin:
             multiline=True,
             wrap_lines=True,
             read_only=Condition(lambda: bool(cli_ref._command_blocks_input)),
-            history=FileHistory(str(self._history_file)),
+            history=_SecretMaskingFileHistory(str(self._history_file)),
             # The completer does blocking work (fuzzy @-file indexing shells out to rg/fd with a
             # 2s timeout; path completion hits os.listdir/stat), so complete_while_typing inline
             # would stall the render loop per keystroke (WSL2/slow FS). ThreadedCompleter moves
