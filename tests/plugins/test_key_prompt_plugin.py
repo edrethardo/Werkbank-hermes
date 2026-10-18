@@ -413,3 +413,21 @@ def test_bundled_plugin_is_opt_in_and_loads_through_the_plugin_manager(home):
     finally:
         mgr.unload_all() if hasattr(mgr, "unload_all") else None
         dp.clear_pages()
+
+
+def test_submit_works_in_multiplex_mode_without_a_scope(kp, client, home):
+    """Live bug: the dashboard runs multiplexed (several profiles in one process) with
+    no secret scope installed for the target profile, so the credential pool raised
+    UnscopedSecretError and nothing was stored. save_api_key must install the target
+    profile's scope itself."""
+    from agent import secret_scope
+    token = secret_scope.set_multiplex_context(True)
+    try:
+        rid = _rid(_request(kp))
+        resp = _submit(client, rid, _csrf(client, rid))
+    finally:
+        secret_scope.reset_multiplex_context(token)
+    assert resp.status_code == 200, resp.text
+    [entry] = _pool(home)
+    assert entry["access_token"] == FAKE
+    assert _status(kp, rid)["status"] == "stored"

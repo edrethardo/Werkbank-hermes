@@ -38,11 +38,16 @@ def profile_home(name: str) -> Path:
 
 @contextmanager
 def _home(path: Path):
+    # Writing into another profile's auth.json from the dashboard (multiplex mode) also
+    # needs that profile's secret scope, or the credential pool raises UnscopedSecretError.
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     token = set_hermes_home_override(path)
+    scope = set_secret_scope(build_profile_secret_scope(path), profile_home=str(path))
     try:
         yield
     finally:
+        reset_secret_scope(scope)
         reset_hermes_home_override(token)
 
 
