@@ -269,3 +269,146 @@ def test_finish_and_expiry_drop_the_egress_entry():
     assert scrub(FAKE_PW) == FAKE_PW
     si.store().purge(now=e2.expires + 1)
     assert scrub(other) == other
+
+
+# -- zweite Nachbesserung (WB-1212 delta review) --------------------------------------------------
+# D1: a ``word:`` lead-in or a URL query must not hide the assignment behind it.
+
+FAKE_TOK = "Zq8" + "FAKEfake0123xyzQ"
+
+
+@pytest.mark.parametrize("text,value", [
+    ("Hinweis: password=" + FAKE_PW, FAKE_PW),
+    ("login:password=" + FAKE_PW, FAKE_PW),
+    ("env: OPENAI_API_KEY=" + FAKE_TOK, FAKE_TOK),
+    ("a:token:" + FAKE_TOK, FAKE_TOK),
+    ("steer: password=" + FAKE_PW + " bitte", FAKE_PW),
+    ("ruf https://api.example.invalid/cb?token=" + FAKE_TOK + "&mode=x auf", FAKE_TOK),
+    ("https://api.example.invalid/x?a=1&key=" + FAKE_TOK, FAKE_TOK),
+    ("http://h.example.invalid/login?user=bob&password=" + FAKE_PW + "#top", FAKE_PW),
+    ("/cb?access_token=" + FAKE_TOK, FAKE_TOK),
+])
+def test_lead_in_and_url_query_found(text, value):
+    found = si.find_secrets(text)
+    assert [text[f.start:f.end] for f in found] == [value]
+
+
+@pytest.mark.parametrize("text", [
+    "https://example.invalid/search?q=token&page=2",
+    "https://example.invalid/r?code=200&state=ok",
+    "Hinweis: siehe https://example.invalid/a?session=abc",
+    "Notiz: token=optional",
+])
+def test_lead_in_and_url_query_false_alarms(text):
+    assert si.find_secrets(text) == []
+
+
+# D4: exemptions only for clear structure; entropy wins over a filename/path/ENV/snake look-alike.
+
+@pytest.mark.parametrize("text,value", [
+    ("password: Hunter2.Abc9", "Hunter2.Abc9"),
+    ("DB_PASS=Tr0ub4dor.Horse", "Tr0ub4dor.Horse"),
+    ("api_key=Q7ZK_9XQ2_PLMW_88AA", "Q7ZK_9XQ2_PLMW_88AA"),
+    ("password: ~Secr3t!x", "~Secr3t!x"),
+    ("password=/9fK$2Lq!m", "/9fK$2Lq!m"),
+    ("pass: correct.horse.battery.staple", "correct.horse.battery.staple"),
+    ("token: xq7_zk9_pw3_mf2_ab4", "xq7_zk9_pw3_mf2_ab4"),
+    ("password=Xk9fQ.Zr7Lp2", "Xk9fQ.Zr7Lp2"),
+    ("passwort: Sommer2024.de", "Sommer2024.de"),
+    ("token: aB3dE5gH7jK9.mN2p", "aB3dE5gH7jK9.mN2p"),
+    ("password: KX7_P9Q2", "KX7_P9Q2"),
+    ("password=QWERTZUIOPX", "QWERTZUIOPX"),
+    ("secret: s3cr3t.T0k3nV4lu3Z", "s3cr3t.T0k3nV4lu3Z"),
+])
+def test_review_positives_found(text, value):
+    found = si.find_secrets(text)
+    assert [text[f.start:f.end] for f in found] == [value]
+
+
+@pytest.mark.parametrize("text", [
+    "password=getpass.getpass()",
+    "password=<your-password>",
+    "secret=MY_APP_SECRET",
+    "PWD=/data/x",
+    "pw_dir=./run",
+    "token: tokenizer_v2_large_model",
+    "password=REPLACE_ME_WITH_SECRET",
+    "api_key=OPENAI_API_KEY",
+    "password: /home/aaron/projekt/zugang.yaml",
+    "token_file=config/tokens.json",
+])
+def test_review_false_alarms_still_quiet(text):
+    assert si.find_secrets(text) == []
+
+
+# Bare long random string (a pasted key alone on a line), no key name, no vendor prefix.
+FAKE_BARE = "Zq8" + "FAKEk2Lm9Xp4Rt7Wv1Bn6Hj3Cs5Df8Gy0Qa4Ne"     # 41 chars, mixed classes
+
+
+@pytest.mark.parametrize("text", [FAKE_BARE, f"hier der Key:\n{FAKE_BARE}\ndanke", f"nimm `{FAKE_BARE}`"])
+def test_bare_long_random_key_found(text):
+    found = si.find_secrets(text)
+    assert [text[f.start:f.end] for f in found] == [FAKE_BARE]
+    assert found[0].art == "api-key"
+
+
+@pytest.mark.parametrize("text", [
+    "4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39",
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "550e8400-e29b-41d4-a716-446655440000",
+    "data:image/png;base64," + ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk" * 4),
+    "integrity=\"sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC\"",
+    "AbstractSingletonProxyFactoryBeanWithLongerName",
+    "siehe https://example.invalid/aB3dE5gH7jK9mN2pQ4rS6tU8vW0xY1zA3bC5dE7fG9h/x",
+    "/home/user/projekte/AbstractSingletonProxyFactory2Bean/src/Main.java",
+    "Donaudampfschifffahrtsgesellschaftskapitaensmuetze2026",
+])
+def test_bare_long_random_false_alarms(text):
+    assert si.find_secrets(text) == []
+
+
+# D2: reference counting / provenance of the egress scrub registration.
+
+def _reg(value):
+    from agent import redact as r
+    return value in r._VAULT_REDACTION_VALUES.get(r._vault_scope(), {})
+
+
+def test_discard_never_unregisters_a_real_vault_fill():
+    from agent.redact import register_vault_redaction_value
+    value = "Zq8" + "#kLm2!pR7vX"
+    register_vault_redaction_value(value)          # a real browser_vault_fill registered it
+    entry = si.intake(f"password={value}", "s1").new[0]
+    si.discard(entry.id)
+    assert _reg(value)
+
+
+def test_same_value_open_in_other_scope_stays_registered():
+    value = "Pw-9" + "fQ!x7Lz2Kc"
+    a = si.intake(f"password: {value}", "A").new[0]
+    b = si.intake(f"password: {value}", "B").new[0]
+    si.discard(a.id)
+    assert _reg(value) and b.status == "pending"
+    si.store().purge(now=b.expires + 1)
+    assert not _reg(value)
+
+
+# D3: a saved value stays scrubbed — after save and after a restart (lazy load of ``secret`` items).
+
+def test_saved_value_stays_scrubbed(tmp_path):
+    from agent.redact import redact_registered_vault_values as scrub
+    entry = si.intake(f"mein token {FAKE_GH}", "s1").new[0]
+    assert si.save(entry.id, vault_factory=_vault(tmp_path))["ok"]
+    assert FAKE_GH not in scrub(f"tool echoed {FAKE_GH}")
+
+
+def test_saved_secret_items_scrubbed_after_restart():
+    from agent import redact as r
+    from agent.vault_store import get_vault_store
+    get_vault_store().add_item("secret", "Token · GEHEIMNIS:token-1", {"value": FAKE_TOK})
+    get_vault_store().add_item("login", "x", {"identifier_type": "username", "identifier": "bob",
+                                              "password": "Login" + "Pw0rd!x"}, origin="https://example.invalid")
+    r.clear_vault_redaction_values()               # what a fresh process starts with
+    assert FAKE_TOK not in r.redact_registered_vault_values(f"echo {FAKE_TOK}")
+    # only ``secret`` items: login passwords are registered by the fill path when used
+    assert "LoginPw0rd!x" in r.redact_registered_vault_values("LoginPw0rd!x")
