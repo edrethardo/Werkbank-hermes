@@ -30,7 +30,7 @@ from tools.delegate_tool_child_run import (  # noqa: F401
 )
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
+    _get_max_spawn_depth, _get_model_profiles, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
@@ -214,6 +214,8 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    # delegation.models profile that sets reasoning_effort (WB-1211); None = delegation.reasoning_effort.
+    reasoning_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -259,7 +261,7 @@ def _build_child_agent(
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
-        routing_cfg=routing_cfg,
+        routing_cfg=routing_cfg, reasoning_cfg=reasoning_cfg,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -400,16 +402,9 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
-def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
-    top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
-) -> tuple[List[tuple], Optional[str]]:
-    """Build every child on the main thread (construction is not thread-safe);
-    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
-    from tools.delegation_live_log import wrap_progress_callback
-    from tools.delegation_output_schema import append_output_contract
-    overrides = {
+def _child_overrides(creds: Dict[str, Any], routing_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """``_build_child_agent`` override kwargs for one resolved credential bundle."""
+    return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
@@ -417,8 +412,70 @@ def _build_children(
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
     }
+
+
+def _resolve_task_model_profiles(
+    task_list: List[Dict[str, Any]], cfg: Dict[str, Any], parent_agent,
+) -> tuple[List[Optional[Dict[str, Any]]], Optional[str]]:
+    """Per-task route for ``tasks[].model_profile`` (WB-1211): ``([route_or_None, ...], None)`` or ``([], error)``.
+
+    A route is ``{"name", "creds", "routing_cfg", "reasoning_cfg"}``. The profile is resolved by the same
+    ``_resolve_delegation_credentials`` as ``delegation.provider``/``base_url`` and is the routing owner of the
+    child (fallback chain: pinned profile → only its own ``fallback_providers``; ``{}`` → parent's, like any
+    unpinned child). Unknown names and unresolvable profiles fail the whole call before any child spawns —
+    never a silent fallback onto another model. Tasks without a profile get None (today's route)."""
+    if not any(isinstance(t, dict) and t.get("model_profile") is not None for t in task_list):
+        return [None] * len(task_list), None
+    profiles = _get_model_profiles(cfg)
+    resolved: Dict[str, Dict[str, Any]] = {}
+    routes: List[Optional[Dict[str, Any]]] = []
+    for i, t in enumerate(task_list):
+        raw = t.get("model_profile")
+        if raw is None:
+            routes.append(None)
+            continue
+        name = raw.strip() if isinstance(raw, str) else ""
+        if not name:
+            return [], f"Task {i} 'model_profile' must be a profile name (string)."
+        if not profiles:
+            return [], (
+                f"Task {i} asks for model_profile {name!r}, but delegation.models is not configured. "
+                "Drop model_profile or define the profile in config.yaml."
+            )
+        if name not in profiles:
+            return [], (
+                f"Task {i} has unknown model_profile {name!r}. "
+                f"Configured profiles (delegation.models): {', '.join(profiles)}."
+            )
+        if name not in resolved:
+            profile = profiles[name]
+            try:
+                creds = _resolve_delegation_credentials(profile, parent_agent)
+            except ValueError as exc:
+                return [], f"model_profile {name!r}: {exc}"
+            resolved[name] = {
+                "name": name, "creds": creds, "routing_cfg": profile,
+                "reasoning_cfg": profile if "reasoning_effort" in profile else None,
+            }
+        routes.append(resolved[name])
+    return routes, None
+
+
+def _build_children(
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+    top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
+    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    task_routes: Optional[List[Optional[Dict[str, Any]]]] = None,
+) -> tuple[List[tuple], Optional[str]]:
+    """Build every child on the main thread (construction is not thread-safe);
+    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
+    ``task_routes[i]`` (from ``_resolve_task_model_profiles``) replaces the call-wide route for task i."""
+    from tools.delegation_live_log import wrap_progress_callback
+    from tools.delegation_output_schema import append_output_contract
+    overrides = _child_overrides(creds, routing_cfg)
     children = []
     for i, t in enumerate(task_list):
+        _route = task_routes[i] if task_routes and i < len(task_routes) else None
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -427,11 +484,15 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=(_route["creds"] if _route else creds)["model"], max_iterations=max_iterations,
+                task_count=len(task_list), parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                **(_child_overrides(_route["creds"], _route["routing_cfg"]) if _route else overrides),
+                **({"reasoning_cfg": _route["reasoning_cfg"]} if _route and _route["reasoning_cfg"] is not None else {}),
             )
         except ValueError as exc:
             return [], str(exc)
+        if _route:
+            child._delegate_model_profile = _route["name"]
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -446,6 +507,11 @@ def _build_children(
         if _writer is not None:
             child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), _writer)
             child._live_transcript_path = str(_writer.path)
+            if _route:
+                # The model the child was actually built with (resolved profile, or the parent's for `{}`).
+                with _quiet("Could not note model in live transcript %d", i):
+                    _writer.event("model", f"{getattr(child, 'model', None) or '?'} via "
+                                  f"{getattr(child, 'provider', None) or '?'} (model_profile: {_route['name']})")
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
             _ident_ref = getattr(child, "_progress_identity_ref", None)
@@ -543,6 +609,9 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+    task_routes, err = _resolve_task_model_profiles(task_list, cfg, parent_agent)
+    if err:
+        return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
@@ -573,6 +642,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        task_routes=task_routes,
     )
     if err:
         return tool_error(err)
@@ -675,10 +745,38 @@ def _build_dynamic_schema_overrides() -> dict:
             k: v for k, v in tasks["items"]["properties"].items() if k != "group"
         }}
 
-    return {
-        "description": _build_top_level_description(independent_completions=independent_completions),
-        "parameters": overrides_params,
-    }
+    description = _build_top_level_description(independent_completions=independent_completions)
+    profiles = _get_model_profiles()
+    if profiles:
+        # Advertised only when configured: without delegation.models the schema stays byte-identical.
+        tasks = overrides_params["properties"]["tasks"]
+        tasks["items"] = {**tasks["items"], "properties": {
+            **tasks["items"]["properties"], "model_profile": _model_profile_param(profiles),
+        }}
+        description += _DESCRIPTION_MODEL_PROFILE
+    return {"description": description, "parameters": overrides_params}
+
+
+_DESCRIPTION_MODEL_PROFILE = (
+    "\n- Per task, `model_profile` picks a configured model (see its description); omitted = the default above."
+)
+
+
+def _model_profile_param(profiles: Dict[str, Dict[str, Any]]) -> dict:
+    """tasks[].model_profile: enum of the delegation.models names, each named with its model."""
+    def _label(route: Dict[str, Any]) -> str:
+        model = str(route.get("model") or "").strip()
+        provider = str(route.get("provider") or "").strip()
+        if not model and not provider:
+            return "your own model"
+        return f"{model or 'default model'}" + (f" via {provider}" if provider else "")
+    choices = "; ".join(f"{name} = {_label(route)}" for name, route in profiles.items())
+    return _p(
+        "string",
+        f"Optional model for THIS child, by profile name ({choices}). Omit to use the default subagent "
+        "model. Unknown names are rejected.",
+        enum=list(profiles),
+    )
 
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}

@@ -1390,6 +1390,11 @@ DEFAULT_CONFIG = {
         # Subagent effort: "ultra" | "max" | "xhigh" | "high" | "medium" | "low" | "minimal" |
         # "none" (empty = inherit)
         "reasoning_effort": "",
+        # Named per-task model profiles (WB-1211): {name: {model, provider?, reasoning_effort?, base_url?,
+        # api_key?, api_mode?, fallback_providers?, request_overrides?}}. delegate_task tasks[] picks one with
+        # model_profile (offered in the schema only when this map is non-empty; unknown name = error).
+        # {} for a profile = the parent's model. Empty map = today's behaviour.
+        "models": {},
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,

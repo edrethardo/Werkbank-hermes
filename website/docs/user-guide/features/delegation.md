@@ -289,7 +289,39 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+The `delegation.model`/`delegation.provider` pin is the default for every child. To pick a model **per task**, use named model profiles (below).
+
+### Per-task model profiles (`delegation.models`)
+
+Define named profiles once; the parent then chooses one per task with `model_profile`:
+
+```yaml
+# ~/.hermes/config.yaml
+delegation:
+  models:
+    schnell:                          # reviewers, read-only and measuring tasks
+      model: "claude-sonnet-4-6"
+      provider: "anthropic"
+      reasoning_effort: "low"
+    stark: {}                         # {} = the parent's own model (e.g. Opus for build work)
+```
+
+```python
+delegate_task(tasks=[
+    {"goal": "Review the diff in PR 12 for regressions", "model_profile": "schnell"},
+    {"goal": "Implement the parser change described in ...", "model_profile": "stark"},
+    {"goal": "Measure cold-start time of ..."},          # no profile: delegation.model/provider as above
+])
+```
+
+- A profile takes the same route keys as the `delegation` section — `model`, `provider`, `base_url`, `api_key`, `api_mode` — and resolves through the same credential path as `delegation.provider` / `delegation.base_url` (runtime provider bundle, credential pools, request overrides). Keys a profile leaves out come from the **parent**, not from `delegation.model`/`provider`: a profile with only `model` keeps the parent's provider, and `{}` runs on the parent's model.
+- `reasoning_effort` in a profile replaces `delegation.reasoning_effort` for that child; without it the delegation setting applies.
+- Fallback follows the pinned-child rule: a profile that sets a provider, endpoint or model uses only its own `fallback_providers` (absent = no fallback); `{}` inherits the parent chain like any unpinned child. `request_overrides` may also be set per profile.
+- `model_profile` appears in the `delegate_task` schema only when `delegation.models` is non-empty, as an enum of the configured names (each described with its model). An unknown name, or a `model_profile` while no profiles are configured, fails the whole call before any child starts — there is no silent fallback to another model. A profile whose provider cannot be resolved fails the same way.
+- The model a child actually runs on shows in `delegate_task(action="list")`, in each result entry's `model` field, and — for tasks with a profile — as a `model` line at the top of the task's live transcript.
+- Without `delegation.models` (missing or `{}`) nothing changes: same schema, same children.
+
+Tasks can also go to the [kanban board](kanban.md#per-task-model-override), which has its own per-task model override.
 
 ## The `/review` Command
 
@@ -643,6 +675,8 @@ delegation:
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
+  # models:                                          # Optional named per-task profiles, chosen with tasks[].model_profile
+  #   schnell: {model: "claude-sonnet-4-6", provider: "anthropic"}   # (see Per-task model profiles above)
 
 # Or use a direct custom endpoint instead of provider:
 delegation:

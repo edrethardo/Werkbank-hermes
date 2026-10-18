@@ -172,6 +172,27 @@ def _get_orchestrator_enabled() -> bool:
         return val.strip().lower() in {"true", "1", "yes", "on"}
     return True
 
+def _get_model_profiles(cfg: Optional[dict] = None) -> Dict[str, Dict[str, Any]]:
+    """delegation.models: profile name -> route dict (WB-1211), in config order.
+
+    A profile is shaped like the delegation section's route keys (model, provider, base_url,
+    api_key, api_mode, reasoning_effort, request_overrides, fallback_providers); ``{}``/null means
+    "the parent's model". Missing, empty or non-map → ``{}`` (feature off, schema unchanged).
+    Entries with a non-string name or a non-map value are skipped with a warning."""
+    raw = (_cfg() if cfg is None else cfg).get("models")
+    if not isinstance(raw, dict):
+        return {}
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for name, route in raw.items():
+        key = str(name).strip() if isinstance(name, str) else ""
+        if route is None:
+            route = {}
+        if not key or not isinstance(route, dict):
+            logger.warning("delegation.models entry %r ignored: needs a name and a map of settings", name)
+            continue
+        profiles[key] = route
+    return profiles
+
 def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
@@ -488,13 +509,14 @@ def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
-    routing_cfg: Optional[Dict[str, Any]] = None,
+    routing_cfg: Optional[Dict[str, Any]] = None, reasoning_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
     or is Nous Portal (dual-wire); a pinned ``delegation.command`` must exist on PATH or the spawn fails loudly;
     ``override_provider`` clears the parent's ACP transport, fallback chain and OpenRouter routing filters so the
-    pinned provider is actually honoured."""
+    pinned provider is actually honoured. ``reasoning_cfg`` (a delegation.models profile that sets
+    ``reasoning_effort``) replaces delegation.reasoning_effort for this child only."""
     effective_model = model or parent_agent.model
     # provider/base_url are one bundle: all from the override, or all from the parent. Per-field fallback built
     # children like an override provider pointed at the PARENT's endpoint (e.g. copilot credentials on the
@@ -568,7 +590,7 @@ def _resolve_child_runtime(
     # YAML ``false`` must disable thinking, not coerce to "" and inherit.
     child_reasoning = getattr(parent_agent, "reasoning_config", None)
     try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (delegation_cfg if reasoning_cfg is None else reasoning_cfg).get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
             parsed = parse_reasoning_effort(delegation_effort)
