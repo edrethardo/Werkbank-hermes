@@ -109,14 +109,23 @@ platforms without buttons:
   after 10 minutes. Either way the placeholder stays in the conversation.
 
 Detection: vendor-prefixed keys, Telegram bot tokens, PEM private keys,
-three-part JWTs, `Bearer` values, DSN/URL passwords and `password=` / `token:`
-style assignments with an opaque value. Commit SHAs, UUIDs and bare hashes are
-not reported, nor are assignment values that read as code or configuration:
-call and attribute expressions (`getpass.getpass()`, `settings.DB_PASSWORD`),
-paths (`/…`, `~/…`, `./…`), file names with an extension, environment variable
-names and upper-case placeholders (`REPLACE_ME…`, `CHANGEME`, `xxx`, `<…>`,
-`${…}`). `PWD` is the working directory, not a password; `pw` / `pass` count
-only as a whole word of the key.
+three-part JWTs, `Bearer` values, DSN/URL passwords, `password=` / `token:`
+style assignments with an opaque value — also behind a lead-in such as
+`Hinweis: password=…` or `env: OPENAI_API_KEY=…` and as URL query parameters
+(`?token=…`, `&key=…`) — and a bare pasted key of 40+ characters with mixed
+case, digits and high entropy. Commit SHAs, UUIDs and hex hashes are not
+reported, nor are assignment values that clearly read as code or
+configuration: calls and code expressions (`getpass.getpass()`,
+`settings.DB_PASSWORD`), paths of plain segments (`/home/u/projekt`,
+`~/secrets/db.txt`, `./run`), file names with a real extension
+(`test_x.py`), environment variable names (`MY_APP_SECRET`), snake-case names
+(`tokenizer_v2_large_model`) and placeholders (`REPLACE_ME…`, `CHANGEME`,
+`xxx`, `<…>`, `${…}`). A value with mixed case and digits, or digits and special
+characters, is a secret even when it looks like one of these
+(`Hunter2.Abc9`, `~Secr3t!x`, `Q7ZK_9XQ2_PLMW_88AA`). A bare base64 string
+of hash length is reported: it cannot be told apart from a generated key.
+`PWD` is the working directory, not a password; `pw` / `pass` count only as a
+whole word of the key.
 
 Text that joins a running turn — `/steer`, a redirect, a message typed while
 the agent works in the TUI, ACP or API server — passes the same replacement in
@@ -125,8 +134,10 @@ descriptions the gateway adds after the message arrived are scanned again
 before the transcript is written or echoed (`🎙️ "…"` shows the placeholder).
 
 While a value waits for your decision it is also on the model-egress scrub
-list (a tool result that echoes it is redacted). Saving, discarding or expiry
-removes it from that list again. If the detector itself fails, the text
+list (a tool result that echoes it is redacted). Discarding or expiry removes
+it again — unless another open message or a vault fill still holds the same
+value. A saved value stays on the list for the profile; after a restart the
+profile's saved `secret` items are loaded on the first scrub. If the detector itself fails, the text
 passes unchanged (fail-open, logged as a warning); the later stages scan
 again. The audit log line (`hermes.secret_intake`) names kind,
 placeholder and a hashed session id, never the value. Turn it off with

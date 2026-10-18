@@ -15,8 +15,11 @@ Contract:
   intake twice (plugin, then gateway, then backstop) is a no-op the second time.
 * The value lives only in :class:`_Store` (process memory) for ``TTL_SECONDS``; then it is wiped. It is
   never logged — the audit line names art, placeholder and scope hash only. Every intake value is
-  also registered with the model-egress redaction (``register_vault_redaction_value``), so a tool
-  result that echoes it later is scrubbed too; save/discard/expiry removes that registration again.
+  also registered with the model-egress redaction (``register_intake_redaction_value``, one reference
+  per open entry), so a tool result that echoes it later is scrubbed too. Discard/expiry releases the
+  reference; the value leaves the scrub list only when no other open entry holds it and no vault fill
+  registered it. A SAVED value stays scrubbed for the profile's lifetime (durable set; after a restart
+  the profile's ``secret`` vault items are loaded on the first scrub).
 * Text joining a RUNNING turn goes through :func:`intake_turn_text` inside ``AIAgent.steer`` /
   ``redirect`` (TUI, classic CLI, ACP, API server and gateway all end there); the gateway also
   re-scans the text it prepared after ``handle_message`` (STT transcript, document notes).
@@ -28,18 +31,24 @@ Contract:
 
 Detection reuses the provider-prefix catalogue of ``agent/redact.py`` and adds a narrow set of
 shapes (Telegram bot token, PEM private key, 3-part JWT, bearer header, DSN / URL password,
-``password=`` / ``token:`` assignments with an opaque value). Commit SHAs, UUIDs and bare hashes
-are NOT findings on their own; see ``tests/agent/test_secret_intake.py`` for the false-alarm corpus.
+``password=`` / ``token:`` assignments with an opaque value — also behind a ``word:`` lead-in and as
+URL query parameters — and a bare pasted key: ≥ 40 chars, mixed case + digits, high entropy).
+Path / file name / ENV name / snake-case exemptions need a clear structure and lose against an
+entropy counter-check. Commit SHAs, UUIDs and hex hashes are NOT findings on their own; a bare
+base64 digest (44/88 chars) is — it cannot be told from ``openssl rand -base64 32``. See
+``tests/agent/test_secret_intake.py`` for the corpus.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import secrets as _secrets
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -75,49 +84,181 @@ _KEYWORD_RE = re.compile(
 # ``pwd`` is the working directory (``PWD=/data/…``), never a password key; ``pw``/``pass`` only count
 # as a whole word of the key (``DB_PASS``, ``pw:``) — the word-bounded check below enforces that.
 _PASSWORD_KEYWORD_RE = re.compile(r"passwor[dt]|passwd|kennwort|pw|pass", re.IGNORECASE)
-# key, optional closing quote, ``=`` or ``:``, optional opening quote, the value (no whitespace/quote/delimiter)
+# key, optional closing quote, ``=`` or ``:``, optional opening quote, the value (no whitespace/quote/delimiter).
+# A lead-in like ``Hinweis:`` / ``login:`` / ``env:`` swallows ``password=…`` as its value; the value
+# is then scanned again (:func:`_assign_matches`) so the assignment behind it is still seen.
 _ASSIGN_RE = re.compile(
     r"(?<![A-Za-z0-9_.\-])(?P<key>[A-Za-z][A-Za-z0-9_.\-]{0,60})[\"']?[ \t]*[:=][ \t]*[\"']?"
     r"(?P<val>[^\s\"'`,;<>(){}\[\]]{6,})"
 )
+_MAX_LEAD_IN_DEPTH = 4           # ``a:b:c:password=…``; bounded so ``a=a=a=…`` stays linear-ish
+_INNER_ASSIGN_RE = re.compile(r"(?P<key>[A-Za-z][A-Za-z0-9_.\-]{0,60})[\"']?[ \t]*[:=]")
+# URL query parameter: the value ends at ``&`` / ``#`` (a plain assignment would run on into the next one).
+_URL_QUERY_RE = re.compile(r"[?&](?P<key>[A-Za-z0-9_.\-]{1,60})=(?P<val>[^&#\s\"'<>`]{6,})")
 _BEARER_RE = re.compile(r"\bBearer[ \t]+(?P<val>[A-Za-z0-9._~+/=\-]{20,})")
 _JWT3_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+# A bare pasted key: a whitespace/quote-delimited run of key characters, no key name, no prefix.
+_BARE_RUN_RE = re.compile(r"(?<![^\s\"'`(\[{<>:=,;])(?P<val>[A-Za-z0-9_\-+/.~]{40,512}={0,3})(?![^\s\"'`)\]}<>,;.!?])")
+_IDENT_WORD_RE = re.compile(r"[A-Z]?[a-z]{3,}")   # word runs of an identifier; rare in random keys
+_PEM_BLOCK_RE = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.DOTALL)
+_PUBKEY_LEAD_RE = re.compile(r"(?:ssh|ecdsa|sk)-[A-Za-z0-9@.\-]+[ \t]+$")   # ``ssh-ed25519 AAAA…`` is public
+_BARE_MIN_ENTROPY = 4.3          # bits/char; random base62 of 40+ chars ≈ 4.8–5.2, prose/CamelCase ≈ 3.6–4.2
 _NOT_A_VALUE_RE = re.compile(
     r"^(?:\$|%|\*{3}|\.{3}|x{3,}|os\.(?:getenv|environ)|process\.env|env\.|none$|null$|true$|false$|"
     r"required$|optional$|string$|example|your[_-]|changeme$|placeholder|redacted|«redacted)",
     re.IGNORECASE,
 )
 _WORDISH_SEGMENT_RE = re.compile(r"[a-z]+|[0-9]+")
-# Values that are code, paths, file names or placeholders — not secrets (review corpus WB-1212):
-_DOTTED_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")      # settings.DB_PASSWORD
-_PATH_RE = re.compile(r"(?:/|~|\.{1,2}/)")                                                 # /x, ~/x, ./x, ../x
-_FILENAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*\.[A-Za-z][A-Za-z0-9]{0,5}")          # test_x.py, db.txt
-_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z]{3,}")                        # MY_APP_SECRET, CHANGEME
 _PLACEHOLDER_WORD_RE = re.compile(r"(?i)(?:replace|change|insert|enter|your|dein|todo|fixme|placeholder)")
-_SNAKE_IDENT_SEGMENT_RE = re.compile(r"[a-z]{2,}|[a-z]{0,3}[0-9]{1,4}")                      # tokenizer_v2_large_model
+
+# -- exemptions with clear structure (review corpus WB-1212). Each one is a SHAPE a human writes in
+# code/config prose; an entropy counter-check (:func:`_is_strong`) overrules every one except a call.
+# Real file extensions only — ``Hunter2.Abc9`` / ``Sommer2024.de`` are passwords, ``db.txt`` is a file.
+_FILE_EXTENSIONS = frozenset("""
+    py pyc pyi txt md rst yaml yml json jsonl toml ini cfg conf env pem key pub crt cer csr p12 pfx der
+    log csv tsv sh bash zsh fish ps1 bat js mjs cjs ts tsx jsx html htm css scss xml sql sqlite db
+    gz tgz zip tar bz2 xz 7z rar pdf png jpg jpeg gif svg webp ico mp3 mp4 wav ogg docx xlsx pptx odt
+    lock go rs java kt c h cc cpp hpp rb php pl lua swift dart vue ipynb gpg asc age kdbx service timer
+    socket desktop plist properties gradle dockerfile tf tfvars hcl nix
+""".split())
+_FILENAME_RE = re.compile(r"(?P<stem>[A-Za-z0-9_][A-Za-z0-9_.\-]*)\.(?P<ext>[A-Za-z][A-Za-z0-9]{0,9})")
+# Dotted expression: only when it starts with a typical code root or carries an identifier shape.
+_DOTTED_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+_CODE_ROOTS = frozenset("""
+    self cls this settings config conf cfg os env environ request req app ctx context args kwargs opts
+    options params data st secrets keyring getpass process window document module vars props state
+    current_app django flask g creds credentials auth client session sys
+""".split())
+_PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
+# ENV name: segments of letters with an optional short number (``AWS_S3_BUCKET``, ``DB_PASSWORD``)
+_ENV_SEGMENT_RE = re.compile(r"[A-Z]{2,}[0-9]{0,2}|[A-Z][0-9]{1,2}|[0-9]{1,3}")
+_ENV_WORD_PARTS = (
+    "KEY", "TOKEN", "SECRET", "PASS", "PWD", "API", "USER", "HOST", "PORT", "URL", "URI", "HOME", "PATH",
+    "NAME", "DIR", "FILE", "CONFIG", "ENV", "AUTH", "CLIENT", "ACCESS", "DB", "DATABASE", "SERVICE", "APP",
+)
+_SNAKE_WORD_RE = re.compile(r"[a-z]{4,}")
+_VERSION_SEGMENT_RE = re.compile(r"v?[0-9]{1,4}|[a-z]{1,3}")
+
+
+def _char_classes(value: str) -> Tuple[bool, bool, bool, bool]:
+    """(lower, upper, digit, special) — special excludes the structure characters ``._-/~``."""
+    return (any(c.islower() for c in value), any(c.isupper() for c in value),
+            any(c.isdigit() for c in value), any(not c.isalnum() and c not in "._-/~" for c in value))
+
+
+def _shannon(value: str) -> float:
+    if not value:
+        return 0.0
+    n = len(value)
+    return -sum((k / n) * math.log2(k / n) for k in Counter(value).values())
+
+
+def _is_strong(value: str) -> bool:
+    """Entropy counter-check: mixed upper/lower case with a digit, or digit + special character, or
+    a high per-character Shannon entropy for its length — a generated or chosen password, never a
+    name. Overrules the path/file/ENV/snake exemptions."""
+    lower, upper, digit, special = _char_classes(value)
+    if lower and upper and digit:
+        return True
+    if digit and special and (lower or upper):
+        return True
+    return len(value) >= 16 and _shannon(value) >= 4.0 and digit
+
+
+def _is_path(value: str) -> bool:
+    """``/home/u/projekt``, ``~/secrets/db.txt``, ``./run``, ``../config/pw.yaml``, ``config/x.json``:
+    ``/``-separated segments without special characters; an absolute or home path needs at least two
+    segments (``/9fK$2Lq!m`` and ``~Secr3t!x`` are not paths). No segment may look generated."""
+    m = re.match(r"(~/|\.{1,2}/|/)?", value)
+    lead = m.group(1) or ""
+    body = value[len(lead):]
+    segments = body.split("/")
+    if not segments or any(not _PATH_SEGMENT_RE.fullmatch(seg) for seg in segments if seg) or not all(segments[:-1]):
+        return False
+    segments = [seg for seg in segments if seg]
+    if not segments:
+        return False
+    if lead in ("/", "~/"):
+        if len(segments) < 2 and not (lead == "~/" and _is_filename(segments[0])):
+            return False
+    elif lead == "":
+        if len(segments) < 2:
+            return False
+    return not any(_is_strong(seg) and not _is_filename(seg) for seg in segments)
+
+
+def _is_filename(value: str) -> bool:
+    m = _FILENAME_RE.fullmatch(value)
+    return bool(m) and m.group("ext").lower() in _FILE_EXTENSIONS and not _is_strong(m.group("stem"))
+
+
+def _is_code_expression(value: str) -> bool:
+    """``settings.DB_PASSWORD``, ``self.config.api_key``, ``request.form.get`` — not ``correct.horse…``."""
+    if not _DOTTED_IDENT_RE.fullmatch(value):
+        return False
+    parts = value.split(".")
+    if parts[0] in _CODE_ROOTS:
+        return True
+    return any("_" in p for p in parts) and not _is_strong(value)
+
+
+def _is_env_name(value: str) -> bool:
+    """``MY_APP_SECRET``, ``OPENAI_API_KEY``, ``AWS_S3_BUCKET``; a single word only with a typical part.
+    ``Q7ZK_9XQ2_PLMW_88AA`` / ``KX7_P9Q2`` / ``QWERTZUIOPX`` are values."""
+    if not re.fullmatch(r"[A-Z0-9_]+", value) or not value[0].isalpha():
+        return False
+    segments = value.split("_")
+    if not all(_ENV_SEGMENT_RE.fullmatch(seg) for seg in segments):
+        return False
+    if len(segments) >= 2:
+        return sum(1 for seg in segments if re.fullmatch(r"[A-Z]{2,}", seg)) * 2 >= len(segments)
+    return any(part in value for part in _ENV_WORD_PARTS)
+
+
+def _is_snake_identifier(value: str) -> bool:
+    """``tokenizer_v2_large_model``: lower-case words joined by ``_``/``-`` with at most a version
+    number — a name, not a token. ``xq7_zk9_pw3_mf2_ab4`` has no word and four letter-digit segments."""
+    segments = re.split(r"[_-]", value)
+    if len(segments) < 2 or not all(re.fullmatch(r"[a-z0-9]+", s) for s in segments):
+        return False
+    if not any(_SNAKE_WORD_RE.fullmatch(s) for s in segments):
+        return False
+    mixed = [s for s in segments if not _SNAKE_WORD_RE.fullmatch(s) and not _VERSION_SEGMENT_RE.fullmatch(s)]
+    return not mixed
 
 
 def _value_is_code_or_placeholder(value: str, after: str) -> bool:
-    """True for values a human writes in code/config prose, not as a secret: a call or attribute
-    expression, a path, a file name with an extension, an ENV-variable name or an upper-case
-    placeholder (``REPLACE_ME…``, ``CHANGEME``), ``xxx…``. *after* is the text right after the value."""
+    """True for values a human writes in code/config prose, not as a secret: a call, a code
+    expression, a path, a file name with a real extension, an ENV-variable name, a snake-case name or
+    an upper-case placeholder (``REPLACE_ME…``), ``xxx…``. *after* is the text right after the value."""
     if after.startswith("("):
         return True                                   # get_token(), getpass.getpass()
-    if _PATH_RE.match(value) or _DOTTED_IDENT_RE.fullmatch(value) or _FILENAME_RE.fullmatch(value):
-        return True
-    if _ENV_NAME_RE.fullmatch(value):
-        return True
     if re.fullmatch(r"(?i)x{3,}", value):
         return True
     if value.isupper() and _PLACEHOLDER_WORD_RE.search(value):
         return True
-    return False
+    if _is_code_expression(value):
+        return True
+    if _is_strong(value) and not _is_path(value):
+        return False
+    return _is_path(value) or _is_filename(value) or _is_env_name(value) or _is_snake_identifier(value)
 
 
-def _is_snake_identifier(value: str) -> bool:
-    """``tokenizer_v2_large_model``: lower-case words joined by ``_``/``-`` — a name, not a token."""
-    segments = re.split(r"[_-]", value)
-    return len(segments) >= 2 and all(_SNAKE_IDENT_SEGMENT_RE.fullmatch(s) for s in segments)
+def _bare_key_is_secret(value: str) -> bool:
+    """A long pasted key alone: ≥ 40 chars, lower + upper + digit, high entropy, no hex/hash/UUID,
+    no path or URL shape, no base64 padding run of an image. Commit SHAs and hashes are hex only."""
+    if re.fullmatch(r"[A-Fa-f0-9\-]+", value):
+        return False                                  # SHA, hash, UUID
+    if value.startswith(("//", "~", "./", "../")) or ("/" in value and _is_path(value)):
+        return False                                  # path / URL-ish
+    if re.match(r"(?i)(?:sha|md)[0-9]{1,3}[-:]", value):
+        return False                                  # SRI ``sha384-…`` / digest ``sha256:…``
+    lower, upper, digit, _ = _char_classes(value)
+    if not (lower and upper and digit) or sum(c.isdigit() for c in value) < 2:
+        return False
+    if sum(len(w) for w in _IDENT_WORD_RE.findall(value)) * 5 >= len(value) * 3:
+        return False                                  # ``LongVariableName2026Version3`` — mostly words
+    return _shannon(value) >= _BARE_MIN_ENTROPY
 
 
 def _redact_mod():
@@ -152,7 +293,27 @@ def _assignment_value_is_secret(key: str, value: str, after: str = "") -> bool:
     if r._has_word_bounded_keyword(key, _PASSWORD_KEYWORD_RE):
         # A human password: any non-trivial value, but not a plain lowercase word (``password: required``).
         return len(value) >= 6 and not re.fullmatch(r"[a-zäöüß]+", value)
-    return len(value) >= 12 and not _is_snake_identifier(value) and r._looks_like_opaque_credential(value)
+    if len(value) < 12:
+        return False
+    return r._looks_like_opaque_credential(value) or _is_strong(value) or _letter_digit_segments(value) >= 3
+
+
+def _letter_digit_segments(value: str) -> int:
+    """``xq7_zk9_pw3_mf2_ab4`` / ``Q7ZK_9XQ2_PLMW_88AA``: segments mixing letters and digits."""
+    return sum(1 for seg in re.split(r"[_.\-]", value)
+               if re.search(r"[A-Za-z]", seg) and re.search(r"[0-9]", seg))
+
+
+def _assign_matches(scan: str):
+    """``_ASSIGN_RE`` matches, plus the matches inside a value that itself starts with an assignment
+    (lead-in ``Hinweis: password=…``, ``login:password=…``, ``a:token:…``), up to a fixed depth."""
+    stack = [(0, len(scan), 0)]
+    while stack:
+        lo, hi, depth = stack.pop()
+        for m in _ASSIGN_RE.finditer(scan, lo, hi):
+            yield m
+            if depth < _MAX_LEAD_IN_DEPTH and _INNER_ASSIGN_RE.match(m.group("val")):
+                stack.append((m.start("val"), m.end("val"), depth + 1))
 
 
 @dataclass(frozen=True)
@@ -200,14 +361,43 @@ def find_secrets(text: str) -> List[Finding]:
         add(m.start(2), m.end(2), "db-passwort")
     for m in r._URL_USERINFO_RE.finditer(scan):
         add(m.start(3), m.end(3), "url-passwort")
-    for m in _ASSIGN_RE.finditer(scan):
+    for m in _assign_matches(scan):
         key, value = m.group("key"), m.group("val")
+        if m.start("key") > 0 and scan[m.start("key") - 1] in "?&":
+            continue                                  # URL query: _URL_QUERY_RE splits at ``&``
         if not r._has_word_bounded_keyword(key, _KEYWORD_RE):
             continue
+        inner = _INNER_ASSIGN_RE.match(value)
+        if inner and r._has_word_bounded_keyword(inner.group("key"), _KEYWORD_RE):
+            continue                                  # ``secret: token=…``: the inner assignment decides
         if not _assignment_value_is_secret(key, value, scan[m.end("val"):m.end("val") + 1]):
             continue
         art = "passwort" if r._has_word_bounded_keyword(key, _PASSWORD_KEYWORD_RE) else "token"
         add(m.start("val"), m.end("val"), art, key)
+    for m in _URL_QUERY_RE.finditer(scan):
+        key, value = m.group("key"), m.group("val")
+        if key.lower() not in r._SENSITIVE_QUERY_PARAMS and not r._has_word_bounded_keyword(key, _KEYWORD_RE):
+            continue
+        if PLACEHOLDER_RE.search(value) or _NOT_A_VALUE_RE.match(value):
+            continue
+        if r._has_word_bounded_keyword(key, _PASSWORD_KEYWORD_RE):
+            ok = not re.fullmatch(r"[a-zäöüß]+", value)
+        else:
+            ok = len(value) >= 8 and (r._looks_like_opaque_credential(value) or _is_strong(value))
+        if ok:
+            art = "passwort" if r._has_word_bounded_keyword(key, _PASSWORD_KEYWORD_RE) else "token"
+            add(m.start("val"), m.end("val"), art, key)
+    pem_spans = [(m.start(), m.end()) for m in _PEM_BLOCK_RE.finditer(scan)] if "-----BEGIN " in scan else []
+    for m in _BARE_RUN_RE.finditer(scan):
+        value = m.group("val")
+        if scan[max(0, m.start() - 7):m.start()].lower() == "base64,":
+            continue                                  # data URI payload (inline image)
+        if _PUBKEY_LEAD_RE.search(scan[max(0, m.start() - 64):m.start()]):
+            continue                                  # SSH public key
+        if any(s <= m.start() < e for s, e in pem_spans):
+            continue                                  # certificate / public key block body
+        if _bare_key_is_secret(value):
+            add(m.start("val"), m.end("val"), "api-key")
 
     # Nothing inside an earlier placeholder is a finding (``GEHEIMNIS:github-token-1`` reads like
     # ``key:value``): intake must be idempotent across the plugin → gateway → backstop chain.
@@ -262,7 +452,7 @@ class _Store:
     def _purge_locked(self, now: float) -> List[PendingSecret]:
         expired = [e for e in self._by_id.values() if e.status == "pending" and e.expires <= now]
         for e in expired:
-            _unregister_egress(e.value, e.home)
+            _release_egress(e.value, e.home)
             e.value = None
             e.status = "expired"
         # forget finished entries after another TTL so the dict stays bounded
@@ -330,7 +520,9 @@ class _Store:
             e = self._by_id.get(entry_id)
             if e is None or e.status != "pending":
                 return None
-            _unregister_egress(e.value, e.home)
+            if status == "saved":
+                _register_durable_egress(e.value, e.home)   # saved: scrubbed for the profile's lifetime
+            _release_egress(e.value, e.home)
             e.value = None
             e.status = status
             e.handle = handle
@@ -340,6 +532,8 @@ class _Store:
         """Tests only."""
         with self._lock:
             for e in self._by_id.values():
+                if e.status == "pending":
+                    _release_egress(e.value, e.home)
                 e.value = None
             self._by_id.clear()
             self._counters.clear()
@@ -413,7 +607,7 @@ def redact_text(text: str, scope: str, *, surface: str = "unbekannt") -> Tuple[s
         entry, is_new = _STORE.placeholder_for(scope, f.art, value, hint=f.hint, surface=surface, home=home)
         if is_new:
             created.append(entry)
-            _register_egress(value)
+            _register_egress(value, home)
             _audit("erkannt", entry)
         out.append(text[pos:f.start])
         out.append(entry.placeholder)
@@ -590,25 +784,55 @@ def card_choices(entries: List[PendingSecret]) -> List[Dict[str, str]]:
             {"value": f"drop:{ids}", "label": "🗑 Verwerfen"}]
 
 
-def _unregister_egress(value: Optional[str], home: str) -> None:
-    """Counterpart of :func:`_register_egress` when the entry finishes (save/discard/expiry). A saved
-    value is re-registered by the vault fill path whenever it is used; a tool result echoing a
-    discarded/expired value after that is no longer scrubbed (documented trade-off)."""
+def _release_egress(value: Optional[str], home: str) -> None:
+    """Counterpart of :func:`_register_egress` when the entry finishes (save/discard/expiry): drops
+    this entry's reference. The value leaves the scrub list only when no other open entry holds it
+    and no vault fill registered it (``agent.redact`` keeps provenance). A discarded/expired value
+    echoed by a tool after that is no longer scrubbed (documented trade-off); a saved one is."""
     if not value:
         return
     try:
-        from agent.redact import unregister_vault_redaction_value
-        unregister_vault_redaction_value(value, home or None)
+        from agent.redact import release_intake_redaction_value
+        release_intake_redaction_value(value, home or None)
     except Exception:
-        logger.debug("secret_intake: egress unregistration failed", exc_info=False)
+        logger.debug("secret_intake: egress release failed", exc_info=False)
 
 
-def _register_egress(value: str) -> None:
+def _register_egress(value: str, home: str = "") -> None:
     try:
-        from agent.redact import register_vault_redaction_value
-        register_vault_redaction_value(value)
+        from agent.redact import register_intake_redaction_value
+        register_intake_redaction_value(value, home or None)
     except Exception:
         logger.debug("secret_intake: egress registration failed", exc_info=False)
+
+
+def _register_durable_egress(value: Optional[str], home: str) -> None:
+    if not value:
+        return
+    try:
+        from agent.redact import register_durable_redaction_value
+        register_durable_redaction_value(value, home or None)
+    except Exception:
+        logger.debug("secret_intake: durable egress registration failed", exc_info=False)
+
+
+def saved_secret_values(home: str) -> List[str]:
+    """Values of the profile's saved ``secret`` vault items (server-side only, never logged): the
+    model-egress scrub loads them once per profile so a saved token stays redacted after a restart.
+    An absent vault file is not created."""
+    from agent.vault_store import VaultStore
+    vault_dir = Path(home) / "vault"
+    if not (vault_dir / "vault.json.enc").exists():
+        return []
+    vault = VaultStore(vault_dir)
+    out: List[str] = []
+    for meta in vault.list_items():
+        if meta.kind != "secret":
+            continue
+        value = str(vault.resolve_secret(meta.id).get("value") or "")
+        if value:
+            out.append(value)
+    return out
 
 
 __all__ = [

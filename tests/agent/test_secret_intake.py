@@ -362,6 +362,12 @@ def test_bare_long_random_key_found(text):
     "siehe https://example.invalid/aB3dE5gH7jK9mN2pQ4rS6tU8vW0xY1zA3bC5dE7fG9h/x",
     "/home/user/projekte/AbstractSingletonProxyFactory2Bean/src/Main.java",
     "Donaudampfschifffahrtsgesellschaftskapitaensmuetze2026",
+    "LongVariableNameForTestingPurposes2026Version3Final",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFake0123456789abcdefGHIJKLmnop user@host",
+    "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ\n"
+    "RTESMBAGA1UEChMJQmFsdGltb3JlMRMwEQYDVQQLEwpDeWJlclRydXN0MSIwIAYD\n-----END CERTIFICATE-----",
+    "git log 4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39..9f86d081884c7d659a2feaa0c55ad015a3bf4f1b",
+    "test_steer_redirect_with_folded_text_parts_v2_regression_case_12",
 ])
 def test_bare_long_random_false_alarms(text):
     assert si.find_secrets(text) == []
