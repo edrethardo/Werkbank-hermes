@@ -71,6 +71,15 @@ def test_history_file_never_stores_the_secret(tmp_path):
     assert si.store()._by_id == {}   # masking keeps nothing, offers nothing
 
 
+def test_chat_redacts_before_it_stages_the_turn():
+    """The staged row (session DB / display) is built from the message chat() passes on: the intake
+    must run first. Structural, because chat() needs a live agent and terminal."""
+    import inspect
+    src = inspect.getsource(CLIChatTurnMixin.chat)
+    assert "self._chat_secret_intake(message)" in src
+    assert src.index("self._chat_secret_intake(message)") < src.index("self._chat_stage_user_message(agent, message)")
+
+
 def test_cli_no_secret_no_prompt():
     cli = _cli("save")
     text = "nur Text"
