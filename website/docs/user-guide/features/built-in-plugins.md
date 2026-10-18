@@ -56,6 +56,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | Plugin | Kind | Purpose |
 |---|---|---|
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
+| `key-prompt` | 2 tools + dashboard page | Ask the owner for an API key via a one-shot `/p/schluessel` link; the key is typed in a masked field and stored straight into the credential pool, never through shell or chat |
 | `handover` | hooks + slash command | `/handover` — carry a briefing across a session boundary (survives `/new` and restarts) |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
@@ -118,6 +119,38 @@ Auto-tracks and removes ephemeral files created during sessions — test scripts
 **Enabling:** `hermes plugins enable disk-cleanup` (or check the box in `hermes plugins`).
 
 **Disabling again:** `hermes plugins disable disk-cleanup`.
+
+### key-prompt
+
+Lets the agent ask you for a provider API key (NVIDIA, OpenRouter, …) **without the key ever passing through a shell, the chat, or the agent**. Built for Telegram and other messaging sessions where `hermes auth add` is out of reach.
+
+**Flow:**
+
+1. The agent calls `request_api_key(provider, label?, purpose?)`. It gets back only a one-shot link: `https://<dashboard.public_url>/p/schluessel/?r=<id>` (valid 5 min, usable once, bound to the requesting session).
+2. The agent sends you that link. The page sits behind the dashboard login like every `/p/<slug>` page and shows the provider name, the purpose, a masked input and the list of profiles (default: `default`).
+3. On submit the dashboard stores the key directly in the chosen profile's credential pool — the same code path as `hermes auth add <provider> --type api-key` (`hermes_cli.auth_commands.add_api_key_credential`), no argv, no log line with the value.
+4. The agent calls `api_key_request_status(request_id, wait_seconds?)` and learns only `pending` / `stored` / `cancelled` / `expired` plus the entry label. When it reads `stored`, it registers the stored value with the output redactor, so any later tool output that happens to contain it is scrubbed before it reaches the model.
+
+**Allowed providers** are the API-key rows of the provider registry (`hermes auth` list) plus OpenRouter; OAuth/device-code providers are refused because a pasted string cannot complete their login.
+
+**Safety:**
+
+| Concern | Handling |
+|---|---|
+| Who can open the page | Dashboard auth gate + Host guard (inherited, `/p/<slug>`) |
+| CSRF | JSON-only submit (a cross-site form cannot send it), Origin / `Sec-Fetch-Site` check, per-request CSRF token embedded in the page; 5 wrong tokens burn the request |
+| Value in URLs | Never: the key is only in the POST body, a submit with query parameters is refused |
+| Replay | Single use (`O_EXCL` claim), 5 min expiry, the result page never shows the key again |
+| Flooding | Max 3 open requests per session, 12 per hour, 20 submits per minute |
+| Audit | `<hermes root>/key-prompt/audit.log` (0600): created / stored / cancelled with provider, label, profile, an 8-char id prefix — never the value |
+
+Request records live in `<hermes root>/key-prompt/requests/` (dir 0700, files 0600) and contain no key.
+
+**Config** (optional, `plugins.entries.key-prompt.settings` in `config.yaml`): `public_url` (defaults to `dashboard.public_url`), `timeout` in seconds (default 300, 30–900).
+
+**Enabling:** `hermes plugins enable key-prompt` in the profile whose gateway should offer the tools **and** in the profile that runs the dashboard (usually `default`), then restart both. New sessions use the stored key; running sessions keep the credentials they resolved at start.
+
+**Disabling again:** `hermes plugins disable key-prompt`.
 
 ### handover
 

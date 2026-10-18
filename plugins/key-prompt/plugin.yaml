@@ -1,0 +1,12 @@
+name: key-prompt
+version: 0.1.0
+description: "API keys without shell and without chat: the agent calls request_api_key and sends the owner a one-shot dashboard link (/p/schluessel, ~5 min, usable once); the key is typed in a masked field there and stored straight into the chosen profile's credential pool (same path as `hermes auth add <provider> --type api-key`). The agent only learns stored/cancelled/expired and the label."
+author: "Aaron + Hermes"
+license: MIT
+kind: standalone
+manifest_version: 1
+tags: [credentials, api-key, dashboard, telegram, messaging]
+provides_tools:
+  - request_api_key
+  - api_key_request_status
+provides_hooks: []

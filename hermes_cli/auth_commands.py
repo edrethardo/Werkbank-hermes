@@ -358,6 +358,14 @@ def _unsuppress_provider_sources(provider: str) -> None:
         pass
 
 
+def _store_api_key_entry(provider: str, pool, token: str, label: str) -> PooledCredential:
+    entry = PooledCredential(
+        provider=provider, id=uuid.uuid4().hex[:6], label=label or f"api-key-{len(pool.entries()) + 1}",
+        auth_type=AUTH_TYPE_API_KEY, priority=0, source=SOURCE_MANUAL, access_token=token,
+        base_url=_provider_base_url(provider))
+    return pool.add_entry(entry)
+
+
 def _add_api_key_credential(args, provider: str, pool) -> PooledCredential:
     token = ((getattr(args, "api_key", None) or "").strip()
              or masked_secret_prompt("Paste your API key: ").strip())
@@ -367,13 +375,36 @@ def _add_api_key_credential(args, provider: str, pool) -> PooledCredential:
     label = (getattr(args, "label", None) or "").strip()
     if not label and sys.stdin.isatty():
         label = line_input(f"Label (optional, default: {default_label}): ").strip()
-    label = label or default_label
-    entry = PooledCredential(
-        provider=provider, id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_API_KEY,
-        priority=0, source=SOURCE_MANUAL, access_token=token, base_url=_provider_base_url(provider))
-    entry = pool.add_entry(entry)
-    print(f'Added {provider} credential #{len(pool.entries())}: "{label}"')
+    entry = _store_api_key_entry(provider, pool, token, label or default_label)
+    print(f'Added {provider} credential #{len(pool.entries())}: "{entry.label}"')
     return entry
+
+
+def add_api_key_credential(provider: str, api_key: str, *, label: str | None = None) -> PooledCredential:
+    """``hermes auth add <provider> --type api-key`` without argv, prompt or stdout.
+
+    For surfaces that collect the key themselves (the dashboard key page of the bundled
+    ``key-prompt`` plugin): the value arrives as an argument, is stored in the active home's
+    credential pool exactly like the CLI stores it, and is never printed. Unknown providers,
+    providers whose auth is owned by a plugin, and an empty key raise ``ValueError``. Runs
+    against ``get_hermes_home()``, so a caller targets another profile with
+    ``hermes_constants.set_hermes_home_override``.
+    """
+    token = (api_key or "").strip() if isinstance(api_key, str) else ""
+    if not token:
+        raise ValueError("No API key provided.")
+    provider = _normalize_provider(provider)
+    configured_provider = _configured_provider_entry(provider)
+    if not _is_known_provider(provider, configured_provider):
+        raise ValueError(f"Unknown provider '{provider}'.")
+    if (error := plugin_missing_auth_handler_error(provider, "add")) is not None:
+        raise ValueError(str(error))
+    if configured_provider is not None:
+        _migrate_legacy_custom_pool_key(provider, configured_provider["pool_key"])
+    pool = load_pool(provider)
+    if not provider.startswith(CUSTOM_POOL_PREFIX):
+        _unsuppress_provider_sources(provider)
+    return _store_api_key_entry(provider, pool, token, (label or "").strip())
 
 
 def auth_add_command(args) -> None:

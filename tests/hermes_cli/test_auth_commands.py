@@ -1074,3 +1074,39 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
     assert seen["forged_status"] == 404
     assert seen["genuine_status"] == 200
     assert code == "good-code"
+
+
+def test_add_api_key_credential_is_the_noninteractive_auth_add(tmp_path, monkeypatch, capsys):
+    """``add_api_key_credential`` is ``hermes auth add <p> --type api-key`` without argv, prompts or
+    stdout: the dashboard key page (plugin ``key-prompt``) stores through it."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+
+    from hermes_cli.auth_commands import add_api_key_credential
+
+    entry = add_api_key_credential("NVIDIA", "  fake-nv-key-123  ", label="nim")
+    assert entry.label == "nim"
+    assert capsys.readouterr().out == ""  # nothing (and certainly no value) on stdout
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    stored = payload["credential_pool"]["nvidia"]
+    assert [e["access_token"] for e in stored if e["source"] == "manual"] == ["fake-nv-key-123"]
+    assert stored[0]["auth_type"] == "api_key"
+    assert stored[0]["base_url"] == "https://integrate.api.nvidia.com/v1"
+
+    second = add_api_key_credential("nvidia", "fake-nv-key-456")
+    assert second.label == "api-key-2"  # same default label rule as the CLI
+
+
+@pytest.mark.parametrize("provider, key", [("no-such-provider", "k"), ("nvidia", "   ")])
+def test_add_api_key_credential_refuses_unknown_provider_and_empty_key(tmp_path, monkeypatch,
+                                                                       provider, key):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    from hermes_cli.auth_commands import add_api_key_credential
+
+    with pytest.raises(ValueError):
+        add_api_key_credential(provider, key)
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert not payload.get("credential_pool", {}).get("nvidia")
