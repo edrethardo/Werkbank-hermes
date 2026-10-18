@@ -245,10 +245,9 @@ def _value_is_code_or_placeholder(value: str, after: str) -> bool:
 
 
 def _bare_key_is_secret(value: str) -> bool:
-    """A long pasted key alone: ≥ 40 chars, lower + upper + digit, high entropy, no hex/hash/UUID,
-    no path or URL shape, no base64 padding run of an image. Commit SHAs and hashes are hex only."""
-    if re.fullmatch(r"[A-Fa-f0-9\-]+", value):
-        return False                                  # SHA, hash, UUID
+    """A long pasted key alone: ≥ 40 chars, lower + upper + digit, high entropy, no path or URL shape,
+    not mostly words. Commit SHAs, hex hashes and UUIDs never pass: hex carries at most 4.0 bits/char
+    (UUID with dashes ≈ 4.1), below ``_BARE_MIN_ENTROPY``, and lacks mixed case."""
     if value.startswith(("//", "~", "./", "../")) or ("/" in value and _is_path(value)):
         return False                                  # path / URL-ish
     if re.match(r"(?i)(?:sha|md)[0-9]{1,3}[-:]", value):

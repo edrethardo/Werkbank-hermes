@@ -287,6 +287,7 @@ FAKE_TOK = "Zq8" + "FAKEfake0123xyzQ"
     ("https://api.example.invalid/x?a=1&key=" + FAKE_TOK, FAKE_TOK),
     ("http://h.example.invalid/login?user=bob&password=" + FAKE_PW + "#top", FAKE_PW),
     ("/cb?access_token=" + FAKE_TOK, FAKE_TOK),
+    ("/cb?token=" + FAKE_TOK + "&mode=x", FAKE_TOK),      # no scheme: the plain assignment must not run past ``&``
 ])
 def test_lead_in_and_url_query_found(text, value):
     found = si.find_secrets(text)
@@ -319,6 +320,14 @@ def test_lead_in_and_url_query_false_alarms(text):
     ("password: KX7_P9Q2", "KX7_P9Q2"),
     ("password=QWERTZUIOPX", "QWERTZUIOPX"),
     ("secret: s3cr3t.T0k3nV4lu3Z", "s3cr3t.T0k3nV4lu3Z"),
+    # each exemption layer alone (mutation proofs): entropy beats path / file name shape …
+    ("token: Zq8FAKEfake0123/xyzQ9Lm", "Zq8FAKEfake0123/xyzQ9Lm"),
+    ("password: Xk9fQ2Lm7.json", "Xk9fQ2Lm7.json"),
+    # … ENV names need ENV-like segments, paths need ``/`` structure, snake names need a word
+    ("api_key=LIVE_KEY_9XQ2ZK7P", "LIVE_KEY_9XQ2ZK7P"),
+    ("password: ~geheimwort", "~geheimwort"),
+    ("password=/sommerwind", "/sommerwind"),
+    ("password: qx_zv_kw_pr", "qx_zv_kw_pr"),
 ])
 def test_review_positives_found(text, value):
     found = si.find_secrets(text)
@@ -368,6 +377,8 @@ def test_bare_long_random_key_found(text):
     "RTESMBAGA1UEChMJQmFsdGltb3JlMRMwEQYDVQQLEwpDeWJlclRydXN0MSIwIAYD\n-----END CERTIFICATE-----",
     "git log 4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39..9f86d081884c7d659a2feaa0c55ad015a3bf4f1b",
     "test_steer_redirect_with_folded_text_parts_v2_regression_case_12",
+    "4f2A9c1E8b7D6a5F4e3D2c1B0a9F8e7D6c5B4a39",      # mixed-case hex: only the entropy bound rejects it
+    "A" * 44 + "Ab12",                                # zero-padded base64 run
 ])
 def test_bare_long_random_false_alarms(text):
     assert si.find_secrets(text) == []
