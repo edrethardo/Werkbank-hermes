@@ -30,12 +30,12 @@ logger = logging.getLogger(__name__)
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
-# Provenance (WB-1212): the secret intake shares the bounded list above, so it must never take a
-# value out that another owner put in. ``_PINNED`` = values a real vault fill registered (only the
-# bound/eviction or a profile clear drops them); ``_INTAKE_REFS`` = open intake entries holding a
-# value (one ref per entry; released on discard/expiry/save). A value leaves the list only when its
-# last intake ref is released AND no fill pinned it.
-_VAULT_REDACTION_PINNED: dict = {}  # profile home → set(values)
+# Secret intake (WB-1212): values of open intake entries live in their OWN refcounted set, never in
+# the 64-entry fill list above — an intake burst can't evict a vault fill / key-prompt value, and a
+# fill burst can't evict an open intake value. One ref per open entry; released on
+# discard/expiry/save. Bounded by the intake store, not here: every ref belongs to a pending
+# ``_Store`` entry, which lives at most ``TTL_SECONDS`` and of which at most ``MAX_PENDING`` are
+# open (``agent.secret_intake``) — so this set holds ≤ 2 × MAX_PENDING forms per process.
 _INTAKE_REDACTION_REFS: dict = {}  # profile home → {value: open intake entries}
 # Saved ``secret`` vault items stay scrubbed for the profile's lifetime — outside the 64-entry fill
 # bound, so many saved tokens never evict a live fill. Loaded lazily from the vault the first time a
@@ -62,8 +62,6 @@ def _add_to_bucket_locked(scope: str, value: str) -> None:
     while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
         evicted = next(iter(bucket))
         del bucket[evicted]
-        _VAULT_REDACTION_PINNED.get(scope, set()).discard(evicted)
-        _INTAKE_REDACTION_REFS.get(scope, {}).pop(evicted, None)
 
 
 def register_vault_redaction_value(value) -> None:
@@ -71,15 +69,13 @@ def register_vault_redaction_value(value) -> None:
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
-    it to (CR/LF stripped), since that is what the page holds. A fill pins the value: the secret
-    intake's release never removes it.
+    it to (CR/LF stripped), since that is what the page holds. Kept apart from the secret intake's
+    set, so the intake's release or overflow never touches it.
     """
     if not isinstance(value, str) or not value:
         return
     with _VAULT_REDACTION_LOCK:
-        scope = _vault_scope()
-        _add_to_bucket_locked(scope, value)
-        _VAULT_REDACTION_PINNED.setdefault(scope, set()).update(_forms(value))
+        _add_to_bucket_locked(_vault_scope(), value)
 
 
 def register_intake_redaction_value(value, scope: str = None) -> None:
@@ -88,7 +84,6 @@ def register_intake_redaction_value(value, scope: str = None) -> None:
         return
     with _VAULT_REDACTION_LOCK:
         scope = scope or _vault_scope()
-        _add_to_bucket_locked(scope, value)
         refs = _INTAKE_REDACTION_REFS.setdefault(scope, {})
         for v in _forms(value):
             refs[v] = refs.get(v, 0) + 1
@@ -96,23 +91,20 @@ def register_intake_redaction_value(value, scope: str = None) -> None:
 
 def release_intake_redaction_value(value, scope: str = None) -> None:
     """Counterpart of :func:`register_intake_redaction_value` (entry discarded, expired or saved).
-    The value leaves the scrub list only when no other open intake entry holds it and no vault fill
-    registered it; saved values live on in the durable set (:func:`register_durable_redaction_value`)."""
+    The value leaves the intake set only when no other open intake entry holds it; a vault fill of
+    the same bytes lives on in the fill list, a saved value in the durable set
+    (:func:`register_durable_redaction_value`) — both untouched here."""
     if not isinstance(value, str) or not value:
         return
     with _VAULT_REDACTION_LOCK:
         scope = scope or _vault_scope()
         refs = _INTAKE_REDACTION_REFS.get(scope, {})
-        pinned = _VAULT_REDACTION_PINNED.get(scope, set())
-        bucket = _VAULT_REDACTION_VALUES.get(scope, {})
         for v in _forms(value):
             left = refs.get(v, 0) - 1
             if left > 0:
                 refs[v] = left
-                continue
-            refs.pop(v, None)
-            if v not in pinned:
-                bucket.pop(v, None)
+            else:
+                refs.pop(v, None)
 
 
 def register_durable_redaction_value(value, scope: str = None) -> None:
@@ -144,8 +136,7 @@ def clear_vault_redaction_values() -> None:
     ``secret`` items are read from the vault again on the next scrub."""
     with _VAULT_REDACTION_LOCK:
         scope = _vault_scope()
-        for registry in (_VAULT_REDACTION_VALUES, _VAULT_REDACTION_PINNED, _INTAKE_REDACTION_REFS,
-                         _DURABLE_REDACTION_VALUES):
+        for registry in (_VAULT_REDACTION_VALUES, _INTAKE_REDACTION_REFS, _DURABLE_REDACTION_VALUES):
             registry.pop(scope, None)
         _DURABLE_LOADED.discard(scope)
 
@@ -158,7 +149,8 @@ def redact_registered_vault_values(text: str) -> str:
     if scope not in _DURABLE_LOADED:
         _ensure_durable_loaded(scope)
     with _VAULT_REDACTION_LOCK:
-        values = set(_VAULT_REDACTION_VALUES.get(scope) or ()) | set(_DURABLE_REDACTION_VALUES.get(scope) or ())
+        values = (set(_VAULT_REDACTION_VALUES.get(scope) or ()) | set(_INTAKE_REDACTION_REFS.get(scope) or ())
+                  | set(_DURABLE_REDACTION_VALUES.get(scope) or ()))
     for value in sorted(values, key=len, reverse=True):  # longest first: a substring never shadows its superstring
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")

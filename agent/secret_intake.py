@@ -57,6 +57,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger("hermes.secret_intake")
 
 TTL_SECONDS = 600.0
+# Open (pending) entries per process. Past it the oldest open entry is retired early (value wiped,
+# egress ref released, like expiry), so the store — and with it the intake scrub set in
+# ``agent.redact`` (≤ 2 forms per open entry) — never grows unbounded within one TTL window.
+MAX_PENDING = 256
 PLACEHOLDER_RE = re.compile(r"\[GEHEIMNIS:[a-z0-9-]+\]")   # numbered (intake) and bare (mask_text) forms
 _MAX_SCAN_CHARS = 400_000   # longer pastes are scanned in full anyway by redact on egress; keep intake bounded
 
@@ -448,12 +452,19 @@ class _Store:
         self._timer: Optional[threading.Timer] = None
 
     # all callers hold no lock
-    def _purge_locked(self, now: float) -> List[PendingSecret]:
+    def _purge_locked(self, now: float, reserve: int = 0) -> List[PendingSecret]:
+        """Expire entries past TTL; with *reserve*, also retire the oldest open entries so at most
+        ``MAX_PENDING - reserve`` stay open (room for the entries about to be created)."""
         expired = [e for e in self._by_id.values() if e.status == "pending" and e.expires <= now]
+        if reserve:
+            pending = sorted((e for e in self._by_id.values() if e.status == "pending" and e.expires > now),
+                             key=lambda e: e.created)
+            expired += pending[:max(0, len(pending) - max(0, MAX_PENDING - reserve))]
         for e in expired:
             _release_egress(e.value, e.home)
             e.value = None
             e.status = "expired"
+            e.expires = min(e.expires, now)   # retired early: forgotten one TTL from now, like expiry
         # forget finished entries after another TTL so the dict stays bounded
         for key in [k for k, e in self._by_id.items() if e.status != "pending" and e.expires + TTL_SECONDS <= now]:
             self._by_id.pop(key, None)
@@ -486,17 +497,27 @@ class _Store:
     def placeholder_for(self, scope: str, art: str, value: str, *, hint: str, surface: str,
                         home: str) -> Tuple[PendingSecret, bool]:
         now = time.time()
+        entry, is_new = None, False
         with self._lock:
-            self._purge_locked(now)
+            retired = self._purge_locked(now)
             for e in self._by_id.values():
                 if e.scope == scope and e.status == "pending" and e.value == value:
-                    return e, False
-            n = self._counters.get((scope, art), 0) + 1
-            self._counters[(scope, art)] = n
-            entry = PendingSecret(
-                id=_secrets.token_hex(6), scope=scope, art=art, placeholder=f"[GEHEIMNIS:{art}-{n}]",
-                hint=hint, surface=surface, home=home, created=now, expires=now + TTL_SECONDS, value=value)
-            self._by_id[entry.id] = entry
+                    entry = e
+                    break
+            if entry is None:
+                retired += self._purge_locked(now, reserve=1)   # bound: retire the oldest open entry
+                n = self._counters.get((scope, art), 0) + 1
+                self._counters[(scope, art)] = n
+                entry = PendingSecret(
+                    id=_secrets.token_hex(6), scope=scope, art=art, placeholder=f"[GEHEIMNIS:{art}-{n}]",
+                    hint=hint, surface=surface, home=home, created=now, expires=now + TTL_SECONDS, value=value)
+                self._by_id[entry.id] = entry
+                _register_egress(value, home)   # under the lock: retire/expiry can't release it first
+                is_new = True
+        for r in retired:
+            _audit("verfallen", r)
+        if not is_new:
+            return entry, False
         self._arm_timer()
         return entry, True
 
@@ -606,7 +627,6 @@ def redact_text(text: str, scope: str, *, surface: str = "unbekannt") -> Tuple[s
         entry, is_new = _STORE.placeholder_for(scope, f.art, value, hint=f.hint, surface=surface, home=home)
         if is_new:
             created.append(entry)
-            _register_egress(value, home)
             _audit("erkannt", entry)
         out.append(text[pos:f.start])
         out.append(entry.placeholder)
