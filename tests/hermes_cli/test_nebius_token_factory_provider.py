@@ -61,13 +61,13 @@ def test_nebius_model_catalog_prefers_live_profile_fetch(monkeypatch):
         ],
     )
 
-    # Current merge policy (658ac1d86 / #46309): curated-first for single
-    # providers — the profile's fallback_models lead the picker, live-only
-    # entries are appended after, and live duplicates of curated entries
-    # are deduped rather than repeated.
+    # Nebius is live-first (_LIVE_FIRST_PICKER_PROVIDERS): the live catalog
+    # leads in its own order, curated-only entries append after, and live
+    # duplicates of curated entries are deduped rather than repeated.
     result = provider_model_ids("nebius-token-factory")
-    assert result[: len(profile.fallback_models)] == list(profile.fallback_models)
-    assert result[len(profile.fallback_models) :] == ["some-brand-new/Live-Only-Model"]
+    live = ["deepseek-ai/DeepSeek-V4-Pro", "NousResearch/Hermes-4-70B", "some-brand-new/Live-Only-Model"]
+    assert result[: len(live)] == live
+    assert result[len(live) :] == [m for m in profile.fallback_models if m not in live]
 
 
 def test_nebius_model_catalog_falls_back_to_profile_models(monkeypatch):

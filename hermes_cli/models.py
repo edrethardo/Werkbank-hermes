@@ -1657,7 +1657,7 @@ def _profile_live_catalog(normalized: str) -> Optional[list[str]]:
 
     Live results are merged with the curated list so models the live endpoint omits still appear:
     curated-first by default so the newest curated models lead when the live API lags;
-    ``_LIVE_FIRST_PICKER_PROVIDERS`` (OpenCode Zen/Go, authoritative live API) live-first so stale
+    ``_LIVE_FIRST_PICKER_PROVIDERS`` (OpenCode Zen/Go, Nebius: authoritative live API) live-first so stale
     curated entries stop polluting the top. Plugin providers without a static entry use the
     profile's ``fallback_models`` as the curated list (Fireworks lists an image model first).
     """

@@ -8,7 +8,7 @@ from providers.base import ProviderProfile
 
 # Conservative allowlist of model families that expose reasoning effort.
 _REASONING_MARKERS = (
-    "deepseek-r1", "deepseek-v4", "deepseek-reasoner", "gpt-oss", "glm-5", "kimi-k2", "minimax-m2", "qwen3",
+    "deepseek-r1", "deepseek-v4", "deepseek-reasoner", "gpt-oss", "glm-5", "kimi-k2", "kimi-k3", "minimax-m2", "minimax-m3", "qwen3",
 )
 
 
@@ -40,10 +40,12 @@ nebius_token_factory = NebiusTokenFactoryProfile(
     base_url="https://api.tokenfactory.nebius.com/v1",
     models_url="https://api.tokenfactory.nebius.com/v1/models?verbose=true", auth_type="api_key",
     default_aux_model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+    # Offline floor only: the picker is live-first for this provider (_LIVE_FIRST_PICKER_PROVIDERS),
+    # so these ids matter when no key is set or /v1/models fails. Keep them to ids the live API serves.
     fallback_models=(
-        "Qwen/Qwen3.5-397B-A17B-fast", "deepseek-ai/DeepSeek-V4-Pro", "zai-org/GLM-5.1", "moonshotai/Kimi-K2.5-fast",
-        "MiniMaxAI/MiniMax-M2.5-fast", "deepseek-ai/DeepSeek-V3.2-fast", "NousResearch/Hermes-4-70B",
-        "openai/gpt-oss-120b-fast", "meta-llama/Llama-3.3-70B-Instruct",
+        "moonshotai/Kimi-K3", "moonshotai/Kimi-K2.6", "deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4.1-Flash",
+        "zai-org/GLM-5.3", "Qwen/Qwen3.5-397B-A17B", "MiniMaxAI/MiniMax-M3", "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "NousResearch/Hermes-4-405B", "openai/gpt-oss-120b",
     ),
 )
 

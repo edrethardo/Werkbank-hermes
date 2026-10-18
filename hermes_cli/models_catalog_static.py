@@ -572,8 +572,11 @@ _BORROWED_MODEL_PROVIDERS: frozenset[str] = frozenset()
 # Providers whose live /v1/models is the authoritative catalog: the picker merges live-first (live
 # entries lead, curated-only append). Every OTHER provider keeps curated-first so a deliberately
 # surfaced newest model stays on top when the live API lags. Zen/Go re-expose dozens of vendors
-# and rotate them often, so their stale curated entries must not pollute the top.
-_LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencode-go", "meta-ai"})
+# and rotate them often, so their stale curated entries must not pollute the top. Nebius Token
+# Factory retires and renames hosted ids faster than a curated list can track (-fast variants vanish).
+_LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset(
+    {"opencode-zen", "opencode-go", "meta-ai", "nebius-token-factory"}
+)
 
 
 # Models supporting OpenAI Priority Processing (service_tier="priority"; see

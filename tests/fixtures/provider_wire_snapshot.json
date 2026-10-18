@@ -8065,7 +8065,7 @@
      "role": "user"
     }
    ],
-   "model": "Qwen/Qwen3.5-397B-A17B-fast",
+   "model": "moonshotai/Kimi-K3",
    "reasoning_effort": "high",
    "timeout": 1800.0,
    "tools": [
@@ -8089,7 +8089,7 @@
     }
    ]
   },
-  "model": "Qwen/Qwen3.5-397B-A17B-fast",
+  "model": "moonshotai/Kimi-K3",
   "off": {
    "messages": [
     {
@@ -8124,7 +8124,7 @@
      "role": "user"
     }
    ],
-   "model": "Qwen/Qwen3.5-397B-A17B-fast",
+   "model": "moonshotai/Kimi-K3",
    "timeout": 1800.0,
    "tools": [
     {
@@ -8181,7 +8181,7 @@
      "role": "user"
     }
    ],
-   "model": "Qwen/Qwen3.5-397B-A17B-fast",
+   "model": "moonshotai/Kimi-K3",
    "reasoning_effort": "medium",
    "timeout": 1800.0,
    "tools": [
