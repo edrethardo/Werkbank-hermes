@@ -151,3 +151,112 @@ async def test_already_redacted_message_gets_its_card_once():
     assert len(adapter.pickers) == 1
     await _run(adapter, _event(pre))
     assert len(adapter.pickers) == 1
+
+
+# -- STT transcripts / document notes / edits / picker (WB-1212 nachbesserung) ---------------------
+
+def _stt_runner(adapter):
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(stt_enabled=True, group_sessions_per_user=True,
+                                    thread_sessions_per_user=False)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._consume_pending_native_image_paths = lambda _key: []
+    runner._session_key_for_source = lambda _source: "telegram:dm:4711"
+    runner._thread_metadata_for_source = lambda *_a, **_k: {}
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._should_echo_stt_transcripts = lambda: True
+    runner._delivery_adapter_for = lambda _source: adapter
+    return runner
+
+
+def _voice_event():
+    from gateway.platforms.event import MessageType
+    return MessageEvent(text="", message_type=MessageType.VOICE, message_id="v1",
+                        source=SessionSource(platform=Platform.TELEGRAM, chat_id="4711", chat_type="dm", user_id="42"),
+                        media_urls=["/tmp/fake-voice.ogg"], media_types=["audio/ogg"])
+
+
+@pytest.mark.asyncio
+async def test_stt_transcript_is_redacted_before_echo_and_agent_text():
+    from unittest.mock import patch
+    adapter = PickerAdapter()
+    runner = _stt_runner(adapter)
+    event = _voice_event()
+    with patch("tools.transcription_tools.transcribe_audio",
+               return_value={"success": True, "transcript": f"mein token {FAKE_GH}", "provider": "mock"}), \
+         patch("gateway.run_inbound.rehome_inbound_media", lambda ev: None):
+        text = await runner._prepare_inbound_message_text(event=event, source=event.source, history=[],
+                                                          session_key="telegram:dm:4711")
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert FAKE_GH not in text and "[GEHEIMNIS:github-token-1]" in text
+    echoes = [s["content"] for s in adapter.sent]
+    assert echoes and all(FAKE_GH not in e for e in echoes)
+    assert any("[GEHEIMNIS:github-token-1]" in e for e in echoes)
+    assert len(adapter.pickers) == 1 and FAKE_GH not in adapter.pickers[0]["title"]
+
+
+@pytest.mark.asyncio
+async def test_pending_voice_cache_holds_only_the_placeholder():
+    from unittest.mock import patch
+    adapter = PickerAdapter()
+    runner = _stt_runner(adapter)
+    event = _voice_event()
+    with patch("tools.transcription_tools.transcribe_audio",
+               return_value={"success": True, "transcript": f"key {FAKE_GH}", "provider": "mock"}):
+        text, transcripts = await runner._transcribe_pending_audio_event_once(event, "")
+    assert FAKE_GH not in text and FAKE_GH not in event._gateway_pending_stt_text
+    assert all(FAKE_GH not in t for t in transcripts + event._gateway_pending_stt_transcripts)
+
+
+@pytest.mark.asyncio
+async def test_prepared_text_redacts_document_notes_and_late_additions():
+    adapter = PickerAdapter()
+    runner = _stt_runner(adapter)
+    event = _event("bitte ansehen")
+    runner._prepend_inbound_document_notes = lambda ev, text: f"[Anhang: notes.txt] token {FAKE_GH}\n\n{text}"
+    text = await runner._prepare_inbound_message_text(event=event, source=event.source, history=[],
+                                                      session_key="telegram:dm:4711")
+    assert FAKE_GH not in text and text.endswith("bitte ansehen")
+
+
+@pytest.mark.asyncio
+async def test_edited_event_text_reaches_platform_hooks_redacted():
+    from unittest.mock import MagicMock, patch
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._session_key_for_source = lambda source: "telegram:dm:4711"
+    invoke = MagicMock()
+    event = {"platform": "telegram", "event_type": "message_edited",
+             "payload": {"chat_id": "4711", "message_id": "9", "text": f"neu {FAKE_GH}"}}
+    with patch("hermes_cli.lifecycle.has_hook", lambda _n: True), patch("hermes_cli.lifecycle.invoke_hook", invoke):
+        await runner._handle_gateway_platform_event(event, _event("x").source)
+    sent = invoke.call_args.kwargs
+    assert sent["payload"]["text"] == "neu [GEHEIMNIS:github-token-1]"
+    assert FAKE_GH not in str(sent)
+
+
+@pytest.mark.asyncio
+async def test_telegram_picker_tap_on_an_old_card_does_not_apply_the_new_one():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    a = object.__new__(TelegramAdapter)
+    calls = []
+
+    async def cb(chat_id, value):
+        calls.append(value)
+        return "ok"
+
+    a._choice_picker_state = {"4711": {"msg_id": 200, "choices": [{"value": "save:new"}],
+                                       "session_key": "k", "on_choice_selected": cb}}
+    a._edit_result_text = AsyncMock()
+    old = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(message_id=100))
+    await a._handle_choice_picker_callback(old, "cp:0", "4711")
+    assert calls == [] and "4711" in a._choice_picker_state
+    new = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(message_id=200))
+    await a._handle_choice_picker_callback(new, "cp:0", "4711")
+    assert calls == ["save:new"]

@@ -57,6 +57,19 @@ def test_detects_keyword_assignments(text, value):
     assert [text[f.start:f.end] for f in found] == [value]
 
 
+@pytest.mark.parametrize("text,value", [
+    ("DB_PASS=" + FAKE_PW, FAKE_PW),
+    ("pw: " + FAKE_PW, FAKE_PW),
+    ("pass: " + FAKE_PW, FAKE_PW),
+    ("password: 'Zq8" + "Fake.Value!'", "Zq8Fake.Value!"),
+    ("token: Zq8" + "FAKEfake0123xyzQ", "Zq8FAKEfake0123xyzQ"),
+    ("client_secret=Zq8" + "FAKEfake0123_xyzQ9", "Zq8FAKEfake0123_xyzQ9"),
+])
+def test_real_cases_still_found_after_false_alarm_rules(text, value):
+    found = si.find_secrets(text)
+    assert [text[f.start:f.end] for f in found] == [value]
+
+
 FALSE_ALARMS = [
     "commit 4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39 ist auf main",
     "Branch fix/sk-learn-upgrade-for-python bitte rebasen",
@@ -73,6 +86,27 @@ FALSE_ALARMS = [
     "Schau dir https://github.com/org/repo/pull/123 an",
     "Platzhalter [GEHEIMNIS:github-token-1] bleibt",
     "Telefon +49 151 23456789, PLZ 10115",
+    # review corpus (WB-1212 nachbesserung): code, paths, file names, placeholders, env names
+    "password = getpass.getpass()",
+    "password=settings.DB_PASSWORD",
+    "PWD=/data/projects/hermes_agent",
+    "pwd: /home/aaron/projekt",
+    "pass: test_secret_intake.py",
+    "'token': tokenizer_v2_large_model",
+    "client_secret: 'REPLACE_ME_WITH_SECRET'",
+    "password: ~/secrets/db.txt",
+    "password: ./zugang.txt",
+    "password=../config/pw.yaml",
+    "api_key = self.config.api_key",
+    "token = get_token()",
+    "token: <DEIN_TOKEN_HIER>",
+    "password: ${DB_PASSWORD}",
+    "PASSWORD=CHANGEME",
+    "api_key: xxxxxxxx",
+    "secret=MY_APP_SECRET_KEY",
+    "pw = request.form.get",
+    "OLDPWD=/home/user",
+    "PWD=Projekt-Alpha2",   # no path shape: only the missing ``pwd`` keyword keeps this quiet
 ]
 
 
@@ -221,3 +255,17 @@ def test_value_registered_for_egress_redaction():
     from agent.redact import redact_registered_vault_values as redact_vault_values
     si.intake(f"x password={FAKE_PW}", "s1")
     assert FAKE_PW not in redact_vault_values(f"tool echoed {FAKE_PW}")
+
+
+def test_finish_and_expiry_drop_the_egress_entry():
+    """The value lives only for the TTL: after save/discard/expiry the egress scrub list forgets it
+    too (it is bounded and would otherwise evict real vault-fill entries)."""
+    from agent.redact import redact_registered_vault_values as scrub
+    other = "Other" + "Passw0rd!x"
+    e1 = si.intake(f"password={FAKE_PW}", "s1").new[0]
+    e2 = si.intake(f"password={other}", "s2").new[0]
+    assert FAKE_PW not in scrub(FAKE_PW) and other not in scrub(other)
+    si.discard(e1.id)
+    assert scrub(FAKE_PW) == FAKE_PW
+    si.store().purge(now=e2.expires + 1)
+    assert scrub(other) == other

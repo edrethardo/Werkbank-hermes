@@ -125,3 +125,82 @@ def test_switch_off_sends_text_unchanged(agent_env, monkeypatch):
     make, db, _ = agent_env
     make().run_conversation(f"key {FAKE_GH}", conversation_history=[], task_id="t")
     assert FAKE_GH in _wire_text()
+
+
+# -- steer / redirect: every text into the running turn goes through the intake (WB-1212) -------
+
+def _bare_steer_agent(session_id="sess-steer"):
+    from run_agent import AIAgent
+    agent = object.__new__(AIAgent)
+    agent.session_id = session_id
+    agent.platform = "cli"
+    agent._pending_steer = None
+    agent._pending_steer_lock = threading.Lock()
+    agent._pending_redirect = None
+    agent._pending_redirect_lock = threading.Lock()
+    agent._model_request_active = threading.Event()
+    agent._executing_tools = False
+    agent._execution_thread_id = None
+    agent._interrupt_thread_signal_pending = False
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent._tool_worker_threads = None
+    agent._tool_worker_threads_lock = None
+    return agent
+
+
+@pytest.fixture()
+def intake_on(monkeypatch):
+    si.store().clear()
+    monkeypatch.setattr(si, "enabled", lambda: True)
+    yield
+    si.store().clear()
+
+
+def test_steer_slot_holds_only_the_placeholder(intake_on):
+    agent = _bare_steer_agent()
+    assert agent.steer(f"nimm {FAKE_GH} bitte") is True
+    assert agent._pending_steer == "nimm [GEHEIMNIS:github-token-1] bitte"
+    assert si.store().take_unoffered("sess-steer", agent._pending_steer)  # value waits for the vault
+
+
+def test_steer_folded_parts_are_redacted_too(intake_on):
+    from agent.folded_messages import FoldedText, folded_parts
+    agent = _bare_steer_agent()
+    agent.steer(FoldedText(f"[Alice] key {FAKE_GH}", [{"ref": "r1", "text": f"key {FAKE_GH}"}]))
+    assert FAKE_GH not in agent._pending_steer
+    parts = folded_parts(agent._pending_steer)
+    assert parts == [{"ref": "r1", "text": "key [GEHEIMNIS:github-token-1]"}]
+
+
+def test_redirect_during_model_request_is_redacted(intake_on):
+    agent = _bare_steer_agent()
+    agent._model_request_active.set()
+    assert agent.redirect(f"password={FAKE_PW} statt dessen") is True
+    assert agent._pending_redirect == "password=[GEHEIMNIS:passwort-1] statt dessen"
+
+
+def test_redirect_during_tools_degrades_to_a_redacted_steer(intake_on):
+    agent = _bare_steer_agent()
+    agent._executing_tools = True
+    assert agent.redirect(f"x {FAKE_GH}") is True
+    assert agent._pending_steer == "x [GEHEIMNIS:github-token-1]"
+
+
+def test_redirect_native_codex_steer_gets_the_placeholder(intake_on):
+    agent = _bare_steer_agent()
+    seen = []
+    agent._codex_session = None
+    with patch("agent.interrupt_control._ic_codex_method",
+               return_value=lambda text: seen.append(text) or True):
+        assert agent.redirect(f"y {FAKE_GH}") is True
+    assert seen == ["y [GEHEIMNIS:github-token-1]"]
+
+
+def test_steer_switch_off_keeps_text(monkeypatch):
+    monkeypatch.setattr(si, "enabled", lambda: False)
+    agent = _bare_steer_agent()
+    agent.steer(f"k {FAKE_GH}")
+    assert agent._pending_steer == f"k {FAKE_GH}"
