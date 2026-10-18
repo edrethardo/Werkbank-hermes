@@ -388,7 +388,7 @@ def test_bare_long_random_false_alarms(text):
 
 def _reg(value):
     from agent import redact as r
-    return value in r._VAULT_REDACTION_VALUES.get(r._vault_scope(), {})
+    return "«redacted" in r.redact_registered_vault_values(value)
 
 
 def test_discard_never_unregisters_a_real_vault_fill():
@@ -408,6 +408,48 @@ def test_same_value_open_in_other_scope_stays_registered():
     assert _reg(value) and b.status == "pending"
     si.store().purge(now=b.expires + 1)
     assert not _reg(value)
+
+
+# N1: intake values live in their own refcounted set — an intake overflow never evicts a vault fill,
+# a key-prompt value or a saved value, and fills never evict an open intake entry.
+
+def test_intake_overflow_never_evicts_a_fill_or_key_prompt_value():
+    from agent.redact import register_vault_redaction_value, _VAULT_REDACTION_MAX_PER_PROFILE
+    fill = "sk-ant-" + "Qx7Lz2Kc8Wv0fQaB3dE5gH7jKmN2pXq7Lz2Kc8Wv0"
+    register_vault_redaction_value(fill)           # browser_vault_fill / key-prompt path
+    for i in range(_VAULT_REDACTION_MAX_PER_PROFILE + 6):
+        assert si.intake(f"password=Zq{i}x!Lm2pR7vX{i}", f"ev{i}").new
+    assert _reg(fill)
+
+
+def test_intake_overflow_never_evicts_a_saved_value(tmp_path):
+    from agent.redact import _VAULT_REDACTION_MAX_PER_PROFILE
+    entry = si.intake(f"mein token {FAKE_GH}", "s1").new[0]
+    assert si.save(entry.id, vault_factory=_vault(tmp_path))["ok"]
+    for i in range(_VAULT_REDACTION_MAX_PER_PROFILE + 6):
+        si.intake(f"password=Zs{i}x!Lm2pR7vX{i}", f"es{i}")
+    assert _reg(FAKE_GH)
+
+
+def test_pending_intake_value_survives_many_more_intakes_and_fills():
+    from agent.redact import register_vault_redaction_value, _VAULT_REDACTION_MAX_PER_PROFILE
+    first = si.intake("password=FirstPend1ng!x", "evA").new[0]
+    for i in range(_VAULT_REDACTION_MAX_PER_PROFILE + 6):
+        si.intake(f"password=Zr{i}y!Lm2pR7vX{i}", f"ew{i}")
+        register_vault_redaction_value(f"fill-{i}-Qx7Lz2Kc8Wv0")
+    assert first.status == "pending" and _reg("FirstPend1ng!x")
+
+
+def test_intake_set_bounded_by_store(monkeypatch):
+    from agent import redact as r
+    monkeypatch.setattr(si, "MAX_PENDING", 3)
+    entries = [si.intake(f"password=Zb{i}x!Lm2pR7vX{i}", f"eb{i}").new[0] for i in range(5)]
+    # the store retires its oldest open entries (value wiped) instead of growing past the bound,
+    # and the intake scrub set holds exactly the values of the entries still open
+    assert [e.status for e in entries] == ["expired", "expired", "pending", "pending", "pending"]
+    assert entries[0].value is None and not _reg("Zb0x!Lm2pR7vX0")
+    held = set(r._INTAKE_REDACTION_REFS.get(r._vault_scope(), {}))
+    assert held == {e.value for e in entries[2:]}
 
 
 # D3: a saved value stays scrubbed — after save and after a restart (lazy load of ``secret`` items).
