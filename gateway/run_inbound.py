@@ -1524,8 +1524,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     async def _echo_stt_transcripts(
         self, adapter, source: SessionSource, transcripts: List[str], *, metadata=None, log_context: str = "Transcript"
     ) -> None:
-        """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)."""
+        """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised).
+        WB-1212: a secret spoken into the clip is echoed as its placeholder, never in clear."""
+        from gateway.secret_intake_gateway import redact_for_session
+        _scope = self._secret_intake_scope(source)
         for tx in transcripts:
+            tx = redact_for_session(tx, _scope, surface="stt")
             try:
                 await adapter.send(source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=metadata)
             except Exception as echo_exc:
@@ -1756,7 +1760,22 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 return None
         # After expansion: the quoted reply is someone else's text and stays literal — an
         # ``@file:`` inside it must never read a local file on the replier's behalf.
-        return self._prepend_inbound_reply_context(event, source, message_text)
+        message_text = self._prepend_inbound_reply_context(event, source, message_text)
+        # WB-1212: STT transcripts, document notes, image descriptions and @-expansions are added
+        # AFTER handle_message's intake — redact the final text before transcript/model see it and
+        # offer the vault card for what is new. Idempotent for the already-redacted user text.
+        from gateway.secret_intake_gateway import intake_prepared_text
+        _adapter = None
+        with suppress(Exception):
+            _adapter = self._delivery_adapter_for(source)
+        return intake_prepared_text(_adapter, event, session_key, message_text)
+
+    def _secret_intake_scope(self, source) -> str:
+        """Scope of the secret intake for *source*: its session key (same as handle_message)."""
+        try:
+            return str(self._session_key_for_source(source) or "gateway")
+        except Exception:
+            return "gateway"
 
     async def _prepare_profile_scoped_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],
@@ -2024,6 +2043,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
         enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+        # WB-1212: the cache feeds agent.interrupt(), the drain and the echo — placeholders only.
+        from gateway.secret_intake_gateway import redact_for_session
+        _scope = self._secret_intake_scope(getattr(event, "source", None))
+        enriched_text = redact_for_session(enriched_text, _scope, surface="stt")
+        successful_transcripts = [redact_for_session(tx, _scope, surface="stt") for tx in successful_transcripts]
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts

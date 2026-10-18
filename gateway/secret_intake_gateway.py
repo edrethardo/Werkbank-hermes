@@ -28,8 +28,11 @@ _CARD_TASKS: set = set()   # strong refs: a fire-and-forget task may otherwise b
 
 def intake_inbound_event(adapter: Any, event: Any, session_key: str, *, surface: Optional[str] = None) -> int:
     """Redact *event* in place; schedule the card for every not-yet-offered placeholder it names.
-    Returns the number of placeholders offered. Never raises (fails open on the TEXT path only when
-    the detector itself breaks — logged)."""
+    Returns the number of placeholders offered. Never raises.
+
+    Fail-open (documented): when the detector itself raises, the text passes UNCHANGED (logged as a
+    warning) — the run_conversation backstop and the steer/redirect stage scan again; a broken
+    detector must not swallow the user's message."""
     if event is None or getattr(event, "internal", False):
         return 0
     try:
@@ -49,6 +52,54 @@ def intake_inbound_event(adapter: Any, event: Any, session_key: str, *, surface:
     if entries and adapter is not None:
         _schedule_card(adapter, event, session_key, entries)
     return len(entries)
+
+
+def redact_for_session(text: Any, session_key: str, *, surface: str) -> Any:
+    """*text* with every secret replaced (same placeholders as the session's intake); no card.
+    Fails open (text unchanged, logged) only when the detector itself breaks."""
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        return secret_intake.intake(text, session_key, surface=surface).text
+    except Exception:
+        logger.warning("secret_intake: scan failed (text passes unchanged)", exc_info=False)
+        return text
+
+
+def intake_prepared_text(adapter: Any, event: Any, session_key: str, text: Any) -> Any:
+    """Intake for the agent-facing text the runner PREPARED after ``handle_message`` (STT transcript,
+    document/media notes, image descriptions, reply context, @-expansions): redact, then offer the
+    card for placeholders not offered yet. Internal events pass unchanged."""
+    if event is not None and getattr(event, "internal", False):
+        return text
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        if not secret_intake.enabled():
+            return text
+        text = secret_intake.intake(text, session_key, surface="gateway-prepared").text
+        entries = secret_intake.offer_candidates(session_key, text)
+    except Exception:
+        logger.warning("secret_intake: prepared-text scan failed (text passes unchanged)", exc_info=False)
+        return text
+    if entries and adapter is not None:
+        _schedule_card(adapter, event, session_key, entries)
+    return text
+
+
+def redact_platform_event(event: Any, session_key: str) -> Any:
+    """``gateway_platform_event`` envelopes (``message_edited``) carry user text to plugin hooks:
+    a copy with ``payload.text`` redacted; the envelope itself is not mutated. No card (an edit is
+    no new message; the value waits for ``hermes vault`` or expires)."""
+    if not isinstance(event, dict):
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str) or not payload["text"]:
+        return event
+    new_text = redact_for_session(payload["text"], session_key, surface="edit")
+    if new_text == payload["text"]:
+        return event
+    return {**event, "payload": {**payload, "text": new_text}}
 
 
 def _surface_of(event: Any) -> str:

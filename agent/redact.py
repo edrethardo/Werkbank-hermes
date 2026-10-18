@@ -57,6 +57,21 @@ def register_vault_redaction_value(value) -> None:
             del bucket[next(iter(bucket))]
 
 
+def unregister_vault_redaction_value(value, scope: str = None) -> None:
+    """Forget one registered value (and its CR/LF-stripped form) for *scope* (profile home; default
+    the current one). The secret intake (WB-1212) calls this when a pending value is saved,
+    discarded or expires, so the bounded list does not hold it — or evict real vault fills — longer
+    than its TTL."""
+    if not isinstance(value, str) or not value:
+        return
+    normalized = value.replace("\r", "").replace("\n", "")
+    with _VAULT_REDACTION_LOCK:
+        bucket = _VAULT_REDACTION_VALUES.get(scope or _vault_scope())
+        if bucket:
+            for v in (value, normalized):
+                bucket.pop(v, None)
+
+
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:

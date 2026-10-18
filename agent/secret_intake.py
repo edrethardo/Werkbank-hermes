@@ -16,7 +16,12 @@ Contract:
 * The value lives only in :class:`_Store` (process memory) for ``TTL_SECONDS``; then it is wiped. It is
   never logged — the audit line names art, placeholder and scope hash only. Every intake value is
   also registered with the model-egress redaction (``register_vault_redaction_value``), so a tool
-  result that echoes it later is scrubbed too.
+  result that echoes it later is scrubbed too; save/discard/expiry removes that registration again.
+* Text joining a RUNNING turn goes through :func:`intake_turn_text` inside ``AIAgent.steer`` /
+  ``redirect`` (TUI, classic CLI, ACP, API server and gateway all end there); the gateway also
+  re-scans the text it prepared after ``handle_message`` (STT transcript, document notes).
+* Fail-open: a detector exception lets the text pass unchanged (warning logged); the next stage
+  (gateway → steer/redirect → ``run_conversation`` backstop) scans again.
 * :func:`save` writes a ``secret`` vault item (label suggested from art + key name + placeholder) and
   wipes the in-memory value; :func:`discard` wipes it. Both run without the model (button / CLI prompt).
 * Switch: ``security.secret_intake`` (default on). Off → :func:`intake` returns the text unchanged.
@@ -62,12 +67,14 @@ _PREFIX_ARTS: Tuple[Tuple[str, str], ...] = (
 )
 
 _KEYWORD_RE = re.compile(
-    r"passwor[dt]|passwd|kennwort|pwd|pw|pass"
+    r"passwor[dt]|passwd|kennwort|pw|pass"
     r"|(?:api|auth|access|refresh|session|secret|bearer|private|client)[ _.\-]?(?:key|token|secret)"
     r"|apikey|token|secret|geheimnis|credential",
     re.IGNORECASE,
 )
-_PASSWORD_KEYWORD_RE = re.compile(r"passwor[dt]|passwd|kennwort|pwd|pw|pass", re.IGNORECASE)
+# ``pwd`` is the working directory (``PWD=/data/…``), never a password key; ``pw``/``pass`` only count
+# as a whole word of the key (``DB_PASS``, ``pw:``) — the word-bounded check below enforces that.
+_PASSWORD_KEYWORD_RE = re.compile(r"passwor[dt]|passwd|kennwort|pw|pass", re.IGNORECASE)
 # key, optional closing quote, ``=`` or ``:``, optional opening quote, the value (no whitespace/quote/delimiter)
 _ASSIGN_RE = re.compile(
     r"(?<![A-Za-z0-9_.\-])(?P<key>[A-Za-z][A-Za-z0-9_.\-]{0,60})[\"']?[ \t]*[:=][ \t]*[\"']?"
@@ -81,6 +88,36 @@ _NOT_A_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _WORDISH_SEGMENT_RE = re.compile(r"[a-z]+|[0-9]+")
+# Values that are code, paths, file names or placeholders — not secrets (review corpus WB-1212):
+_DOTTED_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")      # settings.DB_PASSWORD
+_PATH_RE = re.compile(r"(?:/|~|\.{1,2}/)")                                                 # /x, ~/x, ./x, ../x
+_FILENAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*\.[A-Za-z][A-Za-z0-9]{0,5}")          # test_x.py, db.txt
+_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z]{3,}")                        # MY_APP_SECRET, CHANGEME
+_PLACEHOLDER_WORD_RE = re.compile(r"(?i)(?:replace|change|insert|enter|your|dein|todo|fixme|placeholder)")
+_SNAKE_IDENT_SEGMENT_RE = re.compile(r"[a-z]{2,}|[a-z]{0,3}[0-9]{1,4}")                      # tokenizer_v2_large_model
+
+
+def _value_is_code_or_placeholder(value: str, after: str) -> bool:
+    """True for values a human writes in code/config prose, not as a secret: a call or attribute
+    expression, a path, a file name with an extension, an ENV-variable name or an upper-case
+    placeholder (``REPLACE_ME…``, ``CHANGEME``), ``xxx…``. *after* is the text right after the value."""
+    if after.startswith("("):
+        return True                                   # get_token(), getpass.getpass()
+    if _PATH_RE.match(value) or _DOTTED_IDENT_RE.fullmatch(value) or _FILENAME_RE.fullmatch(value):
+        return True
+    if _ENV_NAME_RE.fullmatch(value):
+        return True
+    if re.fullmatch(r"(?i)x{3,}", value):
+        return True
+    if value.isupper() and _PLACEHOLDER_WORD_RE.search(value):
+        return True
+    return False
+
+
+def _is_snake_identifier(value: str) -> bool:
+    """``tokenizer_v2_large_model``: lower-case words joined by ``_``/``-`` — a name, not a token."""
+    segments = re.split(r"[_-]", value)
+    return len(segments) >= 2 and all(_SNAKE_IDENT_SEGMENT_RE.fullmatch(s) for s in segments)
 
 
 def _redact_mod():
@@ -104,16 +141,18 @@ def _looks_random(token: str) -> bool:
     return not all(_WORDISH_SEGMENT_RE.fullmatch(s) for s in segments)
 
 
-def _assignment_value_is_secret(key: str, value: str) -> bool:
+def _assignment_value_is_secret(key: str, value: str, after: str = "") -> bool:
     r = _redact_mod()
     if PLACEHOLDER_RE.search(value) or _NOT_A_VALUE_RE.match(value):
+        return False
+    if _value_is_code_or_placeholder(value, after):
         return False
     if value.endswith(("://",)) or "://" in value:
         return False  # a URL as the value: its own userinfo rule decides
     if r._has_word_bounded_keyword(key, _PASSWORD_KEYWORD_RE):
         # A human password: any non-trivial value, but not a plain lowercase word (``password: required``).
         return len(value) >= 6 and not re.fullmatch(r"[a-zäöüß]+", value)
-    return len(value) >= 12 and r._looks_like_opaque_credential(value)
+    return len(value) >= 12 and not _is_snake_identifier(value) and r._looks_like_opaque_credential(value)
 
 
 @dataclass(frozen=True)
@@ -165,7 +204,7 @@ def find_secrets(text: str) -> List[Finding]:
         key, value = m.group("key"), m.group("val")
         if not r._has_word_bounded_keyword(key, _KEYWORD_RE):
             continue
-        if not _assignment_value_is_secret(key, value):
+        if not _assignment_value_is_secret(key, value, scan[m.end("val"):m.end("val") + 1]):
             continue
         art = "passwort" if r._has_word_bounded_keyword(key, _PASSWORD_KEYWORD_RE) else "token"
         add(m.start("val"), m.end("val"), art, key)
@@ -223,6 +262,7 @@ class _Store:
     def _purge_locked(self, now: float) -> List[PendingSecret]:
         expired = [e for e in self._by_id.values() if e.status == "pending" and e.expires <= now]
         for e in expired:
+            _unregister_egress(e.value, e.home)
             e.value = None
             e.status = "expired"
         # forget finished entries after another TTL so the dict stays bounded
@@ -290,6 +330,7 @@ class _Store:
             e = self._by_id.get(entry_id)
             if e is None or e.status != "pending":
                 return None
+            _unregister_egress(e.value, e.home)
             e.value = None
             e.status = status
             e.handle = handle
@@ -425,6 +466,31 @@ def intake(message: Any, scope: str, *, surface: str = "unbekannt") -> IntakeRes
     return IntakeResult(message, [])
 
 
+def intake_turn_text(text: Any, scope: str, *, surface: str = "steer") -> Any:
+    """Intake for text folded into a RUNNING turn (``AIAgent.steer`` / ``redirect``): every surface
+    (TUI, classic CLI, ACP, API server, gateway) hands its mid-turn text to those verbs, so the
+    replacement sits there as the last stage. Keeps a :class:`agent.folded_messages.FoldedText`
+    a FoldedText and redacts each part's own ``text`` too (the Werkbank chat draws the parts).
+    Fails open — the original text — only when the detector itself raises (logged)."""
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        if not enabled():
+            return text
+        from agent.folded_messages import FoldedText, folded_parts
+        scope = str(scope or "global")
+        new_text = redact_text(str(text), scope, surface=surface)[0]
+        parts = folded_parts(text)
+        new_parts = [{**p, "text": redact_text(p["text"], scope, surface=surface)[0]}
+                     if isinstance(p.get("text"), str) and p["text"] else p for p in parts]
+        if new_text == str(text) and new_parts == parts:
+            return text                                   # nothing found: the same object
+        return FoldedText(new_text, new_parts) if parts else new_text
+    except Exception:
+        logger.warning("secret_intake: turn text scan failed (text passes unchanged)", exc_info=False)
+        return text
+
+
 def offer_candidates(scope: str, text: Any) -> List[PendingSecret]:
     """Pending entries of *scope* named in *text* that have not been offered to the user yet; marks
     them offered. A Werkbank message redacted in the plugin gets its card from the gateway this way."""
@@ -524,6 +590,19 @@ def card_choices(entries: List[PendingSecret]) -> List[Dict[str, str]]:
             {"value": f"drop:{ids}", "label": "🗑 Verwerfen"}]
 
 
+def _unregister_egress(value: Optional[str], home: str) -> None:
+    """Counterpart of :func:`_register_egress` when the entry finishes (save/discard/expiry). A saved
+    value is re-registered by the vault fill path whenever it is used; a tool result echoing a
+    discarded/expired value after that is no longer scrubbed (documented trade-off)."""
+    if not value:
+        return
+    try:
+        from agent.redact import unregister_vault_redaction_value
+        unregister_vault_redaction_value(value, home or None)
+    except Exception:
+        logger.debug("secret_intake: egress unregistration failed", exc_info=False)
+
+
 def _register_egress(value: str) -> None:
     try:
         from agent.redact import register_vault_redaction_value
@@ -534,6 +613,7 @@ def _register_egress(value: str) -> None:
 
 __all__ = [
     "Finding", "IntakeResult", "PendingSecret", "PLACEHOLDER_RE", "TTL_SECONDS", "apply_choice",
-    "card_choices", "card_text", "discard", "enabled", "find_secrets", "intake", "offer_candidates",
+    "card_choices", "card_text", "discard", "enabled", "find_secrets", "intake", "intake_turn_text",
+    "offer_candidates",
     "redact_text", "save", "store", "suggest_name",
 ]

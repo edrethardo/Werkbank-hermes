@@ -265,11 +265,19 @@ class InterruptControlMixin:
                 self._pending_steer = None
         return True
 
+    def _secret_intake_turn_text(self, text):
+        """WB-1212: secrets in text folded into the running turn become placeholders here — the last
+        stage every surface (TUI, CLI, ACP, API server, gateway) passes. Idempotent."""
+        from agent import secret_intake
+        return secret_intake.intake_turn_text(
+            text, str(getattr(self, "session_id", "") or "agent"), surface="steer")
+
     def steer(self, text: str) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
         interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
         if not text or not text.strip():
             return False
+        text = self._secret_intake_turn_text(text)
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
@@ -286,6 +294,7 @@ class InterruptControlMixin:
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
         if not text or not text.strip():
             return False
+        text = self._secret_intake_turn_text(text)
         cleaned = text.strip()
 
         _native_steer = _ic_codex_method(self, "request_steer")

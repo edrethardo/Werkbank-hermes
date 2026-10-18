@@ -111,7 +111,24 @@ platforms without buttons:
 Detection: vendor-prefixed keys, Telegram bot tokens, PEM private keys,
 three-part JWTs, `Bearer` values, DSN/URL passwords and `password=` / `token:`
 style assignments with an opaque value. Commit SHAs, UUIDs and bare hashes are
-not reported. The audit log line (`hermes.secret_intake`) names kind,
+not reported, nor are assignment values that read as code or configuration:
+call and attribute expressions (`getpass.getpass()`, `settings.DB_PASSWORD`),
+paths (`/…`, `~/…`, `./…`), file names with an extension, environment variable
+names and upper-case placeholders (`REPLACE_ME…`, `CHANGEME`, `xxx`, `<…>`,
+`${…}`). `PWD` is the working directory, not a password; `pw` / `pass` count
+only as a whole word of the key.
+
+Text that joins a running turn — `/steer`, a redirect, a message typed while
+the agent works in the TUI, ACP or API server — passes the same replacement in
+`AIAgent.steer` / `redirect`. Voice transcripts, document notes and image
+descriptions the gateway adds after the message arrived are scanned again
+before the transcript is written or echoed (`🎙️ "…"` shows the placeholder).
+
+While a value waits for your decision it is also on the model-egress scrub
+list (a tool result that echoes it is redacted). Saving, discarding or expiry
+removes it from that list again. If the detector itself fails, the text
+passes unchanged (fail-open, logged as a warning); the later stages scan
+again. The audit log line (`hermes.secret_intake`) names kind,
 placeholder and a hashed session id, never the value. Turn it off with
 `security.secret_intake: false`.
 
