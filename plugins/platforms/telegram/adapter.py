@@ -4393,6 +4393,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not state:
             await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
             return
+        # One picker per chat: a tap on an OLDER card (same ``cp:<i>`` data) must not apply the
+        # current card's choice (WB-1212: "save" of the wrong secret card).
+        tapped = getattr(getattr(query, "message", None), "message_id", None)
+        if tapped is not None and state.get("msg_id") is not None and str(tapped) != str(state["msg_id"]):
+            await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
+            return
         try:
             choice = state["choices"][int(data[3:])]
         except (ValueError, IndexError):

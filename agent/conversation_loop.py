@@ -1737,6 +1737,8 @@ def run_conversation(
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
 
+    user_message, persist_user_message, title_user_message = _secret_intake_backstop(
+        agent, user_message, persist_user_message, title_user_message)
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
@@ -1767,6 +1769,25 @@ def run_conversation(
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
     _close_durable_failed_turn(agent, result)
     return result
+
+
+def _secret_intake_backstop(agent, user_message, persist_user_message, title_user_message):
+    """WB-1212 backstop: the user's secrets become placeholders before the turn persists, compresses,
+    reaches memory, plugin hooks or the model — for every host without an earlier intake point (TUI,
+    ACP, API server, cron, delegate). Idempotent: gateway/CLI-redacted text passes unchanged. The
+    scope is the session id; values wait in ``agent.secret_intake`` for a vault save (no card here)."""
+    try:
+        from agent import secret_intake
+        scope = str(getattr(agent, "session_id", "") or "agent")
+        surface = str(getattr(agent, "platform", "") or "agent")
+        user_message = secret_intake.intake(user_message, scope, surface=surface).text
+        if persist_user_message is not None:
+            persist_user_message = secret_intake.intake(persist_user_message, scope, surface=surface).text
+        if isinstance(title_user_message, str):
+            title_user_message = secret_intake.intake(title_user_message, scope, surface=surface).text
+    except Exception:
+        logger.warning("secret_intake backstop failed", exc_info=True)
+    return user_message, persist_user_message, title_user_message
 
 
 _FAILED_TURN_ERROR_MAX_CHARS = 2000

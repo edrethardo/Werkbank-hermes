@@ -83,6 +83,13 @@ def _cmd_add(args) -> None:
             meta = get_vault_store().add_item(
                 kind="login", label=label, secret=secret, origin=origin
             )
+        elif kind == "secret":
+            # WB-1212: one opaque value (API token, password) the agent may know by handle only.
+            value = ""
+            while not value:
+                value = getpass.getpass("Value (hidden): ")
+            origin = input("Site origin it belongs to (optional, Enter to skip): ").strip() or None
+            meta = get_vault_store().add_item(kind="secret", label=label, secret={"value": value}, origin=origin)
         else:
             from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, REQUIRED_FIELDS
 
@@ -191,7 +198,7 @@ def register_cli(subparser) -> None:
         help="Save a login, card or address ahead of time (optional: the agent asks you on the page when it needs one)",
     )
     p_add.add_argument(
-        "--kind", choices=["login", "payment", "address"], default=None,
+        "--kind", choices=["login", "payment", "address", "secret"], default=None,
         help="Item kind (interactive prompt when omitted)",
     )
     p_add.set_defaults(_vault_handler=_cmd_add)

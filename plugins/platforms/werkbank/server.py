@@ -197,6 +197,20 @@ class WerkbankServer:
         return self._closing.is_set()
 
 
+def _secret_intake(key: str, text: str) -> str:
+    """The board text with every secret replaced (``agent/secret_intake.py``); unchanged when the core
+    has no intake (older Hermes) or ``security.secret_intake`` is off."""
+    try:
+        from agent import secret_intake
+    except Exception:
+        return text
+    try:
+        return secret_intake.intake(text, key, surface="werkbank").text
+    except Exception:
+        logger.warning("werkbank: secret intake failed (text not logged)", exc_info=False)
+        return text
+
+
 def with_attachments(uploads, key: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """WB-1174: a ``user.message`` of a board message with attachments gets ``payload.attachments``
     (a copy; the buffered event stays as the core sent it)."""
@@ -603,6 +617,9 @@ def _handler(app: WerkbankServer):
                 except uploads_mod.UploadError as e:
                     app.buffers.release_id(key, cmid)
                     return self._refuse(e.status, e.error, e.grund, accepted=False)
+            # WB-1212: secrets become placeholders before the mirror, the inject and the event stream see
+            # the text; the gateway offers the vault card for them (same session key, not yet offered).
+            text = _secret_intake(key, text)
             # WB-1148: the mirror goes out FIRST, so its Telegram message id can be the reply anchor of
             # Hermes' answer — and only when the gateway can take the message at all (host pre-check).
             # A mirror that fails or is slow (host.MIRROR_WAIT_S) leaves no anchor.

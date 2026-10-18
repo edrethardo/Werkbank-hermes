@@ -239,7 +239,8 @@ def browser_vault_list() -> str:
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
-                     "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+                     "origin": meta.origin,
+                     "available": meta.kind == "login" or (meta.kind != "secret" and bool(meta.origin))}
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
@@ -442,6 +443,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    if meta.kind == "secret":
+        # WB-1212: a value saved from a chat message has no page field it belongs to; filling it
+        # into whatever page is open would hand it to that site. Listed, never page-filled.
+        return json.dumps({"success": False, "error_type": "not_fillable",
+                           "error": f"Vault item {handle!r} is a saved secret (kind 'secret'), not a page login; "
+                                    "it is not filled into web pages. Tell the user its handle and label instead."})
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})

@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
+# Secret intake (WB-1212): values of open intake entries live in their OWN refcounted set, never in
+# the 64-entry fill list above — an intake burst can't evict a vault fill / key-prompt value, and a
+# fill burst can't evict an open intake value. One ref per open entry; released on
+# discard/expiry/save. Bounded by the intake store, not here: every ref belongs to a pending
+# ``_Store`` entry, which lives at most ``TTL_SECONDS`` and of which at most ``MAX_PENDING`` are
+# open (``agent.secret_intake``) — so this set holds ≤ 2 × MAX_PENDING forms per process.
+_INTAKE_REDACTION_REFS: dict = {}  # profile home → {value: open intake entries}
+# Saved ``secret`` vault items stay scrubbed for the profile's lifetime — outside the 64-entry fill
+# bound, so many saved tokens never evict a live fill. Loaded lazily from the vault the first time a
+# profile scrubs (= process start for that profile), extended on every save.
+_DURABLE_REDACTION_VALUES: dict = {}  # profile home → set(values)
+_DURABLE_LOADED: set = set()  # profile homes whose saved ``secret`` items were read
 
 
 def _vault_scope() -> str:
@@ -37,40 +49,109 @@ def _vault_scope() -> str:
     return str(get_hermes_home())
 
 
+def _forms(value: str):
+    normalized = value.replace("\r", "").replace("\n", "")
+    return [v for v in dict.fromkeys((value, normalized)) if v]
+
+
+def _add_to_bucket_locked(scope: str, value: str) -> None:
+    bucket = _VAULT_REDACTION_VALUES.setdefault(scope, {})
+    for v in _forms(value):
+        bucket.pop(v, None)  # re-registering refreshes recency
+        bucket[v] = None
+    while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+        evicted = next(iter(bucket))
+        del bucket[evicted]
+
+
 def register_vault_redaction_value(value) -> None:
     """Register an exact vault secret value for model-facing redaction.
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
-    it to (CR/LF stripped), since that is what the page holds.
+    it to (CR/LF stripped), since that is what the page holds. Kept apart from the secret intake's
+    set, so the intake's release or overflow never touches it.
     """
     if not isinstance(value, str) or not value:
         return
-    normalized = value.replace("\r", "").replace("\n", "")
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+        _add_to_bucket_locked(_vault_scope(), value)
+
+
+def register_intake_redaction_value(value, scope: str = None) -> None:
+    """Secret intake (WB-1212): one open intake entry holds *value* — scrub it, counted per entry."""
+    if not isinstance(value, str) or not value:
+        return
+    with _VAULT_REDACTION_LOCK:
+        scope = scope or _vault_scope()
+        refs = _INTAKE_REDACTION_REFS.setdefault(scope, {})
+        for v in _forms(value):
+            refs[v] = refs.get(v, 0) + 1
+
+
+def release_intake_redaction_value(value, scope: str = None) -> None:
+    """Counterpart of :func:`register_intake_redaction_value` (entry discarded, expired or saved).
+    The value leaves the intake set only when no other open intake entry holds it; a vault fill of
+    the same bytes lives on in the fill list, a saved value in the durable set
+    (:func:`register_durable_redaction_value`) — both untouched here."""
+    if not isinstance(value, str) or not value:
+        return
+    with _VAULT_REDACTION_LOCK:
+        scope = scope or _vault_scope()
+        refs = _INTAKE_REDACTION_REFS.get(scope, {})
+        for v in _forms(value):
+            left = refs.get(v, 0) - 1
+            if left > 0:
+                refs[v] = left
+            else:
+                refs.pop(v, None)
+
+
+def register_durable_redaction_value(value, scope: str = None) -> None:
+    """A value saved as a ``secret`` vault item: scrubbed for the profile's lifetime (no bound)."""
+    if not isinstance(value, str) or not value:
+        return
+    with _VAULT_REDACTION_LOCK:
+        _DURABLE_REDACTION_VALUES.setdefault(scope or _vault_scope(), set()).update(_forms(value))
+
+
+def _ensure_durable_loaded(scope: str) -> None:
+    """First scrub for a profile: register its saved ``secret`` vault items (restart survival)."""
+    with _VAULT_REDACTION_LOCK:
+        if scope in _DURABLE_LOADED:
+            return
+        _DURABLE_LOADED.add(scope)  # before loading: a failing vault is not retried on every call
+    try:
+        from agent.secret_intake import saved_secret_values
+        values = saved_secret_values(scope)
+    except Exception:
+        logger.debug("vault redaction: saved secret items not loaded", exc_info=False)
+        return
+    for value in values:
+        register_durable_redaction_value(value, scope)
 
 
 def clear_vault_redaction_values() -> None:
-    """Drop the current profile's registered values (profile teardown / explicit lock)."""
+    """Drop the current profile's registered values (profile teardown / explicit lock). Saved
+    ``secret`` items are read from the vault again on the next scrub."""
     with _VAULT_REDACTION_LOCK:
-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+        scope = _vault_scope()
+        for registry in (_VAULT_REDACTION_VALUES, _INTAKE_REDACTION_REFS, _DURABLE_REDACTION_VALUES):
+            registry.pop(scope, None)
+        _DURABLE_LOADED.discard(scope)
 
 
 def redact_registered_vault_values(text: str) -> str:
     """Exact-substring scrub of every vault secret value registered for the current profile."""
     if not isinstance(text, str) or not text:
         return text
+    scope = _vault_scope()
+    if scope not in _DURABLE_LOADED:
+        _ensure_durable_loaded(scope)
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
-    for value in values:
+        values = (set(_VAULT_REDACTION_VALUES.get(scope) or ()) | set(_INTAKE_REDACTION_REFS.get(scope) or ())
+                  | set(_DURABLE_REDACTION_VALUES.get(scope) or ()))
+    for value in sorted(values, key=len, reverse=True):  # longest first: a substring never shadows its superstring
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
     return text

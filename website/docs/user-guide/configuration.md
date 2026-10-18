@@ -2837,6 +2837,7 @@ Secret redaction and the website blocklist:
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
+  secret_intake: true            # Replace secrets in YOUR messages with placeholders, offer a vault save (on by default)
   website_blocklist:             # See Website Blocklist section below
     enabled: false
     domains: []
@@ -2844,6 +2845,8 @@ security:
 ```
 
 - `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development. Reading a secret-bearing file (`.env`-style files, shell rc/profile files, the Hermes `config.yaml` under `HERMES_HOME` and its `backups/config/` copies) with `read_file`, `search_files` or a terminal `cat`/`grep` also masks credential-shaped assignments (`SOME_API_TOKEN: …`) with a non-reusable `«redacted-secret»` marker, whatever the value looks like; ordinary source and project config files keep only the vendor-prefix patterns so fixtures such as `MAX_TOKENS: 100` are never mangled.
+
+- `secret_intake` — when `true` (default), every message you send (Telegram and other gateway platforms, the Werkbank chat, the CLI) is checked for secrets **before** it is stored, mirrored or sent to the model: API keys with a known vendor prefix (`sk-ant-…`, `ghp_…`, `AKIA…`, `xoxb-…` …), Telegram bot tokens, PEM private keys, three-part JWTs, `Bearer` values, DSN/URL passwords and `password=`/`token:` assignments with an opaque value. Each one becomes a placeholder such as `[GEHEIMNIS:github-token-1]`; the rest of the message is unchanged. You get a card with **Im Tresor speichern** / **Verwerfen** (Telegram buttons, a CLI prompt; other platforms a notice). Saving stores a `secret` item in the [credential vault](features/credential-vault.md) named after the placeholder; the value itself waits only in process memory and is wiped after 10 minutes. Commit SHAs, UUIDs and bare hashes are not reported. Set to `false` to send messages unchanged. See [Secrets in your messages](features/credential-vault.md#secrets-in-your-messages).
 
 Earlier releases also had `tirith_*` keys for a bundled command scanner; it was removed and upgrading drops those keys. Content-level command checks are described in [Content-Level Command Checks](security.md#content-level-command-checks).
 

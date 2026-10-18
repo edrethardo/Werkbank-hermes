@@ -1802,6 +1802,9 @@ class GatewayAdapterLifecycleMixin:
         with _log_suppressed(logging.DEBUG, "gateway_platform_event hook dispatch failed", exc_info=True):
             from hermes_cli.lifecycle import has_hook, invoke_hook
             if has_hook("gateway_platform_event") and self._is_user_authorized_for_source(source):
+                # WB-1212: an edited message's text reaches plugin hooks with placeholders only.
+                from gateway.secret_intake_gateway import redact_platform_event
+                event = redact_platform_event(event, self._secret_intake_scope(source))
                 invoke_hook("gateway_platform_event", **event)
 
     def _make_profile_platform_event_handler(self, profile_name: str):
