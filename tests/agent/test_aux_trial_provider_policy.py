@@ -396,3 +396,9 @@ def test_curator_main_fallback_unchanged_when_the_policy_is_off(config, monkeypa
     cfg = _cfg({"exclude_main_providers": []}, **_NIM_MAIN)
     meta, built = _run_curator(config, monkeypatch, cfg, _nim_resolve)
     assert [b["provider"] for b in built] == ["nvidia"]
+
+
+def test_curator_explicit_nvidia_slot_is_the_users_choice(config, monkeypatch):
+    cfg = _cfg({"curator": {"provider": "nvidia", "model": NVIDIA_RUNTIME["model"]}}, **_NIM_MAIN)
+    meta, built = _run_curator(config, monkeypatch, cfg, _nim_resolve)
+    assert [b["provider"] for b in built] == ["nvidia"]

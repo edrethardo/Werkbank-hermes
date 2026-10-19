@@ -27,6 +27,15 @@ def _accepts_keyword_argument(callable_obj: Any, name: str) -> bool:
 
 
 class SummaryDispatchMixin:
+    def _main_route_excluded_for_summary(self) -> bool:
+        """Main route listed in ``auxiliary.exclude_main_providers`` (default: hosted NVIDIA trial):
+        summaries never fall back onto it; without another route compression goes on summary-less (WB-1216)."""
+        from agent import aux_provider_policy as policy
+        if not policy.main_route_excluded(getattr(self, "provider", ""), getattr(self, "base_url", "") or ""):
+            return False
+        policy.log_excluded("compression", str(getattr(self, "provider", "") or ""))
+        return True
+
     def _apply_summary_route(self, call_kwargs: dict, pinned: Optional[Dict[str, Any]] = None) -> None:
         """Pin the summary route onto ``call_kwargs`` for both compression entry points.
 
@@ -47,6 +56,8 @@ class SummaryDispatchMixin:
             return
         if not getattr(self, "_summary_model_fallen_back", False):
             return
+        if self._main_route_excluded_for_summary():
+            return  # trial main (auxiliary.exclude_main_providers): leave routing to the aux policy (WB-1216)
         for key, value in (
             ("provider", self.provider),
             ("model", self.model),

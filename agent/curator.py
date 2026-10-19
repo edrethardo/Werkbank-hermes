@@ -1082,6 +1082,34 @@ def _resolve_review_provider() -> tuple:
     return rp, model_name, provider, overrides
 
 
+def _review_lands_on_excluded_main(provider: Optional[str], rp: Dict[str, Any]) -> bool:
+    """The review would run on the main model (no ``auxiliary.curator`` route, or that route failed to
+    resolve) and the main route is listed in ``auxiliary.exclude_main_providers`` (default: hosted NVIDIA
+    trial) → the LLM pass stays off (WB-1216). An explicit, resolved curator slot is never gated."""
+    from agent import aux_provider_policy as policy
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        cfg = {}
+    task, legacy = _subdict(cfg, "auxiliary", "curator"), _subdict(cfg, "curator", "auxiliary")
+    slot_configured = bool(
+        (str(task.get("provider") or "").strip() not in {"", "auto"} and str(task.get("model") or "").strip())
+        or (legacy.get("provider") and legacy.get("model")))
+    if provider and slot_configured:
+        return False  # explicit auxiliary.curator / legacy slot resolved: the user's choice
+    main = _subdict(cfg, "model")
+    main_provider = str(main.get("provider") or "")
+    if provider:
+        route_provider, route_url = provider, str(rp.get("base_url") or "")
+    else:
+        route_provider, route_url = main_provider, str(main.get("base_url") or "")
+    if not policy.main_route_excluded(route_provider, route_url):
+        return False
+    policy.log_excluded("curator", route_provider)
+    return True
+
+
 def _run_llm_review(prompt: str) -> Dict[str, Any]:
     """Spawn an AIAgent fork on the review prompt. Returns ``final`` (untruncated response), ``summary`` (240-char cap),
     ``model``/``provider`` (what ran), ``tool_calls`` ([{name, arguments}], truncated) and ``error``. Never raises."""
@@ -1092,6 +1120,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         result_meta["error"] = result_meta["summary"] = f"AIAgent import failed: {e}"
         return result_meta
     rp, model_name, provider, request_overrides = _resolve_review_provider()
+    if _review_lands_on_excluded_main(provider, rp):
+        return _llm_meta("skipped (main provider listed in auxiliary.exclude_main_providers; "
+                         "set auxiliary.curator.{provider,model} to run the review elsewhere)")
     result_meta["model"], result_meta["provider"] = model_name, provider or ""
     review_agent = None
     try:

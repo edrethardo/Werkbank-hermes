@@ -1,8 +1,9 @@
 # Overlay for a Hermes profile `nvidia-trial` (WB-1216). NOT a full config.
 #
-# Create the profile from an existing one, then merge these keys into
+# Create the profile FRESH (no clone: a clone would copy SOUL.md, memories, skills, plugins and
+# the source profile's credentials), then merge these keys into
 # ~/.hermes/profiles/nvidia-trial/config.yaml (see docs/notes/nvidia-trial-profile.md).
-# Existing profiles (default, werkbank, hermes_dev, ...) are not touched.
+# Existing profiles are not touched.
 #
 # Model ids: only those confirmed live on build.nvidia.com in the WB-1215 smoke
 # (docs/notes/nvidia-nim-smoke-2026-10.md, 19.10.2026). deepseek-ai/deepseek-v4.1-flash
@@ -22,9 +23,17 @@ fallback_providers:
   - provider: openai-codex
     model: gpt-5.6-terra
 
-# Tool output (ls, file contents) is sent to the model too: set terminal.cwd in this
-# profile to a throwaway development directory (not $HOME).
-#
+# Tool output (ls, file contents) is sent to the model too: the terminal starts in a
+# throwaway directory, never $HOME. Create it empty, without AGENTS.md / CLAUDE.md / .hermes.md.
+terminal:
+  cwd: ~/.hermes/profiles/nvidia-trial/sandbox
+
+# No plugins and no MCP servers in this profile: their tool output and prompt hooks would
+# reach NVIDIA as well. [] is an explicit empty allow-list (unset lets a migration enable installed ones).
+plugins:
+  enabled: []
+mcp_servers: {}
+
 # Trial terms: no personal data to NVIDIA. Memory and the user profile would be
 # injected into every system prompt, so both stay off in this profile.
 memory:
@@ -32,8 +41,10 @@ memory:
   user_profile_enabled: false
 
 auxiliary:
-  # Side tasks (title, compression, vision, background review, ...) never go to the
-  # hosted NVIDIA endpoint via `auto`; they use fallback_providers above, else stay off.
+  # Side tasks (title, compression summary, vision, background review, curator, ...) never go
+  # to the hosted NVIDIA endpoint via `auto` or as a "retry on the main model"; they use an
+  # explicit auxiliary.<task> route or fallback_providers above (nvidia entries skipped), else
+  # stay off (compression then behaves as after a failed summary, without a main-model retry).
   # This is also the built-in default when the key is unset; [] would send them to NVIDIA.
   exclude_main_providers: [nvidia]
 

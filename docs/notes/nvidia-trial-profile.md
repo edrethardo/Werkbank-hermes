@@ -8,8 +8,8 @@ Modell-IDs. Vorlage: `nvidia-trial-profile.config.yaml` (Overlay, kein vollstän
 | Bereich | Verhalten | Datei |
 |---|---|---|
 | Modellliste | Plugin-`fallback_models` = Super (Standard), Ultra, Super-VL; kuratierte Liste mit Super an [0], `z-ai/glm-5.2`/`minimaxai/minimax-m3` raus (nicht in `/v1/models`) | `plugins/model-providers/nvidia/__init__.py`, `hermes_cli/models_catalog_static.py` |
-| Hilfsaufgaben | `auto`-Hilfsaufgaben (Titel, Kompression, Vision, Memory-Query-Rewrite, automatischer Background-Review …) gehen bei Hauptprovider = gehostetes NVIDIA **nicht** an NVIDIA: explizite `auxiliary.<task>`-Route → `fallback_chain` → `fallback_providers` (NVIDIA-Einträge übersprungen) → sonst **aus** (kein Raten eines anderen Anbieters) | `agent/aux_provider_policy.py`, `agent/auxiliary_client.py`, `agent/background_review.py` |
-| Schalter | `auxiliary.exclude_main_providers` — ungesetzt = `[nvidia]`; `[]` = altes Verhalten; lokales NIM (`NVIDIA_BASE_URL` auf anderem Host) nicht betroffen; `custom` auf `integrate.api.nvidia.com` betroffen. Explizites `auxiliary.<task>.provider: nvidia` und `/refine` gehen weiter an NVIDIA | `website/docs/user-guide/configuration.md` |
+| Hilfsaufgaben | `auto`-Hilfsaufgaben (Titel, Kompression, Vision, Memory-Query-Rewrite, automatischer Background-Review, Curator-LLM-Pass …) gehen bei Hauptprovider = gehostetes NVIDIA **nicht** an NVIDIA: explizite `auxiliary.<task>`-Route (inkl. deren `fallback_chain`) → `fallback_providers` (gehostete NVIDIA-Einträge übersprungen) → sonst **aus** (kein Raten eines anderen Anbieters). Auch der „Rückfall aufs Hauptmodell“ ist gesperrt: scheitert die Kompressions-Zusammenfassung auf der Hilfsroute, gibt es keinen Wiederholversuch auf NVIDIA (Kompression läuft wie nach einer gescheiterten Zusammenfassung weiter); der Curator-Pass läuft ohne `auxiliary.curator.{provider,model}` gar nicht (auch nicht, wenn diese Route nicht auflösbar ist) | `agent/aux_provider_policy.py`, `agent/auxiliary_client.py`, `agent/background_review.py`, `agent/context_compressor*.py`, `agent/curator.py` |
+| Schalter | `auxiliary.exclude_main_providers` — ungesetzt = `[nvidia]`; `[]` = altes Verhalten. Wirkt **nur auf Hilfsaufgaben**: Hauptroute gesperrt, und gehostete NVIDIA-Einträge in `fallback_providers` werden für Hilfsaufgaben übersprungen (gleiche Prüfung per Provider + `base_url`). Die Fallback-Kette des Haupt-Chats bleibt unberührt. Lokales NIM (`NVIDIA_BASE_URL` auf anderem Host) nicht betroffen; `custom` auf `integrate.api.nvidia.com` betroffen. Explizites `auxiliary.<task>.provider: nvidia` (bzw. `auxiliary.curator`) und `/refine` gehen weiter an NVIDIA | `website/docs/user-guide/configuration.md` |
 | 404 als Text | `404 page not found` (`text/plain`) auf `https://integrate.api.nvidia.com/v1/chat/completions` → `model_not_found` (nicht retrybar, Fallback); Kurzmeldung `HTTP 404: 404 page not found — NVIDIA NIM does not serve this model id (check it with `hermes model`)`. Gleicher Text ohne `/v1` oder lokal bleibt `unknown` | `agent/error_classifier.py`, `agent/api_error_summary.py` |
 | 401 problem+json | Kurzmeldung `HTTP 401: Unauthorized — Invalid JWT serialization: …` statt Roh-JSON (allgemein für `{"title","detail"}`/`{"detail"}`) | `agent/api_error_summary.py` |
 
@@ -18,19 +18,42 @@ der neue Schlüssel wird nur gelesen. Wirkung nur, wenn jemand NVIDIA als Hauptp
 
 ## Profil anlegen (Owner)
 
+Frisch anlegen, **nicht** klonen. `--clone`/`--clone-from` kopiert `config.yaml`, `.env` (alle Schlüssel der Quelle),
+`SOUL.md`, alle installierten Skills, `memories/MEMORY.md` + `memories/USER.md`, Plugins und die Memory-Provider-Konfiguration
+(nur Messaging-Kanäle werden entfernt) — genau die Personen-/Projektdaten, die nicht zu NVIDIA sollen.
+`--clone-all` kopiert noch mehr (Zustand/Verlauf).
+
 ```bash
-hermes profile create nvidia-trial --clone-from werkbank \
+hermes profile create nvidia-trial --no-skills \
   --description "Geeignet für: NVIDIA-Trial-Tests, nur Entwicklungsprojekte"
+mkdir -p ~/.hermes/profiles/nvidia-trial/sandbox   # Wegwerf-Ordner = terminal.cwd der Vorlage
 # Overlay-Schlüssel aus nvidia-trial-profile.config.yaml in
-# ~/.hermes/profiles/nvidia-trial/config.yaml übernehmen (model, fallback_providers,
-# memory, auxiliary.exclude_main_providers, delegation.models)
-hermes -p nvidia-trial auth add nvidia        # Schlüssel selbst hinterlegen
+# ~/.hermes/profiles/nvidia-trial/config.yaml übernehmen (model, fallback_providers, terminal,
+# plugins, mcp_servers, memory, auxiliary.exclude_main_providers, delegation.models)
+hermes -p nvidia-trial auth add nvidia          # Schlüssel selbst hinterlegen
+hermes -p nvidia-trial auth add anthropic       # nur die Fallback-Zugänge: Claude …
+hermes -p nvidia-trial auth add openai-codex    # … und Codex
 ```
 
-- `--clone-from` kopiert `config.yaml`, `.env`, `SOUL.md`, Skills (Messaging-Kanäle nicht). Die Claude-/Codex-
-  Zugänge für die Fallback-Kette müssen im Profil vorhanden sein (geklonte `.env`/`auth add`).
-- `SOUL.md` des Klons vor dem ersten Lauf auf Personendaten prüfen; Memory und User-Profil sind in der Vorlage aus.
-- Nur in Entwicklungsprojekten starten (Trial-Regeln); keine Belege, Mails, Kundenrepos.
+- Frisches Profil: leere `.env`, Standard-`SOUL.md` (neutral, ohne Personendaten — so lassen), keine Memories;
+  `--no-skills` lässt den Skill-Ordner leer (sonst werden die mitgelieferten Skills eingespielt).
+- Zugänge: nur NVIDIA plus Claude/Codex für die Fallback-Kette — keine weiteren Schlüssel, Mail-/Messenger-Kanäle, MCP-Server.
+- Der Wegwerf-Ordner bleibt leer bzw. enthält nur Test-Code: **keine** `AGENTS.md`, `CLAUDE.md`, `.hermes.md`
+  (würden als Kontextdatei in den System-Prompt geladen); er liegt in keinem Git-Repo mit solchen Dateien. Nur dort bzw. in Entwicklungsprojekten starten
+  (Trial-Regeln); keine Belege, Mails, Kundenrepos.
+
+### Was trotzdem an NVIDIA geht
+
+Auch mit dieser Vorlage erhält NVIDIA bei jedem Turn:
+
+- **System-Prompt** mit Umgebungshinweisen: Betriebssystem/Kernel, Home-Pfad (enthält den Benutzernamen),
+  Arbeitsverzeichnis, Scratch-Ordner, Datum/Zeitzone, Modell-/Provider-Name, `SOUL.md`-Text und Kontextdateien
+  (`AGENTS.md`-Kette vom Git-Wurzelordner bis zum Startordner, `CLAUDE.md`, `.hermes.md`, `.cursorrules`) —
+  deshalb ein leerer Wegwerf-Ordner außerhalb jedes Git-Repos;
+- **Skill-Index**: Name und Kurzbeschreibung jedes Skills im Profil (mit `--no-skills` leer, bis man welche installiert);
+- **Tool-Ergebnisse**: alles, was Werkzeuge zurückgeben — `ls`, Dateiinhalte, Befehlsausgaben, Web-Seiten;
+  Pfade außerhalb des Wegwerf-Ordners bleiben per Tool erreichbar, wenn das Modell sie anfragt;
+- die Nutzer-Nachrichten und der bisherige Verlauf der Sitzung selbst.
 
 ## Fallback: unpinned vs. `--provider/-m`-Pin
 
@@ -56,7 +79,7 @@ separat gemessen (Budget). Streaming in CLI/TUI nicht visuell geprüft — nur d
 
 **Befund Datenhygiene:** Das `terminal`-Werkzeug lief nicht im Scratch-Ordner (Prozess-cwd), sondern im
 konfigurierten Terminal-Startordner (Home): die `ls`-Ausgabe (Ordnernamen) ging als Tool-Ergebnis an NVIDIA.
-Für Trial-Läufe `TERMINAL_CWD`/`terminal.cwd` auf ein Wegwerf-Verzeichnis setzen.
+Die Vorlage setzt deshalb `terminal.cwd: ~/.hermes/profiles/nvidia-trial/sandbox` (als echten Schlüssel).
 
 ## Kontext / Kompression
 

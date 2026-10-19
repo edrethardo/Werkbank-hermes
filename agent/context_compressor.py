@@ -4319,7 +4319,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         _route_model = str(
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
-        if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+        if (_route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False)
+                and not self._main_route_excluded_for_summary()):
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
