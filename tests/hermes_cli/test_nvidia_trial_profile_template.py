@@ -65,3 +65,29 @@ def test_no_secrets_and_no_invented_context(overlay):
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "api_key:" not in text and "nvapi-" not in text
     assert "context_length:" not in text
+
+
+SANDBOX = "~/.hermes/profiles/nvidia-trial/sandbox"
+DOC = REPO / "docs" / "notes" / "nvidia-trial-profile.md"
+
+
+def test_terminal_cwd_is_a_real_key_on_a_throwaway_dir(overlay):
+    """Tool output (ls, file contents) goes to NVIDIA: the terminal must start in a sandbox, not $HOME."""
+    from hermes_cli.config import apply_terminal_config_to_env
+    assert overlay["terminal"]["cwd"] == SANDBOX
+    env = apply_terminal_config_to_env(env={}, config=overlay, override=True)
+    expanded = Path(env["TERMINAL_CWD"])
+    assert expanded.is_absolute() and expanded != Path.home()
+    assert expanded.parts[-3:] == ("profiles", "nvidia-trial", "sandbox")
+
+
+def test_plugins_and_mcp_servers_are_off(overlay):
+    assert overlay["plugins"] == {"enabled": []}  # explicit empty allow-list, not "unset"
+    assert overlay["mcp_servers"] == {}
+
+
+def test_doc_creates_the_profile_fresh_not_as_a_clone():
+    text = DOC.read_text(encoding="utf-8")
+    assert "hermes profile create nvidia-trial --no-skills" in text
+    assert "--clone-from" not in text.split("## Profil anlegen")[1].split("```")[1]
+    assert SANDBOX in text

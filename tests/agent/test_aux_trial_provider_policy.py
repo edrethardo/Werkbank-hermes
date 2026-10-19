@@ -245,3 +245,154 @@ def test_explicit_refine_still_runs_on_the_main_model(config):
 
 def test_background_review_unchanged_for_other_providers(config):
     assert _run_review(_parent(provider="anthropic", base_url="https://api.anthropic.com")).called
+
+
+# ── compression: the main-model retry must not land on the trial endpoint ──────
+
+def _empty_response():
+    return {"choices": [{"message": {"content": "   "}}]}
+
+
+def _ok_response(text="summary"):
+    ok = MagicMock()
+    ok.choices = [MagicMock()]
+    ok.choices[0].message.content = text
+    ok.choices[0].finish_reason = "stop"
+    return ok
+
+
+def _trial_compressor(provider="nvidia", base_url=NIM_URL):
+    from agent.context_compressor import ContextCompressor
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        return ContextCompressor(model=NVIDIA_RUNTIME["model"], provider=provider, base_url=base_url,
+                                 api_key="fake-key-not-real", quiet_mode=True)
+
+
+def _failing_fallback_route(calls):
+    """First call: the aux lane (fallback chain → Claude) answers empty; any retry would succeed."""
+    def _route(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["route_info"].update(provider="anthropic", model="claude-sonnet-5-5")
+            return _empty_response()
+        kwargs["route_info"].update(provider=kwargs.get("provider", ""), model=kwargs.get("model", ""))
+        return _ok_response("summary via main model")
+    return _route
+
+
+_TURNS = [{"role": "user", "content": "do something"}, {"role": "assistant", "content": "ok"}]
+
+
+def test_compression_failure_does_not_retry_on_the_trial_main_model(config):
+    c = _trial_compressor()
+    calls: list = []
+    with patch("agent.context_compressor.call_llm", side_effect=_failing_fallback_route(calls)):
+        result = c._generate_summary(list(_TURNS))
+    assert len(calls) == 1, [k.get("provider") for k in calls]
+    assert result is None  # no summary — the session carries on without one
+    assert not getattr(c, "_summary_model_fallen_back", False)
+
+
+def test_compression_retry_on_main_comes_back_when_the_policy_is_off(config):
+    config["cfg"] = _cfg({"exclude_main_providers": []})
+    c = _trial_compressor()
+    calls: list = []
+    with patch("agent.context_compressor.call_llm", side_effect=_failing_fallback_route(calls)):
+        c._generate_summary(list(_TURNS))
+    assert len(calls) == 2
+    assert calls[1].get("provider") == "nvidia"
+
+
+def test_fallen_back_summary_route_is_not_pinned_onto_the_trial_main(config):
+    c = _trial_compressor()
+    c._summary_model_fallen_back = True
+    call_kwargs: dict = {}
+    c._apply_summary_route(call_kwargs)
+    assert "provider" not in call_kwargs and "base_url" not in call_kwargs and "api_key" not in call_kwargs
+
+
+def test_fallen_back_summary_route_still_pins_other_main_models(config):
+    c = _trial_compressor(provider="anthropic", base_url="https://api.anthropic.com")
+    c._summary_model_fallen_back = True
+    call_kwargs: dict = {}
+    c._apply_summary_route(call_kwargs)
+    assert call_kwargs["provider"] == "anthropic"
+
+
+def test_micro_summary_after_fallback_does_not_pin_the_trial_main(config):
+    c = _trial_compressor()
+    c._summary_model_fallen_back = True
+    seen: list = []
+
+    def _fake_call_llm(**kwargs):
+        seen.append(kwargs)
+        return _ok_response("rolling summary")
+
+    with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+        c._micro_summarize_one("user: hi\nassistant: hello")
+    assert len(seen) == 1
+    assert seen[0].get("provider") != "nvidia" and NIM_URL not in str(seen[0].get("base_url") or "")
+
+
+# ── curator LLM pass: no fallback onto the trial main model ────────────────────
+
+class _CuratorAgentSpy:
+    built: list = []
+
+    def __init__(self, *args, **kwargs):
+        type(self).built.append(kwargs)
+        self._session_messages = []
+
+    def run_conversation(self, user_message=None, **kwargs):
+        return {"final_response": "ok"}
+
+    def close(self):
+        pass
+
+
+def _run_curator(config, monkeypatch, cfg, resolve):
+    import agent.curator as curator
+    config["cfg"] = cfg
+    _CuratorAgentSpy.built = []
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+    monkeypatch.setattr("run_agent.AIAgent", _CuratorAgentSpy)
+    return curator._run_llm_review("review prompt"), _CuratorAgentSpy.built
+
+
+def _nim_resolve(**kwargs):
+    if kwargs.get("requested") not in ("nvidia", "auto"):
+        return {"provider": kwargs.get("requested"), "api_key": "fake", "base_url": "https://api.anthropic.com"}
+    return {"provider": "nvidia", "api_key": "fake-key-not-real", "base_url": NIM_URL}
+
+
+_NIM_MAIN = {"model": {"provider": "nvidia", "default": NVIDIA_RUNTIME["model"]}}
+
+
+def test_curator_does_not_fall_back_onto_the_trial_main(config, monkeypatch):
+    meta, built = _run_curator(config, monkeypatch, _cfg(**_NIM_MAIN), _nim_resolve)
+    assert built == []
+    assert meta.get("error") is None and "skipped" in meta["summary"]
+
+
+def test_curator_failed_slot_resolution_does_not_land_on_the_trial_main(config, monkeypatch):
+    def _broken(**kwargs):
+        if kwargs.get("requested") == "anthropic":
+            raise RuntimeError("no anthropic credentials")
+        return _nim_resolve(**kwargs)
+
+    cfg = _cfg({"curator": {"provider": "anthropic", "model": "claude-sonnet-5-5"}}, **_NIM_MAIN)
+    meta, built = _run_curator(config, monkeypatch, cfg, _broken)
+    assert built == []
+    assert "skipped" in meta["summary"]
+
+
+def test_curator_explicit_slot_still_runs(config, monkeypatch):
+    cfg = _cfg({"curator": {"provider": "anthropic", "model": "claude-sonnet-5-5"}}, **_NIM_MAIN)
+    meta, built = _run_curator(config, monkeypatch, cfg, _nim_resolve)
+    assert [b["provider"] for b in built] == ["anthropic"]
+
+
+def test_curator_main_fallback_unchanged_when_the_policy_is_off(config, monkeypatch):
+    cfg = _cfg({"exclude_main_providers": []}, **_NIM_MAIN)
+    meta, built = _run_curator(config, monkeypatch, cfg, _nim_resolve)
+    assert [b["provider"] for b in built] == ["nvidia"]
