@@ -1,0 +1,61 @@
+# Overlay for a Hermes profile `nvidia-trial` (WB-1216). NOT a full config.
+#
+# Create the profile from an existing one, then merge these keys into
+# ~/.hermes/profiles/nvidia-trial/config.yaml (see docs/notes/nvidia-trial-profile.md).
+# Existing profiles (default, werkbank, hermes_dev, ...) are not touched.
+#
+# Model ids: only those confirmed live on build.nvidia.com in the WB-1215 smoke
+# (docs/notes/nvidia-nim-smoke-2026-10.md, 19.10.2026). deepseek-ai/deepseek-v4.1-flash
+# is listed by /v1/models but timed out 3x — deliberately absent.
+# Context window: unknown (the endpoint reports none) — no context_length is set here;
+# Hermes' static 131072 for nemotron* applies.
+# No secrets in this file: NVIDIA_API_KEY goes into the profile's own .env / credential pool.
+
+model:
+  provider: nvidia
+  default: nvidia/nemotron-3-super-120b-a12b
+
+# NVIDIA down / 404 / 401 / 429 / 5xx → the turn continues on Claude, then Codex.
+fallback_providers:
+  - provider: anthropic
+    model: claude-sonnet-5-5
+  - provider: openai-codex
+    model: gpt-5.6-terra
+
+# Tool output (ls, file contents) is sent to the model too: set terminal.cwd in this
+# profile to a throwaway development directory (not $HOME).
+#
+# Trial terms: no personal data to NVIDIA. Memory and the user profile would be
+# injected into every system prompt, so both stay off in this profile.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+
+auxiliary:
+  # Side tasks (title, compression, vision, background review, ...) never go to the
+  # hosted NVIDIA endpoint via `auto`; they use fallback_providers above, else stay off.
+  # This is also the built-in default when the key is unset; [] would send them to NVIDIA.
+  exclude_main_providers: [nvidia]
+
+delegation:
+  # Named subagent models (delegate_task model_profile). A pinned child gets NO fallback
+  # unless it declares one, so every entry names Claude explicitly.
+  models:
+    nim-general:
+      provider: nvidia
+      model: nvidia/nemotron-3-super-120b-a12b
+      fallback_providers:
+        - provider: anthropic
+          model: claude-sonnet-5-5
+    nim-ultra:
+      provider: nvidia
+      model: nvidia/nemotron-3-ultra-550b-a55b
+      fallback_providers:
+        - provider: anthropic
+          model: claude-sonnet-5-5
+    nim-vision:
+      provider: nvidia
+      model: nvidia/nemotron-3.5-super-vl-120b-a12b
+      fallback_providers:
+        - provider: anthropic
+          model: claude-sonnet-5-5

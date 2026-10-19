@@ -1048,6 +1048,8 @@ def _status_404(c: _Ctx) -> Verdict:
     verdict = _first_match(c.msg, _404_RULES)
     if verdict is not None:
         return verdict
+    if _hosted_nim_unknown_model(c):
+        return _V_MODEL_NOT_FOUND
     # Bare id the catalogue only knows prefixed → malformed id (NVIDIA NIM "404
     # page not found", #78796). A generic 404 (wrong path, proxy glitch) stays
     # unknown so the real error surfaces instead of a silent misreported fallback.
@@ -1266,6 +1268,37 @@ def _rate_limit_reset_seconds(error_msg: str, body: dict, response_headers) -> O
     if (seconds := parse_retry_after_seconds(response_headers)) is not None:
         return seconds
     return reset_delay_from_message(error_msg)
+
+
+HOSTED_NIM_HOST = "integrate.api.nvidia.com"
+
+
+def _request_url_of(error: Exception) -> str:
+    response = getattr(error, "response", None)
+    request = getattr(response, "request", None) if response is not None else None
+    try:
+        return str(getattr(request, "url", "") or "")
+    except Exception:  # httpx raises when the response carries no request
+        return ""
+
+
+def is_hosted_nim_plain_404(error: Exception, msg: str, base_url: str = "") -> bool:
+    """Hosted NVIDIA NIM answers a model it does not serve with a ``text/plain``
+    ``404 page not found`` on its stock ``/v1`` route (WB-1215, 19.10.2026). Only that exact
+    route counts: the same body for a base_url without ``/v1`` is a path problem."""
+    if "page not found" not in (msg or "").lower():
+        return False
+    from urllib.parse import urlparse
+    request_url = _request_url_of(error)
+    if request_url:
+        parsed = urlparse(request_url)
+        return (parsed.hostname or "").lower() == HOSTED_NIM_HOST and parsed.path.rstrip("/") == "/v1/chat/completions"
+    parsed = urlparse(str(base_url or ""))
+    return (parsed.hostname or "").lower() == HOSTED_NIM_HOST and parsed.path.rstrip("/") == "/v1"
+
+
+def _hosted_nim_unknown_model(c: "_Ctx") -> bool:
+    return is_hosted_nim_plain_404(c.error, c.msg, c.base_url)
 
 
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:

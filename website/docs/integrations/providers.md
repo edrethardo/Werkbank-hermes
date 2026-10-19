@@ -52,7 +52,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenAI API (direct)** | `OPENAI_API_KEY` in `~/.hermes/.env` (provider: `openai-api`, optional `OPENAI_BASE_URL`) |
 | **Azure AI Foundry** | `hermes model` → "Azure AI Foundry" (provider: `azure-foundry`; uses Azure OpenAI / Foundry endpoint and key) |
 | **AWS Bedrock** | `hermes model` → "AWS Bedrock" (provider: `bedrock`; standard AWS credentials chain via boto3) |
-| **NVIDIA Build** | `NVIDIA_API_KEY` in `~/.hermes/.env` (provider: `nvidia`; NIM-hosted models on build.nvidia.com) |
+| **NVIDIA Build** | `NVIDIA_API_KEY` in `~/.hermes/.env` or a profile's `.env` (provider: `nvidia`; NIM-hosted models on build.nvidia.com; trial terms — see [NVIDIA NIM](#nvidia-nim)) |
 | **Ollama Cloud** | `hermes model` → "Ollama Cloud" (provider: `ollama-cloud`; cloud-hosted Ollama API) |
 | **Qwen OAuth** | `hermes model` → "Qwen OAuth" (provider: `qwen-oauth`; browser PKCE login) |
 | **MiniMax OAuth** | `hermes model` → "MiniMax (OAuth)" (provider: `minimax-oauth`; browser PKCE login) |
@@ -588,6 +588,37 @@ For on-prem deployments (DGX Spark, local GPU), set `NVIDIA_BASE_URL=http://loca
 :::
 
 Hermes automatically attaches the NIM billing-origin header on every request to `build.nvidia.com` — no configuration needed. This routes consumption against the correct origin in NVIDIA's billing dashboard.
+
+The model picker offers `nvidia/nemotron-3-super-120b-a12b` (default), `nvidia/nemotron-3-ultra-550b-a55b` and `nvidia/nemotron-3.5-super-vl-120b-a12b` (vision) without a key; with a key it merges the live `/v1/models` list. `/v1/models` reports no context window or capabilities, so Hermes keeps its static context estimate.
+
+:::warning build.nvidia.com is a trial endpoint
+The [API catalog terms](https://build.nvidia.com/api-catalog-terms) allow development and test load only — no production workloads and no personal or customer data. Hermes therefore keeps **side tasks** (session titles, compression, vision, background memory/skill review) off the hosted endpoint by default: they use your `fallback_providers`, else they stay off. Switch: [`auxiliary.exclude_main_providers`](../user-guide/configuration.md#keeping-side-tasks-off-a-trial-provider-auxiliaryexclude_main_providers) (`[]` = old behaviour). Your main conversation still goes to NVIDIA — keep memory and the user profile off in a profile used with it.
+:::
+
+**Use a dedicated profile** rather than switching an existing one. The key then lives only in that profile's `.env` (`~/.hermes/profiles/<name>/.env`), not in `~/.hermes/.env`, and a fallback chain keeps the session alive when NVIDIA fails (timeout, 401, 404 unknown model, 429, 5xx):
+
+```bash
+hermes profile create nvidia-trial --clone-from <existing-profile> \
+  --description "Geeignet für: NVIDIA-Trial-Tests, nur Entwicklungsprojekte"
+hermes -p nvidia-trial auth add nvidia      # or NVIDIA_API_KEY=... in the profile's .env
+```
+
+```yaml
+# ~/.hermes/profiles/nvidia-trial/config.yaml (excerpt)
+model:
+  provider: nvidia
+  default: nvidia/nemotron-3-super-120b-a12b
+fallback_providers:
+  - {provider: anthropic, model: claude-sonnet-5-5}
+  - {provider: openai-codex, model: gpt-5.6-terra}
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+```
+
+A launch pinned with `--provider nvidia -m <id>` uses the same `fallback_providers` list (an unknown id answered `404` moved the turn to Claude with no retry on NVIDIA). Point `terminal.cwd` at a throwaway project directory: tool output (file names, file contents) is sent to the model. Delegated children pinned through `delegation.models` get no fallback unless the entry declares its own `fallback_providers`.
+
+Error shapes on the hosted endpoint: an unknown model id answers `404 page not found` as **plain text** — Hermes reports it as "model not found" and moves to the fallback chain instead of retrying; a bad key answers `401` `application/problem+json`, shown as `Unauthorized — <detail>`.
 
 ### GMI Cloud
 

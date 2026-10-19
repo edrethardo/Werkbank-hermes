@@ -57,6 +57,8 @@ _XAI_ENTITLEMENT_HINT = (
     "which, or run `/model` to switch providers."
 )
 _ERROR_DETAIL_KEYS = ("message", "detail", "error", "code", "type")
+# Hosted NIM's plain-text 404 on the stock chat route means "model not served" (WB-1215).
+_NIM_PLAIN_404_HINT = " — NVIDIA NIM does not serve this model id (check it with `hermes model`)"
 
 
 def _is_xai_entitlement_text(lower: str) -> bool:
@@ -152,6 +154,16 @@ class ApiErrorSummaryMixin:
         return str(value)
 
     @staticmethod
+    def _problem_json_line(body: Dict[str, Any]) -> str:
+        """RFC 7807 ``{"title", "detail"}`` (NVIDIA NIM 401, FastAPI ``detail``) → ``title — detail``."""
+        detail = ApiErrorSummaryMixin._coerce_api_error_detail(body.get("detail")).strip()
+        title = body.get("title")
+        title = title.strip() if isinstance(title, str) else ""
+        if detail and title and title.lower() not in detail.lower():
+            return f"{title} — {detail}"
+        return detail or title
+
+    @staticmethod
     def _summarize_api_error(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
@@ -197,6 +209,9 @@ class ApiErrorSummaryMixin:
             if msg:
                 msg = ApiErrorSummaryMixin._coerce_api_error_detail(msg)
                 return ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+            problem = ApiErrorSummaryMixin._problem_json_line(body)
+            if problem:
+                return redact_sensitive_text(f"{prefix}{problem[:300]}")
 
         # SDK may leave body empty while httpx has the payload. Redact: the body is attacker-influenced
         # and may echo Authorization / x-api-key / request JSON.
@@ -220,7 +235,12 @@ class ApiErrorSummaryMixin:
                         return redact_sensitive_text(f"{prefix}{str(err['message'])[:300]}")
                     if payload.get("message"):
                         return redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}")
-                return redact_sensitive_text(f"{prefix}{snippet[:300]}")
+                line = f"{prefix}{snippet[:300]}"
+                if getattr(error, "status_code", None) == 404:
+                    from agent.error_classifier import is_hosted_nim_plain_404
+                    if is_hosted_nim_plain_404(error, snippet):
+                        line += _NIM_PLAIN_404_HINT
+                return redact_sensitive_text(line)
 
         # Fallback: truncate the raw string but give more room than 200 chars
         return ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")

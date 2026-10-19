@@ -283,6 +283,23 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[Dict[str, Any]] = Non
         return parent
 
 
+def _review_stays_off_trial_main(agent: Any, task_cfg: Optional[Dict[str, Any]]) -> bool:
+    """Automatic review on a main provider listed in ``auxiliary.exclude_main_providers`` (default:
+    hosted NVIDIA trial) and not routed elsewhere via ``auxiliary.background_review`` → skip (WB-1216).
+    /refine (explicit) is a user action in the session and is not gated here."""
+    from agent import aux_provider_policy as policy
+    try:
+        base_url = str((agent._current_main_runtime() or {}).get("base_url") or "")
+    except Exception:
+        base_url = str(getattr(agent, "base_url", "") or "")
+    if not policy.main_route_excluded(getattr(agent, "provider", ""), base_url):
+        return False
+    if _resolve_review_runtime(agent, task_cfg).get("routed"):
+        return False
+    policy.log_excluded("background_review", str(getattr(agent, "provider", "")))
+    return True
+
+
 def _warn_review_routing_fallback(agent: Any, task_provider: str, task_model: str, error: Exception) -> None:
     """The configured review route could not be resolved, so the fork runs on the main model. That
     was a debug-level line nobody saw (#116055): the misrouted model never ran and nothing said so.
@@ -1233,6 +1250,9 @@ def _run_review_in_thread(
             "auxiliary.background_review.{provider,model} to route the review to a normal model.",
             getattr(agent, "provider", "?"),
         )
+        _set_thread_approval_callback(None)
+        return
+    if not explicit and _review_stays_off_trial_main(agent, task_cfg):
         _set_thread_approval_callback(None)
         return
     st = _ReviewForkState()

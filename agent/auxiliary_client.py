@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent import aux_provider_policy as _aux_policy
 from agent.error_classifier import (
     _BILLING_PATTERNS,
     _OVERLOADED_PATTERNS,
@@ -4315,6 +4316,9 @@ def _try_main_agent_model_fallback(
         main_provider, main_model = _agg_provider, _agg_model
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
         return None, None, ""
+    if _aux_policy.main_route_excluded(main_provider, _custom_health_base_url(main_provider) or ""):
+        _aux_policy.log_excluded(task, main_provider)
+        return None, None, ""
     if task == "vision" and (
             main_provider in _PROVIDERS_WITHOUT_VISION or not _main_model_supports_vision(main_provider, main_model)):
         # Same capability gate as the auto-route (_vision_main_provider_client): handing an image to a
@@ -4513,6 +4517,9 @@ def _try_main_fallback_chain(
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
             continue
+        if _aux_policy.main_route_excluded(fb_provider, str(entry.get("base_url") or "")):
+            tried.append(f"{label} (auxiliary.{_aux_policy.CONFIG_KEY})")
+            continue
         if _is_provider_unhealthy(fb_norm, fb_base_url):
             _log_skip_unhealthy(fb_norm, task, base_url=fb_base_url)
             tried.append(f"{label} (unhealthy)")
@@ -4683,9 +4690,15 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
-    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-    if routed is not None:
-        return routed
+    # Trial endpoints (auxiliary.exclude_main_providers, default: hosted NVIDIA) never get side
+    # tasks via ``auto``: explicit task route / fallback chain only, else off (WB-1216).
+    excluded = _aux_policy.main_route_excluded(main_provider, base_url)
+    if excluded:
+        _aux_policy.log_excluded(task, main_provider)
+    else:
+        routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
+        if routed is not None:
+            return routed
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -4695,7 +4708,7 @@ def _resolve_auto_route(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
         return fb_client, fb_model, fb_label
-    if not _discovery_chain_allowed(main_provider, task):
+    if excluded or not _discovery_chain_allowed(main_provider, task):
         return None, None, ""
     return _try_discovery_chain()
 
@@ -5665,7 +5678,9 @@ def _vision_auto_route(
         if _agg_provider and _agg_model:
             main_provider, main_model = _agg_provider, _agg_model
             runtime = dict(runtime, base_url="", api_key="", api_mode="")
-    if main_provider and main_provider not in {"auto", "", "moa"}:
+    if main_provider and _aux_policy.main_route_excluded(main_provider, str(runtime.get("base_url") or "")):
+        _aux_policy.log_excluded("vision", main_provider)
+    elif main_provider and main_provider not in {"auto", "", "moa"}:
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
             return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)

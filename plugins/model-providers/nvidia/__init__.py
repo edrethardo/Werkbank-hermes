@@ -27,7 +27,13 @@ class NvidiaProviderProfile(ProviderProfile):
 nvidia = NvidiaProviderProfile(
     name="nvidia", aliases=("nvidia-nim", "nim", "build-nvidia", "nemotron"), env_vars=("NVIDIA_API_KEY",), display_name="NVIDIA NIM",
     description="NVIDIA NIM — accelerated inference", signup_url="https://build.nvidia.com/",
-    fallback_models=("nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/llama-3.3-70b-instruct"),
+    # Live-confirmed on build.nvidia.com (WB-1215 smoke, 19.10.2026: chat, streaming, tool round-trip;
+    # VL also vision). Super first = default. deepseek-ai/deepseek-v4.1-flash is listed by /v1/models
+    # but timed out 3x — add it only after a passing probe.
+    fallback_models=(
+        "nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    ),
     base_url="https://integrate.api.nvidia.com/v1", default_max_tokens=16384,
 )
 

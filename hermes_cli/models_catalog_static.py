@@ -195,11 +195,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "glm-4.7", "glm-4.5", "glm-4.5-flash",
     ],
     "xai": list(_XAI_MODELS),
-    # Nemotron flagships, then third-party agentic models hosted on build.nvidia.com.
+    # Nemotron flagships, then third-party agentic models hosted on build.nvidia.com. [0] is the
+    # provider default: Super (fastest live-confirmed generalist). Every id was served by
+    # GET /v1/models on 19.10.2026 (docs/notes/nvidia-nim-smoke-2026-10.json); z-ai/glm-5.2 and
+    # minimaxai/minimax-m3 were not, so they were dropped.
     "nvidia": [
-        "nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
         "nvidia/nemotron-3.5-lightning-30b-a3b", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-        "z-ai/glm-5.3", "z-ai/glm-5.2", "moonshotai/kimi-k2.6", "minimaxai/minimax-m3",
+        "z-ai/glm-5.3", "moonshotai/kimi-k2.6",
     ],
     "kimi-coding": [
         "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "kimi-for-coding", "kimi-for-coding-highspeed",

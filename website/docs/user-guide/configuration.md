@@ -1668,6 +1668,19 @@ Each entry supports the same three knobs as any auxiliary task config:
 
 `fallback_chain` is available on any auxiliary task — `compression`, `vision`, `approval`, `skills_hub`, `mcp`, etc.
 
+### Keeping side tasks off a trial provider (`auxiliary.exclude_main_providers`)
+
+Some main providers should only ever see the conversation itself — for example a trial endpoint whose terms forbid personal data. `auxiliary.exclude_main_providers` lists main providers that `auto` side tasks (session title, compression, vision, memory query rewrite, the automatic background memory/skill review, …) must **not** be routed back onto:
+
+```yaml
+auxiliary:
+  exclude_main_providers: [nvidia]   # built-in default when the key is unset
+```
+
+With an excluded main provider, an `auto` side task uses, in order: an explicit `auxiliary.<task>.provider/model`, the task's `fallback_chain`, then the top-level `fallback_providers` (excluded providers skipped). If none is configured, the task is **off** — no title model call, compression drops middle turns without a summary, no automatic background review — and Hermes never guesses another logged-in provider. An explicit `auxiliary.<task>.provider: nvidia` and `/refine` still go to NVIDIA because you asked for it.
+
+`nvidia` means the hosted endpoint `integrate.api.nvidia.com` (also when reached through a `custom` provider); a local NIM behind `NVIDIA_BASE_URL` is not affected. Set `exclude_main_providers: []` to restore main-model-first for every provider. The key is read but not seeded into `DEFAULT_CONFIG`, so edit `config.yaml` directly or use `hermes config set auxiliary.exclude_main_providers '[]' --force`.
+
 ### Native vision embed budgets (top-level `vision:`)
 
 Separate from `auxiliary.vision` (which picks the describer model): when the *main* model is vision-capable, `vision_analyze` and browser screenshots embed real pixels into tool results that are re-sent every later turn. `vision.embed_target_bytes` (default `262144`, clamped 64 KiB..4 MiB) sizes one embed; `vision.max_calls_per_image` caps how often the same image may be embedded per session (unset = 3 inside delegated subagents, unlimited for the main agent; `0` = unlimited). See [Vision → Native embeds ride the session](./features/vision.md#native-embeds-ride-the-session-visionembed_target_bytes-and-visionmax_calls_per_image).
