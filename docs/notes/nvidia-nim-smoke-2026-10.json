@@ -1,0 +1,894 @@
+{
+  "calls": 25,
+  "events": [
+    {
+      "n": 1,
+      "at": "2026-10-19T02:11:44+02:00",
+      "kind": "GET /models",
+      "model": null,
+      "status": 200,
+      "latency_s": 0.243,
+      "count": 81,
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:11:44 GMT",
+        "content-type": "application/json"
+      },
+      "pilots": {
+        "deepseek-ai/deepseek-v4.1-flash": true,
+        "nvidia/nemotron-3-super-120b-a12b": true,
+        "nvidia/nemotron-3-ultra-550b-a55b": true,
+        "nvidia/nemotron-3.5-super-vl-120b-a12b": true
+      },
+      "entry_fields": [
+        "created",
+        "id",
+        "object",
+        "owned_by"
+      ]
+    },
+    {
+      "n": 2,
+      "at": "2026-10-19T02:11:56+02:00",
+      "kind": "GET /models/{id}",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "status": 200,
+      "latency_s": 0.14,
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:11:56 GMT",
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"nvidia/nemotron-3-super-120b-a12b\",\"object\":\"model\",\"created\":735790403,\"owned_by\":\"nvidia\"}\n"
+    },
+    {
+      "n": 3,
+      "at": "2026-10-19T02:14:59+02:00",
+      "kind": "chat",
+      "model": "deepseek-ai/deepseek-v4.1-flash",
+      "ok": false,
+      "latency_s": 180.358,
+      "error_type": "APITimeoutError",
+      "error": "Request timed out."
+    },
+    {
+      "n": 4,
+      "at": "2026-10-19T02:18:00+02:00",
+      "kind": "stream",
+      "model": "deepseek-ai/deepseek-v4.1-flash",
+      "ok": false,
+      "latency_s": 180.165,
+      "error_type": "APITimeoutError",
+      "error": "Request timed out."
+    },
+    {
+      "n": 5,
+      "at": "2026-10-19T02:19:11+02:00",
+      "kind": "chat",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "latency_s": 1.194,
+      "status": 200,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "content": "PONG",
+      "reasoning_chars": 89,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 29,
+        "prompt_tokens": 28,
+        "total_tokens": 57,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 24,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      },
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:11 GMT",
+        "content-type": "application/json",
+        "nvcf-reqid": "1b3f731b-23e5-473f-b81a-e57b3ea7cfcf",
+        "nvcf-status": "fulfilled"
+      }
+    },
+    {
+      "n": 6,
+      "at": "2026-10-19T02:19:12+02:00",
+      "kind": "stream",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "ttfb_chunk_s": 0.41,
+      "ttft_content_s": 1.188,
+      "total_s": 1.261,
+      "chunks": 21,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "content": "1 2 3 4 5",
+      "reasoning_chars": 196,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 67,
+        "prompt_tokens": 35,
+        "total_tokens": 102,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 55,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      },
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:11 GMT",
+        "content-type": "text/event-stream",
+        "nvcf-reqid": "a90cbb7f-e66a-40eb-9b9e-35809b352801",
+        "nvcf-status": "fulfilled"
+      }
+    },
+    {
+      "n": 7,
+      "at": "2026-10-19T02:19:24+02:00",
+      "kind": "tools step1 (call)",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "latency_s": 1.394,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "name": "get_test_temperature",
+          "arguments": "{\"city\":\"Testhausen\"}"
+        }
+      ],
+      "content": "",
+      "usage": {
+        "completion_tokens": 66,
+        "prompt_tokens": 323,
+        "total_tokens": 389,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 38,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 8,
+      "at": "2026-10-19T02:19:25+02:00",
+      "kind": "tools step2 (result, prepare_messages)",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "stripped": true,
+      "latency_s": 1.552,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "content": "The temperature in the fictional test city Testhausen is **17.5°C** (this is a fake test value).",
+      "mentions_17_5": true,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 92,
+        "prompt_tokens": 391,
+        "total_tokens": 483,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 64,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 9,
+      "at": "2026-10-19T02:19:26+02:00",
+      "kind": "context (max_tokens=1e7)",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": false,
+      "accepted": false,
+      "latency_s": 0.267,
+      "numbers_in_error": [
+        1048576,
+        1048576
+      ],
+      "error_type": "BadRequestError",
+      "error": "Error code: 400 - {'message': 'Validation: Max tokens must not exceed 1048576, got 10000000', 'type': 'Bad Request', 'code': 400}",
+      "status": 400,
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:26 GMT",
+        "content-type": "application/json",
+        "nvcf-reqid": "52af4882-d9a4-47b0-a89b-ed276972a3e4",
+        "nvcf-status": "errored"
+      },
+      "body": "{\"message\":\"Validation: Max tokens must not exceed 1048576, got 10000000\",\"type\":\"Bad Request\",\"code\":400}"
+    },
+    {
+      "n": 10,
+      "at": "2026-10-19T02:19:30+02:00",
+      "kind": "chat",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "ok": true,
+      "latency_s": 0.923,
+      "status": 200,
+      "response_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "content": "PONG",
+      "reasoning_chars": 85,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 25,
+        "prompt_tokens": 28,
+        "total_tokens": 53,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null
+      },
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:30 GMT",
+        "content-type": "application/json",
+        "nvcf-reqid": "a068ee05-9674-4936-857e-3b274d45d360",
+        "nvcf-status": "fulfilled"
+      }
+    },
+    {
+      "n": 11,
+      "at": "2026-10-19T02:19:30+02:00",
+      "kind": "stream",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "ok": true,
+      "ttfb_chunk_s": 0.447,
+      "ttft_content_s": 0.642,
+      "total_s": 0.672,
+      "chunks": 12,
+      "response_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "content": "1 2 3 4 5",
+      "reasoning_chars": 93,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 35,
+        "prompt_tokens": 35,
+        "total_tokens": 70,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null
+      },
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:30 GMT",
+        "content-type": "text/event-stream; charset=utf-8",
+        "nvcf-reqid": "9c15d2e8-bbd1-4545-b954-d1bba6b71375",
+        "nvcf-status": "fulfilled"
+      }
+    },
+    {
+      "n": 12,
+      "at": "2026-10-19T02:19:31+02:00",
+      "kind": "tools step1 (call)",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "ok": true,
+      "latency_s": 0.936,
+      "response_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "name": "get_test_temperature",
+          "arguments": "{\"city\":\"Testhausen\"}"
+        }
+      ],
+      "content": "",
+      "usage": {
+        "completion_tokens": 75,
+        "prompt_tokens": 323,
+        "total_tokens": 398,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null
+      }
+    },
+    {
+      "n": 13,
+      "at": "2026-10-19T02:19:33+02:00",
+      "kind": "tools step2 (result, prepare_messages)",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "ok": true,
+      "stripped": true,
+      "latency_s": 1.64,
+      "response_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "content": "The temperature in the fictional test city **Testhausen** is **17.5°C** (according to the test tool, which provides fake test values).",
+      "mentions_17_5": true,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 101,
+        "prompt_tokens": 391,
+        "total_tokens": 492,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null
+      }
+    },
+    {
+      "n": 14,
+      "at": "2026-10-19T02:19:35+02:00",
+      "kind": "context (max_tokens=1e7)",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "ok": true,
+      "accepted": true,
+      "latency_s": 2.594,
+      "content": "OK",
+      "usage": {
+        "completion_tokens": 12,
+        "prompt_tokens": 23,
+        "total_tokens": 35,
+        "completion_tokens_details": null,
+        "prompt_tokens_details": null
+      }
+    },
+    {
+      "n": 15,
+      "at": "2026-10-19T02:19:36+02:00",
+      "kind": "chat",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": true,
+      "latency_s": 0.51,
+      "status": 200,
+      "response_model": "private/nvidia/nemotron-3.5-super-120b-a12b",
+      "content": "PONG",
+      "reasoning_chars": 186,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 48,
+        "prompt_tokens": 28,
+        "total_tokens": 76,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 44,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      },
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:36 GMT",
+        "content-type": "application/json",
+        "nvcf-reqid": "0b3bce60-e26b-48be-b4ab-494605f6368e",
+        "nvcf-status": "fulfilled"
+      }
+    },
+    {
+      "n": 16,
+      "at": "2026-10-19T02:19:37+02:00",
+      "kind": "stream",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": true,
+      "ttfb_chunk_s": 0.352,
+      "ttft_content_s": 0.642,
+      "total_s": 0.677,
+      "chunks": 24,
+      "response_model": "private/nvidia/nemotron-3.5-super-120b-a12b",
+      "content": "1 2 3 4 5",
+      "reasoning_chars": 265,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 81,
+        "prompt_tokens": 35,
+        "total_tokens": 116,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 70,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      },
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:36 GMT",
+        "content-type": "text/event-stream",
+        "nvcf-reqid": "96c3841d-637d-45f3-ba51-0a4b8f658310",
+        "nvcf-status": "fulfilled"
+      }
+    },
+    {
+      "n": 17,
+      "at": "2026-10-19T02:19:40+02:00",
+      "kind": "tools step1 (call)",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": true,
+      "latency_s": 3.015,
+      "response_model": "private/nvidia/nemotron-3.5-super-120b-a12b",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "name": "get_test_temperature",
+          "arguments": "{\"city\":\"Testhausen\"}"
+        }
+      ],
+      "content": "",
+      "usage": {
+        "completion_tokens": 89,
+        "prompt_tokens": 323,
+        "total_tokens": 412,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 61,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 18,
+      "at": "2026-10-19T02:19:40+02:00",
+      "kind": "tools step2 (result, prepare_messages)",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": true,
+      "stripped": true,
+      "latency_s": 0.484,
+      "response_model": "private/nvidia/nemotron-3.5-super-120b-a12b",
+      "content": "The temperature in Testhausen is **17.5 °C** (fake test value).",
+      "mentions_17_5": true,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 40,
+        "prompt_tokens": 391,
+        "total_tokens": 431,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 19,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 19,
+      "at": "2026-10-19T02:19:40+02:00",
+      "kind": "context (max_tokens=1e7)",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": false,
+      "accepted": false,
+      "latency_s": 0.308,
+      "numbers_in_error": [
+        1048576,
+        1048576
+      ],
+      "error_type": "BadRequestError",
+      "error": "Error code: 400 - {'message': 'Validation: Max tokens must not exceed 1048576, got 10000000', 'type': 'Bad Request', 'code': 400}",
+      "status": 400,
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:19:40 GMT",
+        "content-type": "application/json",
+        "nvcf-reqid": "6a41a866-5f81-48fa-9812-f9fe9e732bdf",
+        "nvcf-status": "errored"
+      },
+      "body": "{\"message\":\"Validation: Max tokens must not exceed 1048576, got 10000000\",\"type\":\"Bad Request\",\"code\":400}"
+    },
+    {
+      "n": 20,
+      "at": "2026-10-19T02:19:58+02:00",
+      "kind": "vision",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": true,
+      "image": "/data/projects/hermes_agent/wb1215-worktree/assets/banner.png",
+      "image_bytes": 12333,
+      "latency_s": 2.176,
+      "response_model": "private/nvidia/nemotron-3.5-super-120b-a12b",
+      "content": "The image shows the text \"HERMES-AGENT\" in large, pixelated yellow and brown letters against a black background.",
+      "usage": {
+        "completion_tokens": 207,
+        "prompt_tokens": 303,
+        "total_tokens": 510,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 177,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 21,
+      "at": "2026-10-19T02:20:05+02:00",
+      "kind": "tools step1 (call)",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "latency_s": 3.89,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "finish_reason": "tool_calls",
+      "tool_calls": [
+        {
+          "name": "get_test_temperature",
+          "arguments": "{\"city\":\"Testhausen\"}"
+        }
+      ],
+      "content": "",
+      "usage": {
+        "completion_tokens": 74,
+        "prompt_tokens": 323,
+        "total_tokens": 397,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 46,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 22,
+      "at": "2026-10-19T02:20:08+02:00",
+      "kind": "tools step2 (result, UNSTRIPPED name/tool_name)",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "stripped": false,
+      "latency_s": 2.328,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "content": "The temperature in the fictional test city Testhausen is **17.5°C** (this is a fake test value).",
+      "mentions_17_5": true,
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 128,
+        "prompt_tokens": 391,
+        "total_tokens": 519,
+        "completion_tokens_details": {
+          "accepted_prediction_tokens": null,
+          "audio_tokens": null,
+          "reasoning_tokens": 100,
+          "rejected_prediction_tokens": null
+        },
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "n": 23,
+      "at": "2026-10-19T02:20:11+02:00",
+      "kind": "error: fake key",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": false,
+      "latency_s": 0.352,
+      "error_type": "AuthenticationError",
+      "error": "Error code: 401 - {'status': 401, 'title': 'Unauthorized', 'detail': 'Invalid JWT serialization: Missing dot delimiter(s)'}",
+      "status": 401,
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:20:11 GMT",
+        "content-type": "application/problem+json"
+      },
+      "body": "{\"status\":401,\"title\":\"Unauthorized\",\"detail\":\"Invalid JWT serialization: Missing dot delimiter(s)\"}"
+    },
+    {
+      "n": 24,
+      "at": "2026-10-19T02:20:11+02:00",
+      "kind": "error: unknown model",
+      "model": "nvidia/does-not-exist-wb1215",
+      "ok": false,
+      "latency_s": 0.125,
+      "error_type": "NotFoundError",
+      "error": "404 page not found",
+      "status": 404,
+      "headers": {
+        "date": "Mon, 19 Oct 2026 00:20:11 GMT",
+        "content-type": "text/plain; charset=utf-8",
+        "x-content-type-options": "nosniff"
+      },
+      "body": "404 page not found\n"
+    },
+    {
+      "n": 25,
+      "at": "2026-10-19T02:23:29+02:00",
+      "kind": "stream",
+      "model": "deepseek-ai/deepseek-v4.1-flash",
+      "ok": false,
+      "latency_s": 180.406,
+      "error_type": "APITimeoutError",
+      "error": "Request timed out."
+    }
+  ],
+  "meta": {
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "credential_source": "manual",
+    "extra_headers_sent": [
+      "X-BILLING-INVOKE-ORIGIN"
+    ],
+    "openai_sdk": "2.24.0",
+    "ticket": "WB-1215",
+    "measured_on": "2026-10-19",
+    "hermes_code": "fork main efbcb44af6 (live install /data/projects/hermes_agent/upstream)",
+    "profile": "default",
+    "credential": "pool entry 'NVIDIA Build (Trial)' (value never read/printed)",
+    "probe_script": "scripts/nvidia_nim_smoke.py",
+    "client_timeout_s": 180,
+    "max_retries": 0
+  },
+  "models": {
+    "at": "2026-10-19T02:11:44+02:00",
+    "status": 200,
+    "count": 81,
+    "ids": [
+      "01-ai/yi-large",
+      "adept/fuyu-8b",
+      "ai21labs/jamba-1.5-large-instruct",
+      "aisingapore/sea-lion-7b-instruct",
+      "bigcode/starcoder2-15b",
+      "databricks/dbrx-instruct",
+      "deepseek-ai/deepseek-coder-6.7b-instruct",
+      "deepseek-ai/deepseek-v4.1-flash",
+      "google/codegemma-1.1-7b",
+      "google/codegemma-7b",
+      "google/deplot",
+      "google/diffusiongemma-26b-a4b-it",
+      "google/gemma-2b",
+      "google/gemma-3-12b-it",
+      "google/gemma-3-4b-it",
+      "google/gemma-4-31b-it",
+      "google/recurrentgemma-2b",
+      "ibm/granite-3.0-3b-a800m-instruct",
+      "ibm/granite-3.0-8b-instruct",
+      "ibm/granite-34b-code-instruct",
+      "ibm/granite-8b-code-instruct",
+      "meta/codellama-70b",
+      "meta/llama-3.2-11b-vision-instruct",
+      "meta/llama-3.2-90b-vision-instruct",
+      "meta/llama-guard-4-12b",
+      "meta/llama2-70b",
+      "meta/muse-glimmer-30b",
+      "microsoft/kosmos-2",
+      "microsoft/phi-3-vision-128k-instruct",
+      "microsoft/phi-3.5-moe-instruct",
+      "mistralai/codestral-22b-instruct-v0.1",
+      "mistralai/mistral-7b-instruct-v0.3",
+      "mistralai/mistral-large",
+      "mistralai/mistral-large-2-instruct",
+      "mistralai/mixtral-8x22b-v0.1",
+      "moonshotai/kimi-k2.6",
+      "nv-mistralai/mistral-nemo-12b-instruct",
+      "nvidia/ai-synthetic-video-detector",
+      "nvidia/cosmos-reason2-8b",
+      "nvidia/embed-qa-4",
+      "nvidia/ising-calibration-1.5-31b",
+      "nvidia/llama-3.1-nemoguard-8b-content-safety",
+      "nvidia/llama-3.1-nemoguard-8b-topic-control",
+      "nvidia/llama-3.1-nemotron-51b-instruct",
+      "nvidia/llama-3.1-nemotron-70b-instruct",
+      "nvidia/llama-3.1-nemotron-safety-guard-8b-v3",
+      "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+      "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
+      "nvidia/llama-3.2-nv-embedqa-1b-v1",
+      "nvidia/llama-nemotron-embed-vl-1b-v2",
+      "nvidia/llama3-chatqa-1.5-70b",
+      "nvidia/mistral-nemo-minitron-8b-8k-instruct",
+      "nvidia/nemotron-3-embed-1b",
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+      "nvidia/nemotron-3-super-120b-a12b",
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "nvidia/nemotron-3.5-content-safety",
+      "nvidia/nemotron-3.5-lightning-30b-a3b",
+      "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "nvidia/nemotron-4-340b-instruct",
+      "nvidia/nemotron-4-340b-reward",
+      "nvidia/nemotron-nano-3-30b-a3b",
+      "nvidia/nemotron-parse",
+      "nvidia/nemotron-parse-2.0",
+      "nvidia/neva-22b",
+      "nvidia/nv-embedqa-mistral-7b-v2",
+      "nvidia/nvclip",
+      "nvidia/riva-translate-4b-instruct",
+      "nvidia/riva-translate-4b-instruct-v2",
+      "nvidia/vila",
+      "openai/gpt-oss-20b",
+      "poolside/laguna-xs-2.1",
+      "snowflake/arctic-embed-l",
+      "stepfun-ai/step-5-preview",
+      "writer/palmyra-creative-122b",
+      "writer/palmyra-fin-70b-32k",
+      "writer/palmyra-med-70b",
+      "writer/palmyra-med-70b-32k",
+      "z-ai/glm-5.3",
+      "z-ai/glm-5.3-flash",
+      "zyphra/zamba2-7b-instruct"
+    ],
+    "pilot_entries_raw": {
+      "deepseek-ai/deepseek-v4.1-flash": {
+        "id": "deepseek-ai/deepseek-v4.1-flash",
+        "object": "model",
+        "created": 735790403,
+        "owned_by": "deepseek-ai"
+      },
+      "nvidia/nemotron-3-super-120b-a12b": {
+        "id": "nvidia/nemotron-3-super-120b-a12b",
+        "object": "model",
+        "created": 735790403,
+        "owned_by": "nvidia"
+      },
+      "nvidia/nemotron-3-ultra-550b-a55b": {
+        "id": "nvidia/nemotron-3-ultra-550b-a55b",
+        "object": "model",
+        "created": 735790403,
+        "owned_by": "nvidia"
+      },
+      "nvidia/nemotron-3.5-super-vl-120b-a12b": {
+        "id": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "object": "model",
+        "created": 735790403,
+        "owned_by": "nvidia"
+      }
+    },
+    "pilots": {
+      "deepseek-ai/deepseek-v4.1-flash": {
+        "present": true,
+        "similar": [
+          "deepseek-ai/deepseek-coder-6.7b-instruct"
+        ]
+      },
+      "nvidia/nemotron-3-super-120b-a12b": {
+        "present": true,
+        "similar": [
+          "nvidia/llama-3.1-nemotron-51b-instruct",
+          "nvidia/llama-3.1-nemotron-70b-instruct",
+          "nvidia/llama-3.1-nemotron-safety-guard-8b-v3",
+          "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+          "nvidia/llama-nemotron-embed-vl-1b-v2",
+          "nvidia/nemotron-3-embed-1b",
+          "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+          "nvidia/nemotron-3-ultra-550b-a55b",
+          "nvidia/nemotron-3.5-content-safety",
+          "nvidia/nemotron-3.5-lightning-30b-a3b",
+          "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "nvidia/nemotron-4-340b-instruct",
+          "nvidia/nemotron-4-340b-reward",
+          "nvidia/nemotron-nano-3-30b-a3b",
+          "nvidia/nemotron-parse",
+          "nvidia/nemotron-parse-2.0"
+        ]
+      },
+      "nvidia/nemotron-3-ultra-550b-a55b": {
+        "present": true,
+        "similar": [
+          "nvidia/llama-3.1-nemotron-51b-instruct",
+          "nvidia/llama-3.1-nemotron-70b-instruct",
+          "nvidia/llama-3.1-nemotron-safety-guard-8b-v3",
+          "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+          "nvidia/llama-nemotron-embed-vl-1b-v2",
+          "nvidia/nemotron-3-embed-1b",
+          "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+          "nvidia/nemotron-3-super-120b-a12b",
+          "nvidia/nemotron-3.5-content-safety",
+          "nvidia/nemotron-3.5-lightning-30b-a3b",
+          "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "nvidia/nemotron-4-340b-instruct",
+          "nvidia/nemotron-4-340b-reward",
+          "nvidia/nemotron-nano-3-30b-a3b",
+          "nvidia/nemotron-parse",
+          "nvidia/nemotron-parse-2.0"
+        ]
+      },
+      "nvidia/nemotron-3.5-super-vl-120b-a12b": {
+        "present": true,
+        "similar": [
+          "nvidia/llama-3.1-nemotron-51b-instruct",
+          "nvidia/llama-3.1-nemotron-70b-instruct",
+          "nvidia/llama-3.1-nemotron-safety-guard-8b-v3",
+          "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+          "nvidia/llama-nemotron-embed-vl-1b-v2",
+          "nvidia/nemotron-3-embed-1b",
+          "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+          "nvidia/nemotron-3-super-120b-a12b",
+          "nvidia/nemotron-3-ultra-550b-a55b",
+          "nvidia/nemotron-3.5-content-safety",
+          "nvidia/nemotron-3.5-lightning-30b-a3b",
+          "nvidia/nemotron-4-340b-instruct",
+          "nvidia/nemotron-4-340b-reward",
+          "nvidia/nemotron-nano-3-30b-a3b",
+          "nvidia/nemotron-parse",
+          "nvidia/nemotron-parse-2.0"
+        ]
+      }
+    }
+  },
+  "cli_crosscheck": [
+    {
+      "at": "2026-10-19T02:20:26+02:00",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "ok": true,
+      "output": "PONG",
+      "wall_s": 11.3,
+      "api_latency_s": 1.2,
+      "session": "20261019_022033_ed9514",
+      "nvidia_calls": 2,
+      "note": "1 chat + 1 auxiliary title_generation (also routed to nvidia)"
+    },
+    {
+      "at": "2026-10-19T02:20:37+02:00",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "ok": true,
+      "output": "PONG",
+      "wall_s": 10.9,
+      "api_latency_s": 1.4,
+      "session": "20261019_022044_08a4b2",
+      "nvidia_calls": 2,
+      "note": "1 chat + 1 auxiliary title_generation"
+    },
+    {
+      "at": "2026-10-19T02:20:48+02:00",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "ok": true,
+      "output": "PONG",
+      "wall_s": 10.0,
+      "api_latency_s": 1.2,
+      "session": "20261019_022054_ef18fc",
+      "nvidia_calls": 2,
+      "note": "1 chat + 1 auxiliary title_generation"
+    },
+    {
+      "model": "deepseek-ai/deepseek-v4.1-flash",
+      "ok": null,
+      "note": "skipped: 3 direct calls timed out after 180 s without any HTTP response; CLI retries would burn trial calls"
+    }
+  ],
+  "cli_command": "hermes chat -q 'Smoke test. Reply with exactly the word: PONG' --provider nvidia -m <id> --oneshot -Q --ignore-rules --ignore-user-config -t todo --max-turns 2 (cwd: empty scratch dir)",
+  "calls_total_including_cli": 31,
+  "summary": {
+    "deepseek-ai/deepseek-v4.1-flash": {
+      "listed": true,
+      "chat": "timeout 180s",
+      "stream": "timeout 180s x2 (no first byte)",
+      "tools": "not tested",
+      "context": "not measured",
+      "vision": "n/a"
+    },
+    "nvidia/nemotron-3-super-120b-a12b": {
+      "listed": true,
+      "response_model": "nvidia/nemotron-3-super-120b-a12b",
+      "chat": "ok 1.19s",
+      "stream": "ok first chunk 0.41s, first content 1.19s",
+      "tools": "ok roundtrip (stripped and unstripped)",
+      "context": "not measured; max_tokens validation cap 1048576",
+      "vision": "n/a"
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+      "listed": true,
+      "response_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "chat": "ok 0.92s",
+      "stream": "ok first chunk 0.45s, first content 0.64s",
+      "tools": "ok roundtrip",
+      "context": "not measured; max_tokens=1e7 accepted without validation",
+      "vision": "n/a"
+    },
+    "nvidia/nemotron-3.5-super-vl-120b-a12b": {
+      "listed": true,
+      "response_model": "private/nvidia/nemotron-3.5-super-120b-a12b",
+      "chat": "ok 0.51s",
+      "stream": "ok first chunk 0.35s, first content 0.64s",
+      "tools": "ok roundtrip",
+      "context": "not measured; max_tokens validation cap 1048576",
+      "vision": "ok (assets/banner.png, 2.18s)"
+    }
+  }
+}
