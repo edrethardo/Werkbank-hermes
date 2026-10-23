@@ -842,6 +842,17 @@ def dispatch_async_delegation(
     return handle
 
 
+def update_unit_model(delegation_id: Optional[str], model: Optional[str]) -> None:
+    """Completion-block model label of a running unit, e.g. after a delegation.auto fallback child replaced its
+    trial child (WB-1260). No-op for unknown ids or an empty label."""
+    if not delegation_id or not model:
+        return
+    with _records_lock:
+        rec = _records.get(delegation_id)
+        if rec is not None:
+            rec["model"] = model
+
+
 def dispatch_async_delegation_batch(
     *, goals: List[str], context: Optional[str], toolsets: Optional[List[str]], role: str, model: Optional[str],
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],

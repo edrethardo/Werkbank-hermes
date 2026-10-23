@@ -15,7 +15,7 @@ import logging
 import time
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
 from utils import is_truthy_value
@@ -218,6 +218,13 @@ def _build_child_agent(
     reasoning_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    # WB-1260 (delegation.auto), all None/True = unchanged: ``drop_fallback(provider, base_url, model)``
+    # removes matching (trial) entries from the child's fallback chain (vertraulich); ``subagent_id`` reuses
+    # an id already handed out (fallback child of a trial run); ``attach_to_parent=False`` keeps a child
+    # built inside an async unit out of the parent's interrupt fan-out (the unit owns its stop).
+    drop_fallback: Optional[Callable[..., bool]] = None,
+    subagent_id: Optional[str] = None,
+    attach_to_parent: bool = True,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -232,7 +239,7 @@ def _build_child_agent(
 
     # One subagent_id shared by the progress callback, spawn_requested event and
     # the live registry; parent_id is set when THIS parent is itself a subagent.
-    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    subagent_id = subagent_id or f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
 
     # General delegation behavior (reasoning, compression, capabilities) stays
@@ -263,6 +270,9 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg, reasoning_cfg=reasoning_cfg,
     )
+    if drop_fallback is not None:
+        from tools.delegation_auto import drop_trial_fallbacks
+        rt["fallback_model"] = drop_trial_fallbacks(rt.get("fallback_model"), drop_fallback)
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -322,7 +332,8 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
-    _attach_child(parent_agent, child)  # interrupt propagation
+    if attach_to_parent:
+        _attach_child(parent_agent, child)  # interrupt propagation
     # spawn_requested now — the child may queue for seconds when the pool is
     # saturated — then the subagent_start lifecycle hook.
     _safe_progress(child_progress_cb, "subagent.spawn_requested", preview=goal)
@@ -427,7 +438,8 @@ def _resolve_task_model_profiles(
 
     ``model_profile: "auto"`` (WB-1260, only with ``delegation.auto``) picks the profile by difficulty, trial
     profiles first (see ``tools.delegation_auto``); such a route also carries an ``"auto"`` dict. A task with
-    ``vertraulich: true`` never runs on a trial route (explicit profile, call-wide pin or inherited parent)."""
+    ``vertraulich: true`` (or a vertraulich delegating agent) never runs on a trial route (explicit profile,
+    call-wide pin or inherited parent); trial = WB-1216 policy plus every ``delegation.auto.bevorzugt`` route."""
     from tools import delegation_auto as _auto
     auto_cfg = _auto.get_auto_config(cfg)
     std_auto = _auto.standard_auto(auto_cfg)
@@ -437,11 +449,20 @@ def _resolve_task_model_profiles(
         routes, err = _resolve_profile_routes(task_list, cfg, parent_agent, auto_cfg, std_auto)
         if err:
             return [], err
-    err = _confidential_route_error(task_list, routes, creds, parent_agent)
+    _, is_trial = _confidential_plan(task_list, cfg, parent_agent)
+    err = _confidential_route_error(task_list, routes, creds, parent_agent, is_trial)
     if err:
         _release_auto_slots(routes)
         return [], err
     return routes, None
+
+
+def _confidential_plan(task_list, cfg, parent_agent) -> tuple[List[bool], Callable[..., bool]]:
+    """``([vertraulich per task], is_trial)``: a task is vertraulich by its own flag or because the delegating
+    agent is a child of a vertraulich task (grandchildren inherit); ``is_trial(provider, base_url, model)``."""
+    from tools import delegation_auto as _auto
+    flags = [_auto.is_confidential(t, parent_agent) for t in task_list]
+    return flags, _auto.trial_route_check(_auto.get_auto_config(cfg), _get_model_profiles(cfg))
 
 
 def _resolve_profile_routes(task_list, cfg, parent_agent, auto_cfg, std_auto):
@@ -481,7 +502,7 @@ def _resolve_profile_routes(task_list, cfg, parent_agent, auto_cfg, std_auto):
                 if err:
                     return [], err
                 auto_checked = True
-            route, err = _plan_auto_route(i, t, auto_cfg, _route)
+            route, err = _plan_auto_route(i, t, auto_cfg, _route, parent_agent)
             if err:
                 _release_auto_slots(routes)
                 return [], err
@@ -506,7 +527,7 @@ def _resolve_profile_routes(task_list, cfg, parent_agent, auto_cfg, std_auto):
     return routes, None
 
 
-def _plan_auto_route(i: int, task: Dict[str, Any], auto_cfg: Dict[str, Any], resolve_route):
+def _plan_auto_route(i: int, task: Dict[str, Any], auto_cfg: Dict[str, Any], resolve_route, parent_agent=None):
     """Route for one ``model_profile: "auto"`` task: the stage profile, or a healthy trial profile first."""
     from tools import delegation_auto as _auto
     stufe, quelle, err = _auto.task_stage(task)
@@ -519,7 +540,7 @@ def _plan_auto_route(i: int, task: Dict[str, Any], auto_cfg: Dict[str, Any], res
     trials = _auto.trial_profiles(auto_cfg)
     if trials and stufe not in _auto.trial_stages(auto_cfg):
         hinweis = f"Stufe {stufe} nicht in delegation.auto.fuer"
-    elif trials and _auto.is_confidential(task):
+    elif trials and _auto.is_confidential(task, parent_agent):
         hinweis = "vertraulich: kein Trial"
     elif trials:
         cooldown_s = _auto.cooldown_seconds(auto_cfg)
@@ -557,20 +578,21 @@ def _release_auto_slots(routes) -> None:
             auto["slot"] = None
 
 
-def _confidential_route_error(task_list, routes, creds, parent_agent) -> Optional[str]:
-    """``vertraulich: true`` never runs on a trial route (WB-1216's notion of trial), whoever picked it."""
+def _confidential_route_error(task_list, routes, creds, parent_agent, is_trial) -> Optional[str]:
+    """A vertraulich task never runs on a trial PRIMARY route, whoever picked it (its fallback chain is
+    filtered at child construction, see ``_build_children``)."""
     from tools import delegation_auto as _auto
     for i, t in enumerate(task_list):
-        if not (isinstance(t, dict) and _auto.is_confidential(t)):
+        if not _auto.is_confidential(t, parent_agent):
             continue
         route = routes[i] if i < len(routes) else None
         bundle = (route or {}).get("creds") or creds or {}
-        provider, base_url = bundle.get("provider"), bundle.get("base_url")
+        provider, base_url, model = bundle.get("provider"), bundle.get("base_url"), bundle.get("model")
         if not provider and not base_url:
             provider, base_url = getattr(parent_agent, "provider", None), getattr(parent_agent, "base_url", None)
-        if _auto.route_is_trial(provider if isinstance(provider, str) else None,
-                                base_url if isinstance(base_url, str) else None):
-            return (f"Task {i} is marked vertraulich: true but would run on the trial route "
+            model = model or getattr(parent_agent, "model", None)
+        if is_trial(provider, base_url, model):
+            return (f"Task {i} is vertraulich (own flag or a vertraulich parent task) but would run on the trial route "
                     f"({provider or base_url}). Pick a non-trial model_profile (or 'auto').")
     return None
 
@@ -580,11 +602,14 @@ def _build_children(
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
     task_routes: Optional[List[Optional[Dict[str, Any]]]] = None, transparent: bool = False,
+    confidential: Optional[List[bool]] = None, is_trial: Optional[Callable[..., bool]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
     ``task_routes[i]`` (from ``_resolve_task_model_profiles``) replaces the call-wide route for task i.
-    ``transparent`` (delegation.auto configured, WB-1260): every result entry names model + provider."""
+    ``transparent`` (delegation.auto configured, WB-1260): every result entry names model + provider.
+    ``confidential[i]`` (vertraulich, WB-1260): the child's fallback chain loses every ``is_trial`` entry and
+    the child is marked ``_delegate_confidential`` so its own children inherit the flag."""
     from tools.delegation_output_schema import append_output_contract
     overrides = _child_overrides(creds, routing_cfg)
     children = []
@@ -597,8 +622,12 @@ def _build_children(
         _t_images = task_images[i] if task_images and i < len(task_images) else None
         _writer = live_writers[i] if i < len(live_writers) else None
 
+        _conf = bool(confidential and i < len(confidential) and confidential[i])
+
         def _make(route, *, fallback_von=None, i=i, t=t, ctx=_child_context, schema=_task_schema,
-                  images=_t_images, writer=_writer):
+                  images=_t_images, writer=_writer, conf=_conf, **extra):
+            if conf and is_trial is not None:
+                extra["drop_fallback"] = is_trial
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=ctx,
                 toolsets=None,  # always inherit the parent's toolsets
@@ -606,10 +635,13 @@ def _build_children(
                 task_count=len(task_list), parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
                 **(_child_overrides(route["creds"], route["routing_cfg"]) if route else overrides),
                 **({"reasoning_cfg": route["reasoning_cfg"]} if route and route["reasoning_cfg"] is not None else {}),
+                **extra,
             )
             _decorate_child(child, i, route, schema, images, writer, live_deleg_id, fallback_von=fallback_von)
             if transparent:
                 child._delegate_transparent = True
+            if conf:
+                child._delegate_confidential = True
             return child
 
         try:
@@ -621,7 +653,7 @@ def _build_children(
             _fb = _auto.get("fallback")
             child._delegate_auto = {
                 **{k: v for k, v in _auto.items() if k != "fallback"},
-                "rebuild": (lambda _fb=_fb, _make=_make, _from=_auto.get("trial"): _make(_fb, fallback_von=_from))
+                "rebuild": (lambda _fb=_fb, _make=_make, _from=_auto.get("trial"), **kw: _make(_fb, fallback_von=_from, **kw))
                 if _fb else None,
             }
         children.append((i, t, child))
@@ -749,53 +781,56 @@ def delegate_task(
     task_routes, err = _resolve_task_model_profiles(task_list, cfg, parent_agent, creds)
     if err:
         return tool_error(err)
-    err = _oneshot_spawn_budget(parent_agent, len(task_list))
-    if err:
-        _release_auto_slots(task_routes)
-        return tool_error(err)
-
-    overall_start = time.monotonic()
-    # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
-    # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
-    #
-    # The transcripts' profile home is resolved from stable parent-owned
-    # state (the parent's per-profile SessionDB path), NOT ambient
-    # get_hermes_dir(): this thread may have crossed a raw threading.Thread
-    # boundary that dropped the session's _HERMES_HOME_OVERRIDE ContextVar,
-    # and process-wide HERMES_HOME is unstable under concurrent
-    # multi-profile workers — either way transcripts could land in the
-    # wrong profile (#91996). state.db sits directly under the home, so
-    # its parent IS the home; None falls back to today's ambient resolve
-    # (with a warning — that fallback is exactly the #91996 failure mode).
-    _live_home = _parent_live_home(parent_agent)
-
-    from tools.delegation_live_log import create_live_transcripts
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        home=_live_home,
-    )
-    _announce_batch(parent_agent, len(task_list), live_deleg_id)
-    origin = _capture_origin()
-
-    from tools.delegation_auto import get_auto_config
+    # Trial slots planned above belong to this call until the batch owns its children; any early return or
+    # exception on the way (budget, transcripts, build) gives them back (WB-1260).
+    handed_over = False
     try:
+        err = _oneshot_spawn_budget(parent_agent, len(task_list))
+        if err:
+            return tool_error(err)
+
+        overall_start = time.monotonic()
+        # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
+        # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
+        #
+        # The transcripts' profile home is resolved from stable parent-owned
+        # state (the parent's per-profile SessionDB path), NOT ambient
+        # get_hermes_dir(): this thread may have crossed a raw threading.Thread
+        # boundary that dropped the session's _HERMES_HOME_OVERRIDE ContextVar,
+        # and process-wide HERMES_HOME is unstable under concurrent
+        # multi-profile workers — either way transcripts could land in the
+        # wrong profile (#91996). state.db sits directly under the home, so
+        # its parent IS the home; None falls back to today's ambient resolve
+        # (with a warning — that fallback is exactly the #91996 failure mode).
+        _live_home = _parent_live_home(parent_agent)
+
+        from tools.delegation_live_log import create_live_transcripts
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context, model=creds.get("model"), provider=creds.get("provider"),
+            home=_live_home,
+        )
+        _announce_batch(parent_agent, len(task_list), live_deleg_id)
+        origin = _capture_origin()
+
+        from tools.delegation_auto import get_auto_config
+        confidential, is_trial = _confidential_plan(task_list, cfg, parent_agent)
         children, err = _build_children(
             task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter,
             parent_agent=parent_agent, routing_cfg=routing_cfg, live_deleg_id=live_deleg_id,
             live_writers=live_writers, task_images=task_images, task_routes=task_routes,
-            transparent=get_auto_config(cfg) is not None,
+            transparent=get_auto_config(cfg) is not None, confidential=confidential, is_trial=is_trial,
         )
-    except BaseException:
-        _release_auto_slots(task_routes)
-        raise
-    if err:
-        _release_auto_slots(task_routes)
-        return tool_error(err)
-    batch = _Batch(
-        task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
-        live_home=_live_home,
-    )
+        if err:
+            return tool_error(err)
+        batch = _Batch(
+            task_list, children, parent_agent, creds, context, top_role, max_children,
+            live_deleg_id, live_writers, live_paths, *origin, overall_start,
+            live_home=_live_home,
+        )
+        handed_over = True
+    finally:
+        if not handed_over:
+            _release_auto_slots(task_routes)
     return _run_batch(batch, background)
 
 

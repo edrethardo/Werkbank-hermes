@@ -18,6 +18,10 @@ when it is not ``vertraulich: true``, its stage is in ``fuer``, the trial is hea
 pool status, last 429/5xx, cooldown), side tasks of that child would NOT follow it onto the trial
 (``auxiliary.exclude_main_providers``, WB-1216) and a ``trial_parallel`` slot is free. A trial run
 failing with auth/429/5xx/timeout before its first tool call restarts ONCE on the stage profile.
+
+``vertraulich`` (own flag, or inherited from a vertraulich delegating agent) is the central guard: such a
+task never runs on a trial route — WB-1216's trial routes plus every ``bevorzugt`` route, whatever
+``exclude_main_providers`` says (``trial_route_check``) — and its fallback chain loses every trial entry.
 """
 
 from __future__ import annotations
@@ -155,9 +159,13 @@ def task_stage(task: Dict[str, Any]) -> Tuple[Optional[str], str, Optional[str]]
     return stufe, grund, None
 
 
-def is_confidential(task: Dict[str, Any]) -> bool:
+def is_confidential(task: Dict[str, Any], parent_agent: Any = None) -> bool:
+    """``vertraulich: true`` on the task, or inherited: the delegating agent is itself the child of a
+    vertraulich task (``_delegate_confidential``), so its children — the grandchildren — are vertraulich too."""
     from utils import is_truthy_value
-    return is_truthy_value(task.get("vertraulich"), default=False)
+    if getattr(parent_agent, "_delegate_confidential", None) is True:
+        return True
+    return isinstance(task, dict) and is_truthy_value(task.get("vertraulich"), default=False)
 
 
 # ── Process-wide trial state (cooldown + parallel slots) ────────────────────
@@ -271,6 +279,78 @@ def route_is_trial(provider: Optional[str], base_url: Optional[str]) -> bool:
     return bool(provider or base_url) and policy.main_route_excluded(provider, base_url or "")
 
 
+# Provider ids that host many unrelated models: a trial profile on one of them marks only its own model
+# (or its endpoint host) as trial, never the whole provider.
+_SHARED_PROVIDERS = frozenset({"openrouter", "custom", "nous", "auto"})
+
+
+def _host(url: Any) -> str:
+    from urllib.parse import urlparse
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    return (urlparse(raw if "://" in raw else f"https://{raw}").hostname or "").lower()
+
+
+def trial_markers(auto_cfg: Optional[Dict[str, Any]], profiles: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+    """``(provider, host, model)`` of every ``delegation.auto.bevorzugt`` profile — trial no matter what
+    ``auxiliary.exclude_main_providers`` says. A ``nvidia`` profile without ``base_url`` is the hosted NIM."""
+    from agent import aux_provider_policy as policy
+    markers: List[Tuple[str, str, str]] = []
+    for name in trial_profiles(auto_cfg or {}):
+        prof = profiles.get(name)
+        if not isinstance(prof, dict):
+            continue
+        provider = policy._canonical(prof.get("provider") if isinstance(prof.get("provider"), str) else None)
+        host = _host(prof.get("base_url"))
+        if not host and provider == "nvidia":
+            host = policy.HOSTED_NIM_HOST
+        model = str(prof.get("model") or "").strip().lower()
+        if provider or host:
+            markers.append((provider, host, model))
+    return markers
+
+
+def trial_route_check(auto_cfg: Optional[Dict[str, Any]], profiles: Dict[str, Dict[str, Any]]):
+    """Predicate ``(provider, base_url, model=None) -> bool``: the WB-1216 trial routes plus everything a
+    ``bevorzugt`` profile points at (same endpoint host; same provider — on shared providers same model)."""
+    from agent import aux_provider_policy as policy
+    from utils import base_url_host_matches
+    markers = trial_markers(auto_cfg, profiles)
+
+    def _is_trial(provider: Any, base_url: Any, model: Any = None) -> bool:
+        provider = provider if isinstance(provider, str) else None
+        base_url = base_url if isinstance(base_url, str) else None
+        if route_is_trial(provider, base_url):
+            return True
+        canonical = policy._canonical(provider)
+        model_s = str(model or "").strip().lower()
+        for m_provider, m_host, m_model in markers:
+            if m_host and base_url and base_url_host_matches(base_url, m_host):
+                return True
+            if not m_provider or canonical != m_provider:
+                continue
+            if m_provider in _SHARED_PROVIDERS or m_provider.startswith("custom"):
+                if m_model and model_s == m_model:
+                    return True
+                continue
+            return True
+        return False
+    return _is_trial
+
+
+def drop_trial_fallbacks(chain: Any, is_trial) -> Optional[List[Dict[str, Any]]]:
+    """The fallback chain without trial entries (``None`` when nothing is left) — a vertraulich child must
+    not reach the trial through its fallback either."""
+    if not isinstance(chain, list):
+        return chain
+    kept = [e for e in chain if not (isinstance(e, dict) and is_trial(e.get("provider"), e.get("base_url"), e.get("model")))]
+    if len(kept) != len(chain):
+        logger.info("delegation.auto: vertraulich — %d trial entr(y/ies) removed from the child's fallback chain",
+                    len(chain) - len(kept))
+    return kept or None
+
+
 # ── Fallback trigger ────────────────────────────────────────────────────────
 
 _FALLBACK_REASONS = frozenset({
@@ -339,9 +419,38 @@ def _replace_child(batch: Any, i: int, task: Dict[str, Any], new_child: Any) -> 
                 children[k] = (i, task, new_child)
 
 
+def _unit_stopped(batch: Any) -> bool:
+    return getattr(batch, "stop_requested", None) is True
+
+
+def _note_unit_model(batch: Any) -> None:
+    """An async unit's completion label follows the children that actually run (fallback child)."""
+    unit_id = getattr(batch, "unit_id", None)
+    if getattr(batch, "detached", None) is not True or not isinstance(unit_id, str):
+        return
+    try:
+        from tools.async_delegation import update_unit_model
+        from tools.delegate_tool_dispatch import _unit_model_label
+        update_unit_model(unit_id, _unit_model_label(batch, [c for (_, _, c) in batch.children]))
+    except Exception as exc:  # label only; never fail the run
+        logger.debug("delegation.auto: could not update the unit model label: %s", exc)
+
+
+def _close_unrun(child: Any) -> None:
+    try:
+        child.close()
+    except Exception as exc:
+        logger.debug("delegation.auto: closing an unstarted fallback child failed: %s", exc)
+
+
 def run_auto_child(batch: Any, i: int, task: Dict[str, Any], child: Any) -> Dict[str, Any]:
     """Run one child; a trial child that failed with auth/429/5xx/timeout before its first tool call
-    restarts ONCE on its stage profile (``fallback_von``). Releases the trial slot when done."""
+    restarts ONCE on its stage profile (``fallback_von``). Releases the trial slot when done.
+
+    Inside an async unit the fallback child takes the trial child's place in ``batch.children`` (the unit's
+    ``interrupt_fn`` reads it live), keeps its ``subagent_id`` (ids already handed to the model stay valid),
+    stays out of the parent's interrupt fan-out like its siblings, and is never started once the unit was
+    stopped."""
     from tools.delegate_tool import _run_single_child
     auto = getattr(child, "_delegate_auto", None)
     auto = auto if isinstance(auto, dict) else None
@@ -362,19 +471,35 @@ def run_auto_child(batch: Any, i: int, task: Dict[str, Any], child: Any) -> Dict
         if reason:
             record_trial_failure(trial, reason)
             _release()
+        if reason and _unit_stopped(batch):
+            logger.info("delegation.auto: task %d stopped; no fallback after trial failure (%s)", i, reason)
+            reason = None
+        if reason:
+            kw: Dict[str, Any] = {}
+            sid = getattr(child, "_subagent_id", None)
+            if isinstance(sid, str) and sid:
+                kw["subagent_id"] = sid
+            if getattr(batch, "detached", None) is True:
+                kw["attach_to_parent"] = False
             try:
                 with _rebuild_lock:  # construction is not thread-safe; siblings may fall back at once
-                    new_child = auto["rebuild"]()
+                    new_child = auto["rebuild"](**kw)
             except Exception as exc:
                 logger.warning("delegation.auto: fallback child for task %d could not be built: %s", i, exc)
                 entry["fallback_fehler"] = str(exc)
             else:
-                child = new_child
-                _replace_child(batch, i, task, child)
-                entry = _run(child)
-                if isinstance(entry, dict):
-                    entry["fallback_von"] = trial
-                    entry["fallback_grund"] = reason
+                old_child = child
+                _replace_child(batch, i, task, new_child)
+                if _unit_stopped(batch):  # stop landed while building: put the trial child back, never start
+                    _replace_child(batch, i, task, old_child)
+                    _close_unrun(new_child)
+                else:
+                    child = new_child
+                    _note_unit_model(batch)
+                    entry = _run(child)
+                    if isinstance(entry, dict):
+                        entry["fallback_von"] = trial
+                        entry["fallback_grund"] = reason
         _annotate(entry, child, auto)
         return entry
     finally:

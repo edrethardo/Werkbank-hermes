@@ -50,6 +50,11 @@ class _Batch:
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
     live_home: Any = None  # explicit profile home for transcripts/manifest (#91996); None = ambient resolve
+    # Async unit bookkeeping (WB-1260): ``detached`` while the async registry owns the unit's stop (children are
+    # out of the parent's interrupt fan-out), ``stop_requested`` once its interrupt_fn fired — a delegation.auto
+    # fallback child is then never started.
+    detached: bool = False
+    stop_requested: bool = False
 
     def owner_kwargs(self) -> Dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -404,9 +409,15 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
     child_agents = [c for (_, _, c) in unit.children]
+    unit.detached = True
+
+    def _live_children() -> list:
+        # Read at call time: a delegation.auto fallback child replaces its trial child in unit.children (WB-1260).
+        return [c for (_, _, c) in unit.children]
 
     def _interrupt():
-        for c in child_agents:
+        unit.stop_requested = True
+        for c in _live_children():
             _signal_child_stop(c, "Async delegation cancelled")
 
     return dispatch_async_delegation_batch(
@@ -421,12 +432,13 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None
                           and unit.live_writers[i].path is not None},
-        progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+        progress_fn=lambda: _batch_progress_token(_live_children()), **routing,
     )
 
 def _restore_parent_cancellation(unit: _Batch) -> None:
     """Rejected children stay owned by the parent: re-attach them (``_attach_child`` replays a stop that
     arrived while async admission had them detached)."""
+    unit.detached = False
     for _, _, child in unit.children:
         _attach_child(unit.parent_agent, child)
 
