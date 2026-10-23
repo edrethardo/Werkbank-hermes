@@ -415,7 +415,7 @@ def _child_overrides(creds: Dict[str, Any], routing_cfg: Dict[str, Any]) -> Dict
 
 
 def _resolve_task_model_profiles(
-    task_list: List[Dict[str, Any]], cfg: Dict[str, Any], parent_agent,
+    task_list: List[Dict[str, Any]], cfg: Dict[str, Any], parent_agent, creds: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[Optional[Dict[str, Any]]], Optional[str]]:
     """Per-task route for ``tasks[].model_profile`` (WB-1211): ``([route_or_None, ...], None)`` or ``([], error)``.
 
@@ -423,54 +423,168 @@ def _resolve_task_model_profiles(
     ``_resolve_delegation_credentials`` as ``delegation.provider``/``base_url`` and is the routing owner of the
     child (fallback chain: pinned profile → only its own ``fallback_providers``; ``{}`` → parent's, like any
     unpinned child). Unknown names and unresolvable profiles fail the whole call before any child spawns —
-    never a silent fallback onto another model. Tasks without a profile get None (today's route)."""
-    if not any(isinstance(t, dict) and t.get("model_profile") is not None for t in task_list):
-        return [None] * len(task_list), None
+    never a silent fallback onto another model. Tasks without a profile get None (today's route).
+
+    ``model_profile: "auto"`` (WB-1260, only with ``delegation.auto``) picks the profile by difficulty, trial
+    profiles first (see ``tools.delegation_auto``); such a route also carries an ``"auto"`` dict. A task with
+    ``vertraulich: true`` never runs on a trial route (explicit profile, call-wide pin or inherited parent)."""
+    from tools import delegation_auto as _auto
+    auto_cfg = _auto.get_auto_config(cfg)
+    std_auto = _auto.standard_auto(auto_cfg)
+    if not std_auto and not any(isinstance(t, dict) and t.get("model_profile") is not None for t in task_list):
+        routes: List[Optional[Dict[str, Any]]] = [None] * len(task_list)
+    else:
+        routes, err = _resolve_profile_routes(task_list, cfg, parent_agent, auto_cfg, std_auto)
+        if err:
+            return [], err
+    err = _confidential_route_error(task_list, routes, creds, parent_agent)
+    if err:
+        _release_auto_slots(routes)
+        return [], err
+    return routes, None
+
+
+def _resolve_profile_routes(task_list, cfg, parent_agent, auto_cfg, std_auto):
+    from tools import delegation_auto as _auto
     profiles = _get_model_profiles(cfg)
     resolved: Dict[str, Dict[str, Any]] = {}
     routes: List[Optional[Dict[str, Any]]] = []
+
+    def _route(name: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if name not in resolved:
+            profile = profiles[name]
+            try:
+                creds = _resolve_delegation_credentials(profile, parent_agent)
+            except ValueError as exc:
+                return None, f"model_profile {name!r}: {exc}"
+            resolved[name] = {
+                "name": name, "creds": creds, "routing_cfg": profile,
+                "reasoning_cfg": profile if "reasoning_effort" in profile else None,
+            }
+        return resolved[name], None
+
+    auto_checked = False
     for i, t in enumerate(task_list):
         raw = t.get("model_profile")
+        if raw is None and std_auto:
+            raw = _auto.AUTO_PROFILE
         if raw is None:
             routes.append(None)
             continue
         name = raw.strip() if isinstance(raw, str) else ""
         if not name:
+            _release_auto_slots(routes)
             return [], f"Task {i} 'model_profile' must be a profile name (string)."
+        if name == _auto.AUTO_PROFILE and auto_cfg and name not in profiles:
+            if not auto_checked:
+                err = _auto.validate_auto_config(auto_cfg, profiles)
+                if err:
+                    return [], err
+                auto_checked = True
+            route, err = _plan_auto_route(i, t, auto_cfg, _route)
+            if err:
+                _release_auto_slots(routes)
+                return [], err
+            routes.append(route)
+            continue
         if not profiles:
             return [], (
                 f"Task {i} asks for model_profile {name!r}, but delegation.models is not configured. "
                 "Drop model_profile or define the profile in config.yaml."
             )
         if name not in profiles:
+            _release_auto_slots(routes)
             return [], (
                 f"Task {i} has unknown model_profile {name!r}. "
                 f"Configured profiles (delegation.models): {', '.join(profiles)}."
             )
-        if name not in resolved:
-            profile = profiles[name]
-            try:
-                creds = _resolve_delegation_credentials(profile, parent_agent)
-            except ValueError as exc:
-                return [], f"model_profile {name!r}: {exc}"
-            resolved[name] = {
-                "name": name, "creds": creds, "routing_cfg": profile,
-                "reasoning_cfg": profile if "reasoning_effort" in profile else None,
-            }
-        routes.append(resolved[name])
+        route, err = _route(name)
+        if err:
+            _release_auto_slots(routes)
+            return [], err
+        routes.append(route)
     return routes, None
+
+
+def _plan_auto_route(i: int, task: Dict[str, Any], auto_cfg: Dict[str, Any], resolve_route):
+    """Route for one ``model_profile: "auto"`` task: the stage profile, or a healthy trial profile first."""
+    from tools import delegation_auto as _auto
+    stufe, quelle, err = _auto.task_stage(task)
+    if err:
+        return None, f"Task {i} {err}"
+    base, err = resolve_route(str(auto_cfg[stufe]).strip())
+    if err:
+        return None, err
+    chosen, trial, slot, hinweis = base, None, None, None
+    trials = _auto.trial_profiles(auto_cfg)
+    if trials and stufe not in _auto.trial_stages(auto_cfg):
+        hinweis = f"Stufe {stufe} nicht in delegation.auto.fuer"
+    elif trials and _auto.is_confidential(task):
+        hinweis = "vertraulich: kein Trial"
+    elif trials:
+        cooldown_s = _auto.cooldown_seconds(auto_cfg)
+        for tname in trials:
+            t_route, t_err = resolve_route(tname)
+            reason = (
+                (f"Trial {tname} nicht auflösbar: {t_err}" if t_err else None)
+                or _auto.trial_cooldown_reason(tname, cooldown_s)
+                or _auto.side_tasks_refusal(t_route["creds"].get("provider"), t_route["creds"].get("base_url"))
+                or _auto.pool_refusal(t_route["creds"].get("provider") or "", t_route["creds"].get("model"), cooldown_s)
+            )
+            if reason is None:
+                limit = _auto.trial_parallel(auto_cfg)
+                slot = _auto.try_acquire_slot(tname, limit)
+                if slot is None:
+                    reason = f"Trial {tname}: delegation.auto.trial_parallel={limit} erreicht"
+            if reason is None:
+                chosen, trial = t_route, tname
+                break
+            hinweis = reason
+        if trial is not None:
+            hinweis = None
+    auto = {"stufe": stufe, "quelle": quelle, "hinweis": hinweis, "trial": trial, "slot": slot,
+            "fallback": base if trial is not None else None}
+    return {**chosen, "auto": auto}, None
+
+
+def _release_auto_slots(routes) -> None:
+    """Give back trial slots planned for a call that will not run its children."""
+    from tools import delegation_auto as _auto
+    for route in routes or []:
+        auto = route.get("auto") if isinstance(route, dict) else None
+        if isinstance(auto, dict) and auto.get("slot") is not None:
+            _auto.release_slot(auto.get("trial"), auto.get("slot"))
+            auto["slot"] = None
+
+
+def _confidential_route_error(task_list, routes, creds, parent_agent) -> Optional[str]:
+    """``vertraulich: true`` never runs on a trial route (WB-1216's notion of trial), whoever picked it."""
+    from tools import delegation_auto as _auto
+    for i, t in enumerate(task_list):
+        if not (isinstance(t, dict) and _auto.is_confidential(t)):
+            continue
+        route = routes[i] if i < len(routes) else None
+        bundle = (route or {}).get("creds") or creds or {}
+        provider, base_url = bundle.get("provider"), bundle.get("base_url")
+        if not provider and not base_url:
+            provider, base_url = getattr(parent_agent, "provider", None), getattr(parent_agent, "base_url", None)
+        if _auto.route_is_trial(provider if isinstance(provider, str) else None,
+                                base_url if isinstance(base_url, str) else None):
+            return (f"Task {i} is marked vertraulich: true but would run on the trial route "
+                    f"({provider or base_url}). Pick a non-trial model_profile (or 'auto').")
+    return None
 
 
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
-    task_routes: Optional[List[Optional[Dict[str, Any]]]] = None,
+    task_routes: Optional[List[Optional[Dict[str, Any]]]] = None, transparent: bool = False,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
-    ``task_routes[i]`` (from ``_resolve_task_model_profiles``) replaces the call-wide route for task i."""
-    from tools.delegation_live_log import wrap_progress_callback
+    ``task_routes[i]`` (from ``_resolve_task_model_profiles``) replaces the call-wide route for task i.
+    ``transparent`` (delegation.auto configured, WB-1260): every result entry names model + provider."""
     from tools.delegation_output_schema import append_output_contract
     overrides = _child_overrides(creds, routing_cfg)
     children = []
@@ -480,45 +594,68 @@ def _build_children(
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
-        try:
+        _t_images = task_images[i] if task_images and i < len(task_images) else None
+        _writer = live_writers[i] if i < len(live_writers) else None
+
+        def _make(route, *, fallback_von=None, i=i, t=t, ctx=_child_context, schema=_task_schema,
+                  images=_t_images, writer=_writer):
             child = _build_child_preserving_parent_tools(
-                task_index=i, goal=t["goal"], context=_child_context,
+                task_index=i, goal=t["goal"], context=ctx,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=(_route["creds"] if _route else creds)["model"], max_iterations=max_iterations,
+                model=(route["creds"] if route else creds)["model"], max_iterations=max_iterations,
                 task_count=len(task_list), parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
-                **(_child_overrides(_route["creds"], _route["routing_cfg"]) if _route else overrides),
-                **({"reasoning_cfg": _route["reasoning_cfg"]} if _route and _route["reasoning_cfg"] is not None else {}),
+                **(_child_overrides(route["creds"], route["routing_cfg"]) if route else overrides),
+                **({"reasoning_cfg": route["reasoning_cfg"]} if route and route["reasoning_cfg"] is not None else {}),
             )
+            _decorate_child(child, i, route, schema, images, writer, live_deleg_id, fallback_von=fallback_von)
+            if transparent:
+                child._delegate_transparent = True
+            return child
+
+        try:
+            child = _make(_route)
         except ValueError as exc:
             return [], str(exc)
-        if _route:
-            child._delegate_model_profile = _route["name"]
-        if _task_schema is not None:
-            with _quiet("Could not attach output schema to child %d", i):
-                child._delegate_output_schema = _task_schema
-        # Validated per-task images; absent on image-less tasks, which keep the text-only goal turn.
-        _t_images = task_images[i] if task_images and i < len(task_images) else None
-        if _t_images:
-            with _quiet("Could not attach images to child %d", i):
-                child._delegate_images = _t_images
-        # Tee progress events into the live transcript (wrapper keeps the
-        # _flush contract and swallows writer failures).
-        _writer = live_writers[i] if i < len(live_writers) else None
-        if _writer is not None:
-            child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), _writer)
-            child._live_transcript_path = str(_writer.path)
-            if _route:
-                # The model the child was actually built with (resolved profile, or the parent's for `{}`).
-                with _quiet("Could not note model in live transcript %d", i):
-                    _writer.event("model", f"{getattr(child, 'model', None) or '?'} via "
-                                  f"{getattr(child, 'provider', None) or '?'} (model_profile: {_route['name']})")
-        if live_deleg_id:
-            setattr(child, "_delegation_id", live_deleg_id)
-            _ident_ref = getattr(child, "_progress_identity_ref", None)
-            if isinstance(_ident_ref, dict):
-                _ident_ref["delegation_id"] = live_deleg_id
+        _auto = _route.get("auto") if isinstance(_route, dict) else None
+        if isinstance(_auto, dict):
+            _fb = _auto.get("fallback")
+            child._delegate_auto = {
+                **{k: v for k, v in _auto.items() if k != "fallback"},
+                "rebuild": (lambda _fb=_fb, _make=_make, _from=_auto.get("trial"): _make(_fb, fallback_von=_from))
+                if _fb else None,
+            }
         children.append((i, t, child))
     return children, None
+
+
+def _decorate_child(child, i, route, schema, images, writer, live_deleg_id, *, fallback_von=None) -> None:
+    """Per-task attachments of a freshly built child: profile name, output schema, images, live transcript tee."""
+    from tools.delegation_live_log import wrap_progress_callback
+    if route:
+        child._delegate_model_profile = route["name"]
+    if schema is not None:
+        with _quiet("Could not attach output schema to child %d", i):
+            child._delegate_output_schema = schema
+    # Validated per-task images; absent on image-less tasks, which keep the text-only goal turn.
+    if images:
+        with _quiet("Could not attach images to child %d", i):
+            child._delegate_images = images
+    # Tee progress events into the live transcript (wrapper keeps the
+    # _flush contract and swallows writer failures).
+    if writer is not None:
+        child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), writer)
+        child._live_transcript_path = str(writer.path)
+        if route:
+            # The model the child was actually built with (resolved profile, or the parent's for `{}`).
+            with _quiet("Could not note model in live transcript %d", i):
+                writer.event("model", f"{getattr(child, 'model', None) or '?'} via "
+                             f"{getattr(child, 'provider', None) or '?'} (model_profile: {route['name']})"
+                             + (f" (fallback_von: {fallback_von})" if fallback_von else ""))
+    if live_deleg_id:
+        setattr(child, "_delegation_id", live_deleg_id)
+        _ident_ref = getattr(child, "_progress_identity_ref", None)
+        if isinstance(_ident_ref, dict):
+            _ident_ref["delegation_id"] = live_deleg_id
 
 
 def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
@@ -609,11 +746,12 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
-    task_routes, err = _resolve_task_model_profiles(task_list, cfg, parent_agent)
+    task_routes, err = _resolve_task_model_profiles(task_list, cfg, parent_agent, creds)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
+        _release_auto_slots(task_routes)
         return tool_error(err)
 
     overall_start = time.monotonic()
@@ -639,12 +777,19 @@ def delegate_task(
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
-    children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
-        task_routes=task_routes,
-    )
+    from tools.delegation_auto import get_auto_config
+    try:
+        children, err = _build_children(
+            task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter,
+            parent_agent=parent_agent, routing_cfg=routing_cfg, live_deleg_id=live_deleg_id,
+            live_writers=live_writers, task_images=task_images, task_routes=task_routes,
+            transparent=get_auto_config(cfg) is not None,
+        )
+    except BaseException:
+        _release_auto_slots(task_routes)
+        raise
     if err:
+        _release_auto_slots(task_routes)
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
@@ -749,11 +894,16 @@ def _build_dynamic_schema_overrides() -> dict:
     profiles = _get_model_profiles()
     if profiles:
         # Advertised only when configured: without delegation.models the schema stays byte-identical.
+        from tools.delegation_auto import get_auto_config
+        auto_cfg = get_auto_config(_load_config())
         tasks = overrides_params["properties"]["tasks"]
-        tasks["items"] = {**tasks["items"], "properties": {
-            **tasks["items"]["properties"], "model_profile": _model_profile_param(profiles),
-        }}
+        extra = {"model_profile": _model_profile_param(profiles, auto=auto_cfg is not None)}
+        if auto_cfg is not None:
+            extra.update(_auto_task_params())
+        tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra}}
         description += _DESCRIPTION_MODEL_PROFILE
+        if auto_cfg is not None:
+            description += _DESCRIPTION_AUTO
     return {"description": description, "parameters": overrides_params}
 
 
@@ -762,7 +912,29 @@ _DESCRIPTION_MODEL_PROFILE = (
 )
 
 
-def _model_profile_param(profiles: Dict[str, Dict[str, Any]]) -> dict:
+_DESCRIPTION_AUTO = (
+    "\n- `model_profile: \"auto\"` picks the model by difficulty (`schwierigkeit`, else a fixed heuristic); "
+    "mark tasks with private/customer data `vertraulich: true` (never sent to the free trial model)."
+)
+
+
+def _auto_task_params() -> dict:
+    """tasks[].schwierigkeit / tasks[].vertraulich, offered only with delegation.auto (WB-1260)."""
+    return {
+        "schwierigkeit": _p(
+            "string",
+            "Optional difficulty for model_profile 'auto': leicht (lookup, listing, summary), mittel (normal "
+            "implementation), schwer (review, security, architecture, long context). Omit = heuristic.",
+            enum=["leicht", "mittel", "schwer"],
+        ),
+        "vertraulich": _p(
+            "boolean",
+            "true = this task carries private, customer or secret data and must never run on a trial endpoint.",
+        ),
+    }
+
+
+def _model_profile_param(profiles: Dict[str, Dict[str, Any]], *, auto: bool = False) -> dict:
     """tasks[].model_profile: enum of the delegation.models names, each named with its model."""
     def _label(route: Dict[str, Any]) -> str:
         model = str(route.get("model") or "").strip()
@@ -771,11 +943,15 @@ def _model_profile_param(profiles: Dict[str, Dict[str, Any]]) -> dict:
             return "your own model"
         return f"{model or 'default model'}" + (f" via {provider}" if provider else "")
     choices = "; ".join(f"{name} = {_label(route)}" for name, route in profiles.items())
+    names = list(profiles)
+    if auto and "auto" not in profiles:
+        choices += "; auto = chosen by difficulty (schwierigkeit), free trial model first where it fits"
+        names.append("auto")
     return _p(
         "string",
         f"Optional model for THIS child, by profile name ({choices}). Omit to use the default subagent "
         "model. Unknown names are rejected.",
-        enum=list(profiles),
+        enum=names,
     )
 
 def _p(type_: str, description: str, **extra) -> dict:

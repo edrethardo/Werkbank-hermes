@@ -60,6 +60,10 @@ class _Batch:
 
     def run_child(self, i: int, task: Dict[str, Any], child: Any) -> Dict[str, Any]:
         from tools.delegate_tool import _run_single_child
+        if isinstance(getattr(child, "_delegate_auto", None), dict) or getattr(child, "_delegate_transparent", None) is True:
+            # delegation.auto (WB-1260): trial slot, one fallback restart, model/provider in the entry.
+            from tools.delegation_auto import run_auto_child
+            return run_auto_child(self, i, task, child)
         return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
 
 
@@ -386,7 +390,11 @@ def _units_of(batch: _Batch) -> List[_Batch]:
 
 def _unit_model_label(unit: _Batch, child_agents: list) -> Optional[str]:
     """Completion-block model for one unit: the call-wide route, unless a task picked a
-    delegation.models profile (WB-1211) — then the models the children were actually built with."""
+    delegation.models profile (WB-1211) — then the models the children were actually built with. With
+    delegation.auto (WB-1260) every child is named as ``model via provider``."""
+    if any(getattr(c, "_delegate_transparent", None) is True for c in child_agents):
+        labels = [f"{getattr(c, 'model', None) or '?'} via {getattr(c, 'provider', None) or '?'}" for c in child_agents]
+        return ", ".join(dict.fromkeys(labels)) or unit.creds["model"]
     if not any(isinstance(getattr(c, "_delegate_model_profile", None), str) for c in child_agents):
         return unit.creds["model"]
     models = list(dict.fromkeys(str(getattr(c, "model", "") or "") for c in child_agents))

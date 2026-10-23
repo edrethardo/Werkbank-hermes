@@ -225,6 +225,9 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
                   + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else ""))
         lines += ["", header + ") ---"]
+        if r.get("provider"):  # delegation.auto (WB-1260): the model this task actually ran on
+            lines.append(f"Model: {r.get('model') or '?'} via {r['provider']}"
+                         + (f" (fallback_von: {r['fallback_von']})" if r.get("fallback_von") else ""))
         if r_status in _DONE and r_summary:
             if r_truncated:
                 lines.append(_TRUNCATED_SUMMARY_NOTE)
