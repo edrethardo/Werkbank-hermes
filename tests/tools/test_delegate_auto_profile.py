@@ -53,9 +53,10 @@ def _fresh_state():
     auto_mod.reset_state()
 
 
-def _factory(built, results_by_provider=None):
+def _factory(built, results_by_provider=None, agents=None):
     """Fake AIAgent: records kwargs; ``results_by_provider[provider]`` is a list of run results (popped)."""
     results_by_provider = results_by_provider or {}
+    agents = agents if agents is not None else []
 
     def _make(**kwargs):
         child = MagicMock()
@@ -68,15 +69,16 @@ def _factory(built, results_by_provider=None):
         queue = results_by_provider.get(kwargs.get("provider"))
         child.run_conversation.return_value = dict(queue.pop(0) if queue else OK_RESULT)
         built.append(kwargs)
+        agents.append(child)
         return child
     return _make
 
 
-def _run(cfg, tasks, *, results_by_provider=None, parent=None):
+def _run(cfg, tasks, *, results_by_provider=None, parent=None, agents=None):
     built = []
     resolver = MagicMock(side_effect=lambda requested=None, target_model=None, **_: dict(RUNTIMES[requested]))
     with patch("tools.delegate_tool._load_config", return_value=cfg), \
-            patch("run_agent.AIAgent", side_effect=_factory(built, results_by_provider)), \
+            patch("run_agent.AIAgent", side_effect=_factory(built, results_by_provider, agents)), \
             patch("hermes_cli.runtime_provider.resolve_runtime_provider", resolver):
         out = json.loads(delegate_task(tasks=tasks, parent_agent=parent or _parent()))
     return out, built
@@ -399,3 +401,226 @@ def test_standard_auto_applies_to_tasks_without_profile():
     assert built[0]["provider"] == "nvidia"
     out, built = _run(_cfg(), [{"goal": "List the files in docs/notes"}])
     assert built[0]["provider"] == "openrouter"  # not opted in: parent route as today
+
+
+# ── Nachbesserung: vertraulich über Fallback-Ketten, Trial-Erkennung, Vererbung (B1–B3) ──
+
+
+NV_FALLBACK = {"provider": "nvidia", "model": "nemotron"}
+ANT_FALLBACK = {"provider": "anthropic", "model": "claude-sonnet-fake"}
+
+
+def _haiku_with_fallback(*chain):
+    return {**MODELS, "haiku": {**MODELS["haiku"], "fallback_providers": list(chain)}}
+
+
+def _providers(chain):
+    return [e.get("provider") for e in (chain or [])]
+
+
+def test_confidential_drops_trial_from_profile_fallback_chain():
+    """Repro B1: models.haiku falls back to nvidia; a vertraulich task on haiku must not carry it."""
+    cfg = {"models": _haiku_with_fallback(NV_FALLBACK), "auto": AUTO}
+    out, built = _run(cfg, [{"goal": "List the files in docs/notes", "model_profile": "haiku", "vertraulich": True}])
+    assert "error" not in out, out
+    assert built[0]["provider"] == "anthropic"
+    assert "nvidia" not in _providers(built[0]["fallback_model"])
+
+
+def test_confidential_keeps_non_trial_fallback_entries():
+    cfg = {"models": _haiku_with_fallback(NV_FALLBACK, ANT_FALLBACK), "auto": AUTO}
+    out, built = _run(cfg, [{"goal": "List the files in docs/notes", "model_profile": "haiku", "vertraulich": True}])
+    assert "error" not in out, out
+    assert _providers(built[0]["fallback_model"]) == ["anthropic"]
+
+
+def test_non_confidential_task_keeps_its_full_fallback_chain():
+    cfg = {"models": _haiku_with_fallback(NV_FALLBACK, ANT_FALLBACK), "auto": AUTO}
+    out, built = _run(cfg, [{"goal": "List the files in docs/notes", "model_profile": "haiku"}])
+    assert _providers(built[0]["fallback_model"]) == ["nvidia", "anthropic"]
+
+
+def test_confidential_auto_task_drops_trial_from_stage_profile_fallback():
+    cfg = {"models": _haiku_with_fallback(NV_FALLBACK), "auto": AUTO}
+    out, built = _run(cfg, [{"goal": "List the files in docs/notes", "model_profile": "auto", "vertraulich": True}])
+    assert "error" not in out, out
+    assert [b["provider"] for b in built] == ["anthropic"]
+    assert "nvidia" not in _providers(built[0]["fallback_model"])
+
+
+def test_confidential_drops_trial_from_inherited_parent_fallback_chain():
+    parent = _parent()
+    parent._fallback_chain = [dict(NV_FALLBACK), {"provider": "openrouter", "model": "gpt-4o-mini"}]
+    out, built = _run(_cfg(), [{"goal": "List the files in docs/notes", "vertraulich": True}], parent=parent)
+    assert "error" not in out, out
+    assert _providers(built[0]["fallback_model"]) == ["openrouter"]
+    # Control: without vertraulich the inherited chain stays as it is.
+    out, built = _run(_cfg(), [{"goal": "List the files in docs/notes"}], parent=parent)
+    assert _providers(built[0]["fallback_model"]) == ["nvidia", "openrouter"]
+
+
+def test_confidential_drops_hosted_nim_fallback_under_another_provider_id():
+    parent = _parent()
+    parent._fallback_chain = [{"provider": "custom", "model": "x", "base_url": NVIDIA_URL}]
+    with patch("agent.aux_provider_policy.excluded_main_providers", return_value=frozenset()):
+        out, built = _run(_cfg(), [{"goal": "List the files in docs/notes", "vertraulich": True}], parent=parent)
+    assert "error" not in out, out
+    assert not built[0]["fallback_model"]
+
+
+def test_bevorzugt_profile_is_trial_even_without_exclude_main_providers():
+    """Repro B2: exclude_main_providers: [] must not open the trial for vertraulich tasks."""
+    with patch("agent.aux_provider_policy.excluded_main_providers", return_value=frozenset()):
+        out, built = _run(_cfg(), [{"goal": "List the files in docs/notes", "model_profile": "nemotron",
+                                    "vertraulich": True}])
+    assert "error" in out and "vertraulich" in out["error"]
+    assert built == []
+
+
+def test_bevorzugt_provider_is_trial_for_inherited_parent_without_exclude_main_providers():
+    parent = _parent()
+    parent.provider, parent.base_url, parent.model = "nvidia", NVIDIA_URL, ULTRA
+    with patch("agent.aux_provider_policy.excluded_main_providers", return_value=frozenset()):
+        out, built = _run(_cfg(), [{"goal": "List the files in docs/notes", "vertraulich": True}], parent=parent)
+    assert "error" in out and "vertraulich" in out["error"]
+    assert built == []
+
+
+def test_bevorzugt_fallback_entry_dropped_without_exclude_main_providers():
+    cfg = {"models": _haiku_with_fallback(NV_FALLBACK, ANT_FALLBACK), "auto": AUTO}
+    with patch("agent.aux_provider_policy.excluded_main_providers", return_value=frozenset()):
+        out, built = _run(cfg, [{"goal": "List the files in docs/notes", "model_profile": "haiku",
+                                 "vertraulich": True}])
+    assert "error" not in out, out
+    assert _providers(built[0]["fallback_model"]) == ["anthropic"]
+
+
+def test_child_of_confidential_task_is_marked_confidential():
+    agents = []
+    _run(_cfg(), [{"goal": "List the files in docs/notes", "model_profile": "haiku", "vertraulich": True},
+                  {"goal": "List the files in docs/other", "model_profile": "haiku"}], agents=agents)
+    assert getattr(agents[0], "_delegate_confidential", None) is True
+    assert getattr(agents[1], "_delegate_confidential", None) is not True
+
+
+def test_grandchild_inherits_confidential_auto_never_trial():
+    """B3: a child of a vertraulich task delegates again — its children are vertraulich too."""
+    parent = _parent()
+    parent._delegate_confidential = True
+    agents = []
+    out, built = _run(_cfg(), [{"goal": "List the files in docs/notes", "model_profile": "auto"}],
+                      parent=parent, agents=agents)
+    assert "error" not in out, out
+    assert [b["provider"] for b in built] == ["anthropic"]
+    assert "vertraulich" in out["results"][0]["auto_hinweis"]
+    assert getattr(agents[0], "_delegate_confidential", None) is True
+
+
+def test_grandchild_of_confidential_parent_refused_on_explicit_trial():
+    parent = _parent()
+    parent._delegate_confidential = True
+    out, built = _run(_cfg(), [{"goal": "List the files in docs/notes", "model_profile": "nemotron"}], parent=parent)
+    assert "error" in out and "vertraulich" in out["error"]
+    assert built == []
+
+
+def test_grandchild_of_confidential_parent_drops_trial_fallback():
+    parent = _parent()
+    parent._delegate_confidential = True
+    cfg = {"models": _haiku_with_fallback(NV_FALLBACK, ANT_FALLBACK), "auto": AUTO}
+    out, built = _run(cfg, [{"goal": "List the files in docs/notes", "model_profile": "haiku"}], parent=parent)
+    assert _providers(built[0]["fallback_model"]) == ["anthropic"]
+
+
+# ── Nachbesserung: Rückfall-Kind in der Async-Unit (B4), Slots bei Ausnahme (B6) ──
+
+
+def _capture_batch(cfg, tasks, results_by_provider, agents):
+    """Build the batch through delegate_task, but hand it back instead of running it."""
+    captured = {}
+    with patch("tools.delegate_tool._run_batch", side_effect=lambda b, bg: captured.setdefault("b", b) and "{}"):
+        _run(cfg, tasks, results_by_provider=results_by_provider, agents=agents)
+    return captured["b"]
+
+
+def _run_unit_async(batch, agents, seen):
+    """Drive the batch as ONE async unit: capture the dispatch kwargs in *seen*, then run the runner inline."""
+    from tools import async_delegation, delegate_tool_dispatch as dispatch
+
+    def _fake_dispatch(**kw):
+        seen.update(kw)
+        return {"status": "dispatched", "delegation_id": "d-auto-1"}
+
+    resolver = MagicMock(side_effect=lambda requested=None, target_model=None, **_: dict(RUNTIMES[requested]))
+    stops = []
+    with patch("tools.async_delegation.dispatch_async_delegation_batch", side_effect=_fake_dispatch), \
+            patch.object(dispatch, "_signal_child_stop", side_effect=lambda c, *a, **k: stops.append(c)):
+        batch.unit_id = "d-auto-1"
+        dispatch._dispatch_unit(batch, "d-auto-1", None, {})
+        with async_delegation._records_lock:
+            async_delegation._records["d-auto-1"] = {"delegation_id": "d-auto-1", "model": seen["model"],
+                                                    "status": "running"}
+        try:
+            with patch("tools.delegate_tool._load_config", return_value=_cfg()), \
+                    patch("run_agent.AIAgent", side_effect=_factory([], {}, agents)), \
+                    patch("hermes_cli.runtime_provider.resolve_runtime_provider", resolver):
+                result = seen["runner"]()
+            with async_delegation._records_lock:
+                record = dict(async_delegation._records["d-auto-1"])
+        finally:
+            with async_delegation._records_lock:
+                async_delegation._records.pop("d-auto-1", None)
+    return result, stops, record
+
+
+def test_async_unit_stop_reaches_fallback_child():
+    agents, seen = [], {}
+    batch = _capture_batch(_cfg(), [{"goal": "List the files in docs/notes", "model_profile": "auto"}],
+                           {"nvidia": [RATE_LIMITED]}, agents)
+    trial_child = agents[0]
+    assert trial_child.provider == "nvidia"
+
+    def _fallback_run(*a, **k):
+        seen["interrupt_fn"]()  # unit-wide stop while the fallback child runs
+        return dict(OK_RESULT)
+
+    real_replace = auto_mod._replace_child
+
+    def _replace(b, i, t, new_child):
+        new_child.run_conversation.side_effect = _fallback_run
+        return real_replace(b, i, t, new_child)
+
+    with patch.object(auto_mod, "_replace_child", side_effect=_replace):
+        result, stops, record = _run_unit_async(batch, agents, seen)
+    fallback_child = agents[-1]
+    assert fallback_child is not trial_child and fallback_child.provider == "anthropic"
+    assert result["results"][0]["fallback_von"] == "nemotron"
+    assert fallback_child in stops, "unit-wide stop must reach the fallback child"
+    # The fallback child keeps the trial child's subagent_id (ids handed to the model stay valid) ...
+    assert fallback_child._subagent_id == trial_child._subagent_id
+    # ... and the unit's completion label names the model that actually ran.
+    assert record["model"] == "claude-haiku-fake via anthropic"
+
+
+def test_async_unit_stop_before_fallback_prevents_the_restart():
+    agents, seen = [], {}
+    batch = _capture_batch(_cfg(), [{"goal": "List the files in docs/notes", "model_profile": "auto"}], {}, agents)
+    trial_child = agents[0]
+
+    def _trial_run(*a, **k):
+        seen["interrupt_fn"]()  # stop arrives while the trial child runs; it then fails with 429
+        return dict(RATE_LIMITED)
+
+    trial_child.run_conversation.side_effect = _trial_run
+    result, stops, record = _run_unit_async(batch, agents, seen)
+    assert trial_child in stops
+    assert len(agents) == 1, "no fallback child may start after a unit-wide stop"
+    assert "fallback_von" not in result["results"][0]
+
+
+def test_slots_released_when_exception_hits_between_planning_and_build():
+    tasks = [{"goal": "List the files in docs/notes", "model_profile": "auto"}]
+    with patch("tools.delegation_live_log.create_live_transcripts", side_effect=RuntimeError("disk gone")):
+        with pytest.raises(RuntimeError):
+            _run(_cfg(trial_parallel=1), tasks)
+    assert auto_mod.running_trial_children("nemotron") == 0
