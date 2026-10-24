@@ -351,3 +351,62 @@ async def test_telegram_picker_passes_the_tapping_user_to_a_card_callback():
                         from_user=SimpleNamespace(id=42))
     await a._handle_choice_picker_callback(q, "cp:0", "4711")
     assert calls == [("keep:x", "42")]
+
+
+# -- WB-1261 review fixes -----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_card_answer_marks_a_strangers_keep_as_toast_only(monkeypatch):
+    adapter = ReleaseAdapter()
+    card, keep = await _card_for(adapter, f"nimm {FAKE_BARE} bitte")
+    monkeypatch.setattr("gateway.wake.admit_internal_event", lambda *a: None)
+    result = await card["cb"]("4711", keep, user_id="99")
+    assert getattr(result, "toast_only", False) is True and FAKE_BARE not in result
+    ok = await card["cb"]("4711", card["choices"][1]["value"], user_id="99")   # drop: not toast-only
+    assert getattr(ok, "toast_only", False) is False
+
+
+def _tg_with_state(cb):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    a = object.__new__(TelegramAdapter)
+    a._choice_picker_state = {"4711": {"msg_id": 200, "choices": [{"value": "save:x"}, {"value": "keep:x"}],
+                                       "session_key": "k", "on_choice_selected": cb}}
+    a._edit_result_text = AsyncMock()
+    q = lambda uid: SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(message_id=200),
+                                    from_user=SimpleNamespace(id=uid))
+    return a, q
+
+
+@pytest.mark.asyncio
+async def test_telegram_strangers_tap_only_toasts_and_keeps_the_card():
+    from gateway.secret_intake_gateway import ToastOnly
+    calls = []
+
+    async def cb(chat_id, value, user_id=None):
+        calls.append((value, user_id))
+        if user_id != "42":
+            return ToastOnly("⛔ [GEHEIMNIS:api-key-1]: freigeben kann nur, wer die Nachricht geschickt hat.")
+        return "✅ ok"
+
+    a, q = _tg_with_state(cb)
+    stranger = q(99)
+    await a._handle_choice_picker_callback(stranger, "cp:1", "4711")
+    a._edit_result_text.assert_not_called()                        # card, buttons stay
+    stranger.answer.assert_awaited_once()
+    assert "freigeben kann nur" in stranger.answer.await_args.kwargs.get("text", "")
+    assert "4711" in a._choice_picker_state                        # picker state stays
+    owner = q(42)
+    await a._handle_choice_picker_callback(owner, "cp:1", "4711")  # the sender can still answer
+    a._edit_result_text.assert_awaited_once()
+    assert "4711" not in a._choice_picker_state
+    assert calls == [("keep:x", "99"), ("keep:x", "42")]
+
+
+def test_released_turn_prefix_keeps_the_value_out_of_the_80_char_info_log():
+    """``gateway/run_turn.py`` logs ``event.text[:80]`` at INFO: the value must start later."""
+    from gateway.secret_intake_gateway import released_turn_text
+    text = released_turn_text([("[GEHEIMNIS:api-key-1]", FAKE_BARE)])
+    assert text.index(FAKE_BARE) > 80
+    assert FAKE_BARE not in text[:80].replace("\n", " ")

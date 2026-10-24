@@ -30,10 +30,11 @@ Contract:
 * :func:`release` (WB-1261, card answer „Kein Geheimnis“) hands the original value back to the
   caller (the gateway injects it into the session as a follow-up turn, the CLI puts it back into the
   turn it is about to stage) and saves nothing. Only the sender of the message (``sender`` given to
-  :func:`intake` / :func:`offer_candidates`), only in the entry's own scope, only while pending
-  (TTL), once. The value's art + a keyed, process-local HMAC land in an exception list so the same
-  value raises no new card (and the follow-up turn is not redacted again); the cleartext is never
-  kept. Audit lines name placeholder/art, never the value or the actor.
+  :func:`intake`; adopted later by :func:`offer_candidates` only for Werkbank-plugin entries), only in
+  the entry's own scope, only while pending (TTL), once. (sender, art, keyed process-local HMAC of
+  the value) land in an exception list so the same value from the same sender raises no new card (and
+  the follow-up turn is not redacted again); another sender or a scan without one still redacts it.
+  The cleartext is never kept. Audit lines name placeholder/art, never the value or the actor.
 * Switch: ``security.secret_intake`` (default on). Off → :func:`intake` returns the text unchanged.
 
 Detection reuses the provider-prefix catalogue of ``agent/redact.py`` and adds a narrow set of
@@ -255,11 +256,15 @@ def _value_is_code_or_placeholder(value: str, after: str) -> bool:
     return _is_path(value) or _is_filename(value) or _is_env_name(value) or _is_snake_identifier(value)
 
 
-# A name part of a file reference (WB-1261): a word in any case (``folio``, ``PDF``, ``DE``), a number,
-# a lower-case hex id (``doc_3f9a1c2b7d4e``), a short letter prefix + number (``DE0000…``, ``ABC123``,
-# ``v2``) or a number + short unit (``24h``). A segment mixing upper, lower AND digits is never one.
+# A name part of a file reference (WB-1261): a word in ONE case form (``folio``, ``Depot``, ``PDF``),
+# a number, a lower-case hex id (``doc_3f9a1c2b7d4e``), a short letter prefix + number (``DE0000…``,
+# ``ABC123``, ``v2``) or a number + short unit (``24h``). Mixed case inside a part (``QxZkPw``) is never
+# a word — a block-wise key ``AbCdEf-12345-….txt`` keeps its blocks and stays a key.
 _FILE_NAME_PART_RE = re.compile(
-    r"[A-Za-z]+|[0-9]+|[0-9a-f]{4,32}|[A-Z]{1,4}[0-9]+|[a-z]{1,10}[0-9]+|[0-9]+[a-z]{1,3}")
+    r"[a-z]+|[A-Z][a-z]*|[A-Z]+|[0-9]+|[0-9a-f]{4,32}|[A-Z]{1,4}[0-9]+|[a-z]{1,10}[0-9]+|[0-9]+[a-z]{1,3}")
+# Credential containers: a key-like name with one of these is never the file-reference exception
+# (``<key>.env`` / ``.pem`` / ``.p12`` / ``client_<key>.json``); the bare-key rule decides as without it.
+_CREDENTIAL_EXTENSIONS = frozenset({"env", "key", "pem", "p12", "pfx", "json", "jks", "keystore", "ppk"})
 
 
 def _is_file_reference(value: str) -> bool:
@@ -271,6 +276,8 @@ def _is_file_reference(value: str) -> bool:
     m = _FILENAME_RE.fullmatch(last)
     if not m or m.group("ext").lower() not in _FILE_EXTENSIONS:
         return False
+    if m.group("ext").lower() in _CREDENTIAL_EXTENSIONS:
+        return False                                  # only called for an already key-like value
     parts = [p for p in re.split(r"[/_.\- ]", head + "/" + m.group("stem")) if p]
     return bool(parts) and all(_FILE_NAME_PART_RE.fullmatch(p) for p in parts)
 
@@ -536,7 +543,7 @@ class _Store:
                 if e.scope == scope and e.status == "pending" and e.value == value:
                     entry = e
                     break
-            if entry is not None and sender and not entry.sender:
+            if entry is not None and sender and not entry.sender and entry.surface == _WERKBANK_SURFACE:
                 entry.sender = sender
             if entry is None:
                 retired += self._purge_locked(now, reserve=1)   # bound: retire the oldest open entry
@@ -568,7 +575,7 @@ class _Store:
                    if e.scope == scope and e.status == "pending" and not e.offered and e.placeholder in text]
             for e in out:
                 e.offered = True
-                if sender and not e.sender:
+                if sender and not e.sender and e.surface == _WERKBANK_SURFACE:
                     e.sender = sender            # pre-redacted (Werkbank plugin): the card's event names it
         return sorted(out, key=lambda e: text.find(e.placeholder))
 
@@ -600,6 +607,10 @@ class _Store:
 
 
 _STORE = _Store()
+# The one path whose entries are created without a sender on purpose (the Werkbank plugin redacts the
+# board text before the gateway event exists); only there may the card's event name the sender later.
+# Any other sender-less entry (reply quote, edit, STT, backstop) stays unreleasable (WB-1261 F4).
+_WERKBANK_SURFACE = "werkbank"
 
 
 def store() -> _Store:
@@ -652,11 +663,26 @@ def _home() -> str:
         return ""
 
 
-def _unreleased(text: str, findings: List[Finding], home: str) -> List[Finding]:
-    """*findings* minus the values the user released as „Kein Geheimnis“ (same art, same value)."""
-    if not findings or not _RELEASED.get(home):
+# The classic CLI's user is the local owner: its intake entries and „Kein Geheimnis“ answers carry this
+# marker, and the CLI agent's own backstop scans with it (WB-1261).
+CLI_SENDER = "cli-lokal"
+
+
+def agent_sender(agent: Any) -> str:
+    """Sender for scans inside an agent run: the gateway user it runs for (``agent._user_id``), the
+    local owner for the classic CLI, else "" (no release applies)."""
+    uid = str(getattr(agent, "_user_id", None) or "")
+    if uid:
+        return uid
+    return CLI_SENDER if str(getattr(agent, "platform", "") or "") == "cli" else ""
+
+
+def _unreleased(text: str, findings: List[Finding], home: str, sender: str = "") -> List[Finding]:
+    """*findings* minus the values *sender* released as „Kein Geheimnis“ (same sender, art, value).
+    No sender known → no release applies (the value is a secret again: the safe direction)."""
+    if not findings or not sender or not _RELEASED.get(home):
         return findings
-    return [f for f in findings if not _is_released(f.art, text[f.start:f.end], home)]
+    return [f for f in findings if not _is_released(sender, f.art, text[f.start:f.end], home)]
 
 
 def redact_text(text: str, scope: str, *, surface: str = "unbekannt",
@@ -667,7 +693,7 @@ def redact_text(text: str, scope: str, *, surface: str = "unbekannt",
     if not findings:
         return text, []
     home = _home()
-    findings = _unreleased(text, findings, home)
+    findings = _unreleased(text, findings, home, sender)
     if not findings:
         return text, []
     out: List[str] = []
@@ -687,10 +713,11 @@ def redact_text(text: str, scope: str, *, surface: str = "unbekannt",
     return "".join(out), created
 
 
-def mask_text(text: str) -> str:
+def mask_text(text: str, *, sender: str = "") -> str:
     """*text* with every finding replaced by ``[GEHEIMNIS:<art>]`` — no store, no audit, nothing kept.
-    For copies that must never hold the value but need no vault offer (input history files)."""
-    findings = _unreleased(text, find_secrets(text), _home())
+    For copies that must never hold the value but need no vault offer (input history files). Values
+    *sender* released stay; without a sender every finding is masked."""
+    findings = _unreleased(text, find_secrets(text), _home(), str(sender or ""))
     if not findings:
         return text
     out, pos = [], 0
@@ -731,7 +758,7 @@ def intake(message: Any, scope: str, *, surface: str = "unbekannt", sender: str 
     return IntakeResult(message, [])
 
 
-def intake_turn_text(text: Any, scope: str, *, surface: str = "steer") -> Any:
+def intake_turn_text(text: Any, scope: str, *, surface: str = "steer", sender: str = "") -> Any:
     """Intake for text folded into a RUNNING turn (``AIAgent.steer`` / ``redirect``): every surface
     (TUI, classic CLI, ACP, API server, gateway) hands its mid-turn text to those verbs, so the
     replacement sits there as the last stage. Keeps a :class:`agent.folded_messages.FoldedText`
@@ -744,9 +771,10 @@ def intake_turn_text(text: Any, scope: str, *, surface: str = "steer") -> Any:
             return text
         from agent.folded_messages import FoldedText, folded_parts
         scope = str(scope or "global")
-        new_text = redact_text(str(text), scope, surface=surface)[0]
+        sender = str(sender or "")
+        new_text = redact_text(str(text), scope, surface=surface, sender=sender)[0]
         parts = folded_parts(text)
-        new_parts = [{**p, "text": redact_text(p["text"], scope, surface=surface)[0]}
+        new_parts = [{**p, "text": redact_text(p["text"], scope, surface=surface, sender=sender)[0]}
                      if isinstance(p.get("text"), str) and p["text"] else p for p in parts]
         if new_text == str(text) and new_parts == parts:
             return text                                   # nothing found: the same object
@@ -818,7 +846,8 @@ def discard(entry_id: str) -> Dict[str, Any]:
 
 
 # -- release („Kein Geheimnis“, WB-1261) ----------------------------------------------------------
-# Exception list: (art, HMAC-SHA256 of the value under a random per-process key) per profile home.
+# Exception list: (sender tag, art, HMAC-SHA256 of the value under a random per-process key) per profile
+# home — a release counts only for the sender who gave it (WB-1261 F6); the sender is kept as an HMAC too.
 # Not reversible without the key, the key never leaves process memory, nothing is persisted —
 # a restart forgets the list (the value would raise a card again, the safe direction).
 _RELEASE_KEY = _secrets.token_bytes(32)
@@ -827,25 +856,32 @@ _RELEASED_MAX = 512
 _RELEASED_LOCK = threading.Lock()
 
 
-def _release_sig(art: str, value: str) -> Tuple[str, str]:
+def _release_sig(sender: str, art: str, value: str) -> Tuple[str, str, str]:
     import hmac
-    return art, hmac.new(_RELEASE_KEY, value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()
+
+    def mac(label: bytes, data: str) -> str:
+        return hmac.new(_RELEASE_KEY, label + b"\0" + data.encode("utf-8", "replace"), hashlib.sha256).hexdigest()
+    return mac(b"sender", sender), art, mac(b"value", value)
 
 
-def _remember_released(art: str, value: str, home: str) -> None:
+def _remember_released(sender: str, art: str, value: str, home: str) -> None:
     from collections import OrderedDict
+    if not sender:
+        return
     with _RELEASED_LOCK:
         bucket = _RELEASED.setdefault(home, OrderedDict())
-        sig = _release_sig(art, value)
+        sig = _release_sig(sender, art, value)
         bucket.pop(sig, None)
         bucket[sig] = None
         while len(bucket) > _RELEASED_MAX:
             bucket.popitem(last=False)
 
 
-def _is_released(art: str, value: str, home: str) -> bool:
+def _is_released(sender: str, art: str, value: str, home: str) -> bool:
+    if not sender:
+        return False
     with _RELEASED_LOCK:
-        return _release_sig(art, value) in (_RELEASED.get(home) or {})
+        return _release_sig(sender, art, value) in (_RELEASED.get(home) or {})
 
 
 def release(entry_id: str, *, actor: Optional[str], scope: Optional[str]) -> Dict[str, Any]:
@@ -869,7 +905,7 @@ def release(entry_id: str, *, actor: Optional[str], scope: Optional[str]) -> Dic
         if not allowed(e):
             return False
         captured["value"] = e.value
-        _remember_released(e.art, e.value or "", e.home)   # before the egress ref is released
+        _remember_released(e.sender, e.art, e.value or "", e.home)   # before the egress ref is released
         return True
 
     done = _STORE.finish(entry_id, "released", check=check)
@@ -885,10 +921,12 @@ def release(entry_id: str, *, actor: Optional[str], scope: Optional[str]) -> Dic
 
 def apply_choice(value: str, *, vault_factory: Optional[Callable[[str], Any]] = None,
                  actor: Optional[str] = None, scope: Optional[str] = None,
-                 on_release: Optional[Callable[[str, str], None]] = None) -> str:
+                 on_release: Optional[Callable[[str, str], None]] = None,
+                 on_refused: Optional[Callable[[str], None]] = None) -> str:
     """Answer of a card / prompt: ``save:<id>[,<id>…]``, ``drop:<id>[,<id>…]`` or ``keep:<id>[,<id>…]``
     („Kein Geheimnis“: *on_release* gets ``(placeholder, original)`` per released entry; *actor* /
-    *scope* identify who tapped on which session's card). Returns the user-facing result text
+    *scope* identify who tapped on which session's card; *on_refused* gets the placeholder of each
+    „Kein Geheimnis“ refused as ``nicht_berechtigt``). Returns the user-facing result text
     (German, no values). Runs without the model."""
     action, _, ids = str(value or "").partition(":")
     lines: List[str] = []
@@ -914,6 +952,8 @@ def apply_choice(value: str, *, vault_factory: Optional[Callable[[str], Any]] = 
                     on_release(res["placeholder"], res["value"])
                 lines.append(f"✅ {ph}: Kein Geheimnis. Der Agent bekommt den Originaltext; nichts gespeichert.")
             elif res.get("reason") == "nicht_berechtigt":
+                if on_refused is not None:
+                    on_refused(ph)
                 lines.append(f"⛔ {ph}: freigeben kann nur, wer die Nachricht geschickt hat.")
             else:
                 lines.append(f"⌛ {ph}: schon abgelaufen oder entschieden.")
@@ -997,5 +1037,5 @@ __all__ = [
     "Finding", "IntakeResult", "PendingSecret", "PLACEHOLDER_RE", "TTL_SECONDS", "apply_choice",
     "card_choices", "card_text", "discard", "enabled", "find_secrets", "intake", "intake_turn_text",
     "offer_candidates",
-    "redact_text", "release", "save", "store", "suggest_name",
+    "redact_text", "release", "save", "store", "suggest_name", "CLI_SENDER", "agent_sender",
 ]

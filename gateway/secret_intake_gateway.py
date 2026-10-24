@@ -134,14 +134,26 @@ async def _answer(chat_id: str, value: str) -> str:
     return await asyncio.to_thread(secret_intake.apply_choice, value)
 
 
+class ToastOnly(str):
+    """Picker answer that must not replace the card: the adapter shows it as a short notice (Telegram:
+    ``query.answer`` toast) and keeps card, buttons and picker state — a stranger's „Kein Geheimnis“
+    tap must not take the sender's card away (WB-1261 F8)."""
+    toast_only = True
+
+
 def _card_answer(adapter: Any, event: Any, session_key: str):
     """Card callback bound to this card's adapter, event and session. ``user_id`` is the tapping user
-    as the adapter reports it; „Kein Geheimnis“ is refused in the core unless it is the sender."""
+    as the adapter reports it; „Kein Geheimnis“ is refused in the core unless it is the sender — that
+    refusal comes back as :class:`ToastOnly` (nothing decided, the card stays for the sender)."""
     async def answer(chat_id: str, value: str, user_id: Optional[str] = None) -> str:
         released: List[tuple] = []
+        refused: List[str] = []
         text = await asyncio.to_thread(
             secret_intake.apply_choice, value, actor=user_id, scope=session_key,
-            on_release=lambda placeholder, original: released.append((placeholder, original)))
+            on_release=lambda placeholder, original: released.append((placeholder, original)),
+            on_refused=refused.append)
+        if refused and not released:
+            return ToastOnly(text)
         if released and not await _inject_released(adapter, event, session_key, released):
             text += "\n⚠️ Die Freigabe konnte nicht in die Sitzung gelegt werden; bitte den Text noch einmal schicken."
         return text

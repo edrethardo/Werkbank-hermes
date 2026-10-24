@@ -270,7 +270,8 @@ class InterruptControlMixin:
         stage every surface (TUI, CLI, ACP, API server, gateway) passes. Idempotent."""
         from agent import secret_intake
         return secret_intake.intake_turn_text(
-            text, str(getattr(self, "session_id", "") or "agent"), surface="steer")
+            text, str(getattr(self, "session_id", "") or "agent"), surface="steer",
+            sender=secret_intake.agent_sender(self))
 
     def steer(self, text: str) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no

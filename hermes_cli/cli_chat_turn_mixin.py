@@ -23,8 +23,9 @@ from agent.i18n import t
 from hermes_cli.cli_agent_setup_mixin import _retire_agent
 
 # WB-1261: the classic CLI's user is the local owner; its intake entries and „Kein Geheimnis“ answers
-# carry this marker so the core's sender check passes only for the CLI's own prompt.
-_CLI_SENDER = "cli-lokal"
+# carry this marker so the core's sender check passes only for the CLI's own prompt (the CLI agent's
+# backstop scans with the same marker: ``secret_intake.agent_sender``).
+from agent.secret_intake import CLI_SENDER as _CLI_SENDER
 
 
 def _restore_released(message, released):

@@ -4432,6 +4432,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.error("Choice picker selection failed: %s", exc)
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
+        if getattr(result_text, "toast_only", False) is True:
+            # WB-1261: refused for this user (a stranger's „Kein Geheimnis“) — a toast only; card,
+            # buttons and picker state stay for the sender's own answer.
+            await query.answer(text=str(result_text)[:190])
+            return
         await self._edit_result_text(query, result_text)
         await query.answer()
         self._choice_picker_state.pop(chat_id, None)

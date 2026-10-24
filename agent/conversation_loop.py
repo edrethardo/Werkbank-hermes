@@ -1780,11 +1780,14 @@ def _secret_intake_backstop(agent, user_message, persist_user_message, title_use
         from agent import secret_intake
         scope = str(getattr(agent, "session_id", "") or "agent")
         surface = str(getattr(agent, "platform", "") or "agent")
-        user_message = secret_intake.intake(user_message, scope, surface=surface).text
+        sender = secret_intake.agent_sender(agent)   # WB-1261: releases count only for this user
+        user_message = secret_intake.intake(user_message, scope, surface=surface, sender=sender).text
         if persist_user_message is not None:
-            persist_user_message = secret_intake.intake(persist_user_message, scope, surface=surface).text
+            persist_user_message = secret_intake.intake(persist_user_message, scope, surface=surface,
+                                                        sender=sender).text
         if isinstance(title_user_message, str):
-            title_user_message = secret_intake.intake(title_user_message, scope, surface=surface).text
+            title_user_message = secret_intake.intake(title_user_message, scope, surface=surface,
+                                                      sender=sender).text
     except Exception:
         logger.warning("secret_intake backstop failed", exc_info=True)
     return user_message, persist_user_message, title_user_message
