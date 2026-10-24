@@ -27,6 +27,13 @@ Contract:
   (gateway → steer/redirect → ``run_conversation`` backstop) scans again.
 * :func:`save` writes a ``secret`` vault item (label suggested from art + key name + placeholder) and
   wipes the in-memory value; :func:`discard` wipes it. Both run without the model (button / CLI prompt).
+* :func:`release` (WB-1261, card answer „Kein Geheimnis“) hands the original value back to the
+  caller (the gateway injects it into the session as a follow-up turn, the CLI puts it back into the
+  turn it is about to stage) and saves nothing. Only the sender of the message (``sender`` given to
+  :func:`intake` / :func:`offer_candidates`), only in the entry's own scope, only while pending
+  (TTL), once. The value's art + a keyed, process-local HMAC land in an exception list so the same
+  value raises no new card (and the follow-up turn is not redacted again); the cleartext is never
+  kept. Audit lines name placeholder/art, never the value or the actor.
 * Switch: ``security.secret_intake`` (default on). Off → :func:`intake` returns the text unchanged.
 
 Detection reuses the provider-prefix catalogue of ``agent/redact.py`` and adds a narrow set of
@@ -248,12 +255,36 @@ def _value_is_code_or_placeholder(value: str, after: str) -> bool:
     return _is_path(value) or _is_filename(value) or _is_env_name(value) or _is_snake_identifier(value)
 
 
+# A name part of a file reference (WB-1261): a word in any case (``folio``, ``PDF``, ``DE``), a number,
+# a lower-case hex id (``doc_3f9a1c2b7d4e``), a short letter prefix + number (``DE0000…``, ``ABC123``,
+# ``v2``) or a number + short unit (``24h``). A segment mixing upper, lower AND digits is never one.
+_FILE_NAME_PART_RE = re.compile(
+    r"[A-Za-z]+|[0-9]+|[0-9a-f]{4,32}|[A-Z]{1,4}[0-9]+|[a-z]{1,10}[0-9]+|[0-9]+[a-z]{1,3}")
+
+
+def _is_file_reference(value: str) -> bool:
+    """``/home/u/.hermes/cache/documents/doc_3f9a1c2b7d4e_bip_folio_mobile_20261024_0000001.PDF``
+    or the file name alone: the last ``/`` segment carries a real extension (any case) and every name
+    part — split at ``/ _ - . space`` — is a plain word, number, hex id or prefixed number. A pasted
+    key used as a file name (``/tmp/<key>.txt``) keeps its mixed-case segment and stays a key."""
+    head, _, last = value.rstrip(".").rpartition("/")   # sentence dot after the path (``saved at: ….PDF.``)
+    m = _FILENAME_RE.fullmatch(last)
+    if not m or m.group("ext").lower() not in _FILE_EXTENSIONS:
+        return False
+    parts = [p for p in re.split(r"[/_.\- ]", head + "/" + m.group("stem")) if p]
+    return bool(parts) and all(_FILE_NAME_PART_RE.fullmatch(p) for p in parts)
+
+
 def _bare_key_is_secret(value: str) -> bool:
     """A long pasted key alone: ≥ 40 chars, lower + upper + digit, high entropy, no path or URL shape,
     not mostly words. Commit SHAs, hex hashes and UUIDs never pass: hex carries at most 4.0 bits/char
-    (UUID with dashes ≈ 4.1), below ``_BARE_MIN_ENTROPY``, and lacks mixed case."""
+    (UUID with dashes ≈ 4.1), below ``_BARE_MIN_ENTROPY``, and lacks mixed case. A file reference
+    (cache path of an uploaded document, a file name with a real extension and plain name parts) is
+    not a key either (WB-1261: an upload ``….PDF`` was offered as ``api-key``)."""
     if value.startswith(("//", "~", "./", "../")) or ("/" in value and _is_path(value)):
         return False                                  # path / URL-ish
+    if _is_file_reference(value):
+        return False                                  # document cache path / file name
     if re.match(r"(?i)(?:sha|md)[0-9]{1,3}[-:]", value):
         return False                                  # SRI ``sha384-…`` / digest ``sha256:…``
     lower, upper, digit, _ = _char_classes(value)
@@ -437,8 +468,9 @@ class PendingSecret:
     expires: float
     value: Optional[str] = field(default=None, repr=False)
     offered: bool = False
-    status: str = "pending"          # pending | saved | discarded | expired
+    status: str = "pending"          # pending | saved | discarded | released | expired
     handle: Optional[str] = None
+    sender: str = field(default="", repr=False)   # user id of the message's sender (release check)
 
     def label(self) -> str:
         return suggest_name(self)
@@ -495,7 +527,7 @@ class _Store:
             self._arm_timer()
 
     def placeholder_for(self, scope: str, art: str, value: str, *, hint: str, surface: str,
-                        home: str) -> Tuple[PendingSecret, bool]:
+                        home: str, sender: str = "") -> Tuple[PendingSecret, bool]:
         now = time.time()
         entry, is_new = None, False
         with self._lock:
@@ -504,13 +536,16 @@ class _Store:
                 if e.scope == scope and e.status == "pending" and e.value == value:
                     entry = e
                     break
+            if entry is not None and sender and not entry.sender:
+                entry.sender = sender
             if entry is None:
                 retired += self._purge_locked(now, reserve=1)   # bound: retire the oldest open entry
                 n = self._counters.get((scope, art), 0) + 1
                 self._counters[(scope, art)] = n
                 entry = PendingSecret(
                     id=_secrets.token_hex(6), scope=scope, art=art, placeholder=f"[GEHEIMNIS:{art}-{n}]",
-                    hint=hint, surface=surface, home=home, created=now, expires=now + TTL_SECONDS, value=value)
+                    hint=hint, surface=surface, home=home, created=now, expires=now + TTL_SECONDS, value=value,
+                    sender=sender)
                 self._by_id[entry.id] = entry
                 _register_egress(value, home)   # under the lock: retire/expiry can't release it first
                 is_new = True
@@ -526,19 +561,24 @@ class _Store:
         with self._lock:
             return self._by_id.get(entry_id)
 
-    def take_unoffered(self, scope: str, text: str) -> List[PendingSecret]:
+    def take_unoffered(self, scope: str, text: str, sender: str = "") -> List[PendingSecret]:
         self.purge()
         with self._lock:
             out = [e for e in self._by_id.values()
                    if e.scope == scope and e.status == "pending" and not e.offered and e.placeholder in text]
             for e in out:
                 e.offered = True
+                if sender and not e.sender:
+                    e.sender = sender            # pre-redacted (Werkbank plugin): the card's event names it
         return sorted(out, key=lambda e: text.find(e.placeholder))
 
-    def finish(self, entry_id: str, status: str, handle: Optional[str] = None) -> Optional[PendingSecret]:
+    def finish(self, entry_id: str, status: str, handle: Optional[str] = None,
+               check: Optional[Callable[[PendingSecret], bool]] = None) -> Optional[PendingSecret]:
         with self._lock:
             e = self._by_id.get(entry_id)
-            if e is None or e.status != "pending":
+            if e is None or e.status != "pending" or e.expires <= time.time():
+                return None
+            if check is not None and not check(e):
                 return None
             if status == "saved":
                 _register_durable_egress(e.value, e.home)   # saved: scrubbed for the profile's lifetime
@@ -612,19 +652,31 @@ def _home() -> str:
         return ""
 
 
-def redact_text(text: str, scope: str, *, surface: str = "unbekannt") -> Tuple[str, List[PendingSecret]]:
+def _unreleased(text: str, findings: List[Finding], home: str) -> List[Finding]:
+    """*findings* minus the values the user released as „Kein Geheimnis“ (same art, same value)."""
+    if not findings or not _RELEASED.get(home):
+        return findings
+    return [f for f in findings if not _is_released(f.art, text[f.start:f.end], home)]
+
+
+def redact_text(text: str, scope: str, *, surface: str = "unbekannt",
+                sender: str = "") -> Tuple[str, List[PendingSecret]]:
     """Replace every finding in *text*; returns ``(text, entries created now)``. *text* object is
     returned unchanged when nothing was found."""
     findings = find_secrets(text)
     if not findings:
         return text, []
     home = _home()
+    findings = _unreleased(text, findings, home)
+    if not findings:
+        return text, []
     out: List[str] = []
     pos = 0
     created: List[PendingSecret] = []
     for f in findings:
         value = text[f.start:f.end]
-        entry, is_new = _STORE.placeholder_for(scope, f.art, value, hint=f.hint, surface=surface, home=home)
+        entry, is_new = _STORE.placeholder_for(scope, f.art, value, hint=f.hint, surface=surface, home=home,
+                                               sender=sender)
         if is_new:
             created.append(entry)
             _audit("erkannt", entry)
@@ -638,7 +690,7 @@ def redact_text(text: str, scope: str, *, surface: str = "unbekannt") -> Tuple[s
 def mask_text(text: str) -> str:
     """*text* with every finding replaced by ``[GEHEIMNIS:<art>]`` — no store, no audit, nothing kept.
     For copies that must never hold the value but need no vault offer (input history files)."""
-    findings = find_secrets(text)
+    findings = _unreleased(text, find_secrets(text), _home())
     if not findings:
         return text
     out, pos = [], 0
@@ -650,14 +702,14 @@ def mask_text(text: str) -> str:
     return "".join(out)
 
 
-def intake(message: Any, scope: str, *, surface: str = "unbekannt") -> IntakeResult:
+def intake(message: Any, scope: str, *, surface: str = "unbekannt", sender: str = "") -> IntakeResult:
     """Redact a user message (str, or a multimodal content list whose ``text`` parts are redacted).
     Returns the message unchanged (same object) when the switch is off or nothing was found."""
     if not enabled():
         return IntakeResult(message, [])
     scope = str(scope or "global")
     if isinstance(message, str):
-        new_text, created = redact_text(message, scope, surface=surface)
+        new_text, created = redact_text(message, scope, surface=surface, sender=sender)
         res = IntakeResult(new_text, created)
         res._replaced = new_text is not message
         return res
@@ -667,7 +719,7 @@ def intake(message: Any, scope: str, *, surface: str = "unbekannt") -> IntakeRes
         parts = []
         for part in message:
             if isinstance(part, dict) and isinstance(part.get("text"), str):
-                new_text, created = redact_text(part["text"], scope, surface=surface)
+                new_text, created = redact_text(part["text"], scope, surface=surface, sender=sender)
                 if new_text is not part["text"]:
                     part = {**part, "text": new_text}
                     changed = True
@@ -704,14 +756,15 @@ def intake_turn_text(text: Any, scope: str, *, surface: str = "steer") -> Any:
         return text
 
 
-def offer_candidates(scope: str, text: Any) -> List[PendingSecret]:
+def offer_candidates(scope: str, text: Any, *, sender: str = "") -> List[PendingSecret]:
     """Pending entries of *scope* named in *text* that have not been offered to the user yet; marks
-    them offered. A Werkbank message redacted in the plugin gets its card from the gateway this way."""
+    them offered. A Werkbank message redacted in the plugin gets its card from the gateway this way;
+    *sender* (the card event's user) fills an entry that was created without one."""
     if isinstance(text, list):
         text = "\n".join(str(p.get("text") or "") for p in text if isinstance(p, dict))
     if not isinstance(text, str) or "[GEHEIMNIS:" not in text:
         return []
-    return _STORE.take_unoffered(str(scope or "global"), text)
+    return _STORE.take_unoffered(str(scope or "global"), text, str(sender or ""))
 
 
 _ART_NAMES = {
@@ -764,9 +817,79 @@ def discard(entry_id: str) -> Dict[str, Any]:
     return {"ok": True, "placeholder": done.placeholder}
 
 
-def apply_choice(value: str, *, vault_factory: Optional[Callable[[str], Any]] = None) -> str:
-    """Answer of a card / prompt: ``save:<id>[,<id>…]`` or ``drop:<id>[,<id>…]``. Returns the
-    user-facing result text (German, no values). Runs without the model."""
+# -- release („Kein Geheimnis“, WB-1261) ----------------------------------------------------------
+# Exception list: (art, HMAC-SHA256 of the value under a random per-process key) per profile home.
+# Not reversible without the key, the key never leaves process memory, nothing is persisted —
+# a restart forgets the list (the value would raise a card again, the safe direction).
+_RELEASE_KEY = _secrets.token_bytes(32)
+_RELEASED: Dict[str, "OrderedDict[Tuple[str, str], None]"] = {}
+_RELEASED_MAX = 512
+_RELEASED_LOCK = threading.Lock()
+
+
+def _release_sig(art: str, value: str) -> Tuple[str, str]:
+    import hmac
+    return art, hmac.new(_RELEASE_KEY, value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()
+
+
+def _remember_released(art: str, value: str, home: str) -> None:
+    from collections import OrderedDict
+    with _RELEASED_LOCK:
+        bucket = _RELEASED.setdefault(home, OrderedDict())
+        sig = _release_sig(art, value)
+        bucket.pop(sig, None)
+        bucket[sig] = None
+        while len(bucket) > _RELEASED_MAX:
+            bucket.popitem(last=False)
+
+
+def _is_released(art: str, value: str, home: str) -> bool:
+    with _RELEASED_LOCK:
+        return _release_sig(art, value) in (_RELEASED.get(home) or {})
+
+
+def release(entry_id: str, *, actor: Optional[str], scope: Optional[str]) -> Dict[str, Any]:
+    """„Kein Geheimnis“: hand the pending value back for the agent and save nothing. Allowed only for
+    the message's sender (*actor* must equal the entry's ``sender``; unknown on either side → refused),
+    only in the entry's own *scope* (session of the card), only while pending and within the TTL, once.
+    Returns ``{"ok": True, "placeholder", "art", "value"}`` — the value is for the agent only, never log
+    it — or ``{"ok": False, "reason": "abgelaufen" | "nicht_berechtigt", "placeholder"}``. A refusal
+    consumes nothing: the entry stays open for the sender's own answer."""
+    entry = _STORE.get(entry_id)
+    if entry is None or entry.status != "pending" or entry.value is None:
+        return {"ok": False, "reason": "abgelaufen", "placeholder": getattr(entry, "placeholder", None)}
+    actor = str(actor or "")
+
+    def allowed(e: PendingSecret) -> bool:
+        return bool(actor) and bool(e.sender) and actor == e.sender and str(scope or "") == e.scope
+
+    captured: Dict[str, Any] = {}
+
+    def check(e: PendingSecret) -> bool:
+        if not allowed(e):
+            return False
+        captured["value"] = e.value
+        _remember_released(e.art, e.value or "", e.home)   # before the egress ref is released
+        return True
+
+    done = _STORE.finish(entry_id, "released", check=check)
+    if done is None:
+        fresh = _STORE.get(entry_id)
+        if fresh is not None and fresh.status == "pending" and not allowed(fresh):
+            _audit("freigabe_abgewiesen", fresh)
+            return {"ok": False, "reason": "nicht_berechtigt", "placeholder": fresh.placeholder}
+        return {"ok": False, "reason": "abgelaufen", "placeholder": entry.placeholder}
+    _audit("freigegeben", done)
+    return {"ok": True, "placeholder": done.placeholder, "art": done.art, "value": captured.get("value")}
+
+
+def apply_choice(value: str, *, vault_factory: Optional[Callable[[str], Any]] = None,
+                 actor: Optional[str] = None, scope: Optional[str] = None,
+                 on_release: Optional[Callable[[str, str], None]] = None) -> str:
+    """Answer of a card / prompt: ``save:<id>[,<id>…]``, ``drop:<id>[,<id>…]`` or ``keep:<id>[,<id>…]``
+    („Kein Geheimnis“: *on_release* gets ``(placeholder, original)`` per released entry; *actor* /
+    *scope* identify who tapped on which session's card). Returns the user-facing result text
+    (German, no values). Runs without the model."""
     action, _, ids = str(value or "").partition(":")
     lines: List[str] = []
     for entry_id in [i for i in ids.split(",") if i]:
@@ -783,6 +906,17 @@ def apply_choice(value: str, *, vault_factory: Optional[Callable[[str], Any]] = 
             res = discard(entry_id)
             lines.append(f"🗑 {res.get('placeholder') or 'Geheimnis'} verworfen."
                          if res.get("ok") else f"⌛ {res.get('placeholder') or 'Geheimnis'}: schon abgelaufen oder entschieden.")
+        elif action == "keep":
+            res = release(entry_id, actor=actor, scope=scope)
+            ph = res.get("placeholder") or "Geheimnis"
+            if res.get("ok"):
+                if on_release is not None:
+                    on_release(res["placeholder"], res["value"])
+                lines.append(f"✅ {ph}: Kein Geheimnis. Der Agent bekommt den Originaltext; nichts gespeichert.")
+            elif res.get("reason") == "nicht_berechtigt":
+                lines.append(f"⛔ {ph}: freigeben kann nur, wer die Nachricht geschickt hat.")
+            else:
+                lines.append(f"⌛ {ph}: schon abgelaufen oder entschieden.")
     return "\n".join(lines) or "Nichts zu tun."
 
 
@@ -797,10 +931,15 @@ def card_text(entries: List[PendingSecret]) -> str:
     return "\n".join([head, *rows, tail])
 
 
-def card_choices(entries: List[PendingSecret]) -> List[Dict[str, str]]:
+def card_choices(entries: List[PendingSecret], *, release: bool = True) -> List[Dict[str, str]]:
+    """Card buttons. *release* adds „Kein Geheimnis“ — only where the surface reports who tapped
+    (the sender check could never pass otherwise)."""
     ids = ",".join(e.id for e in entries)
-    return [{"value": f"save:{ids}", "label": "💾 Im Tresor speichern"},
-            {"value": f"drop:{ids}", "label": "🗑 Verwerfen"}]
+    out = [{"value": f"save:{ids}", "label": "💾 Im Tresor speichern"},
+           {"value": f"drop:{ids}", "label": "🗑 Verwerfen"}]
+    if release:
+        out.append({"value": f"keep:{ids}", "label": "✅ Kein Geheimnis"})
+    return out
 
 
 def _release_egress(value: Optional[str], home: str) -> None:
@@ -858,5 +997,5 @@ __all__ = [
     "Finding", "IntakeResult", "PendingSecret", "PLACEHOLDER_RE", "TTL_SECONDS", "apply_choice",
     "card_choices", "card_text", "discard", "enabled", "find_secrets", "intake", "intake_turn_text",
     "offer_candidates",
-    "redact_text", "save", "store", "suggest_name",
+    "redact_text", "release", "save", "store", "suggest_name",
 ]

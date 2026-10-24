@@ -22,6 +22,24 @@ from agent.i18n import t
 
 from hermes_cli.cli_agent_setup_mixin import _retire_agent
 
+# WB-1261: the classic CLI's user is the local owner; its intake entries and „Kein Geheimnis“ answers
+# carry this marker so the core's sender check passes only for the CLI's own prompt.
+_CLI_SENDER = "cli-lokal"
+
+
+def _restore_released(message, released):
+    """*message* with each released placeholder replaced by its original (str or content parts)."""
+    def put_back(text):
+        for placeholder, original in released:
+            text = text.replace(placeholder, original)
+        return text
+    if isinstance(message, str):
+        return put_back(message)
+    if isinstance(message, list):
+        return [{**p, "text": put_back(p["text"])} if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                for p in message]
+    return message
+
 
 class CLIChatTurnMixin:
     """chat() and its per-turn phase helpers."""
@@ -136,7 +154,7 @@ class CLIChatTurnMixin:
         scope = str(getattr(getattr(self, "agent", None), "session_id", None)
                     or getattr(self, "session_id", None) or "cli")
         try:
-            res = secret_intake.intake(message, scope, surface="cli")
+            res = secret_intake.intake(message, scope, surface="cli", sender=_CLI_SENDER)
         except Exception:
             logging.warning("secret_intake: CLI scan failed", exc_info=True)
             return message
@@ -149,7 +167,8 @@ class CLIChatTurnMixin:
             return res.text
         ids = ",".join(e.id for e in entries)
         choices = [("save", "Im Tresor speichern", "Name wie vorgeschlagen; der Agent sieht nur den Platzhalter"),
-                   ("drop", "Verwerfen", "Wert sofort löschen; der Platzhalter bleibt im Text")]
+                   ("drop", "Verwerfen", "Wert sofort löschen; der Platzhalter bleibt im Text"),
+                   ("keep", "Kein Geheimnis", "Der Agent bekommt den Originaltext; nichts wird gespeichert")]
         try:
             raw = self._prompt_text_input_modal(title="Geheimnis erkannt", detail=detail, choices=choices)
             choice = self._normalize_slash_confirm_choice(raw, choices)
@@ -158,6 +177,12 @@ class CLIChatTurnMixin:
             choice = None
         if choice in ("save", "drop"):
             print(secret_intake.apply_choice(f"{choice}:{ids}"))
+        elif choice == "keep":
+            # WB-1261: the turn is not staged yet — the original goes back into it, nothing is saved.
+            released = []
+            print(secret_intake.apply_choice(f"keep:{ids}", actor=_CLI_SENDER, scope=scope,
+                                             on_release=lambda ph, val: released.append((ph, val))))
+            return _restore_released(res.text, released)
         else:
             print(f"Keine Entscheidung: der Wert wird in {int(secret_intake.TTL_SECONDS // 60)} Minuten verworfen.")
         return res.text

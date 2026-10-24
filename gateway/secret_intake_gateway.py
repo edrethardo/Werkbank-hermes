@@ -11,6 +11,11 @@ The suggestion card goes out through the adapter's existing button path (``send_
 Telegram inline keyboard with its own callback authorization); the tap is answered by
 ``secret_intake.apply_choice`` in a worker thread, never by the model. Adapters without buttons get
 a text notice instead (no value, and the value expires after the TTL).
+
+WB-1261: adapters whose picker reports the tapping user (``choice_picker_reports_user = True``,
+Telegram) get a third button „Kein Geheimnis“. Only the sender of the message may use it (the card's
+event names them); the original then reaches the agent as an internal follow-up turn in the same
+session („Freigegeben: …“, queued behind a running turn like every internal event) — nothing is saved.
 """
 
 from __future__ import annotations
@@ -39,13 +44,15 @@ def intake_inbound_event(adapter: Any, event: Any, session_key: str, *, surface:
         if not secret_intake.enabled():
             return 0
         where = surface or _surface_of(event)
+        sender = _sender_of(event)
         for attr in ("text", "reply_to_text"):
             value = getattr(event, attr, None)
             if isinstance(value, str) and value:
-                res = secret_intake.intake(value, session_key, surface=where)
+                res = secret_intake.intake(value, session_key, surface=where,
+                                           sender=sender if attr == "text" else "")
                 if res.text is not value:
                     setattr(event, attr, res.text)
-        entries = secret_intake.offer_candidates(session_key, getattr(event, "text", "") or "")
+        entries = secret_intake.offer_candidates(session_key, getattr(event, "text", "") or "", sender=sender)
     except Exception:
         logger.warning("secret_intake: inbound scan failed", exc_info=True)
         return 0
@@ -77,8 +84,9 @@ def intake_prepared_text(adapter: Any, event: Any, session_key: str, text: Any) 
     try:
         if not secret_intake.enabled():
             return text
-        text = secret_intake.intake(text, session_key, surface="gateway-prepared").text
-        entries = secret_intake.offer_candidates(session_key, text)
+        sender = _sender_of(event)
+        text = secret_intake.intake(text, session_key, surface="gateway-prepared", sender=sender).text
+        entries = secret_intake.offer_candidates(session_key, text, sender=sender)
     except Exception:
         logger.warning("secret_intake: prepared-text scan failed (text passes unchanged)", exc_info=False)
         return text
@@ -102,6 +110,11 @@ def redact_platform_event(event: Any, session_key: str) -> Any:
     return {**event, "payload": {**payload, "text": new_text}}
 
 
+def _sender_of(event: Any) -> str:
+    """User id of the event's sender (the only one who may release its secrets); "" when unknown."""
+    return str(getattr(getattr(event, "source", None), "user_id", None) or "")
+
+
 def _surface_of(event: Any) -> str:
     platform = getattr(getattr(event, "source", None), "platform", None)
     return str(getattr(platform, "value", platform) or "gateway")
@@ -121,6 +134,48 @@ async def _answer(chat_id: str, value: str) -> str:
     return await asyncio.to_thread(secret_intake.apply_choice, value)
 
 
+def _card_answer(adapter: Any, event: Any, session_key: str):
+    """Card callback bound to this card's adapter, event and session. ``user_id`` is the tapping user
+    as the adapter reports it; „Kein Geheimnis“ is refused in the core unless it is the sender."""
+    async def answer(chat_id: str, value: str, user_id: Optional[str] = None) -> str:
+        released: List[tuple] = []
+        text = await asyncio.to_thread(
+            secret_intake.apply_choice, value, actor=user_id, scope=session_key,
+            on_release=lambda placeholder, original: released.append((placeholder, original)))
+        if released and not await _inject_released(adapter, event, session_key, released):
+            text += "\n⚠️ Die Freigabe konnte nicht in die Sitzung gelegt werden; bitte den Text noch einmal schicken."
+        return text
+    return answer
+
+
+def released_turn_text(released: List[tuple]) -> str:
+    """Follow-up turn for the agent: which placeholder stands for which original text."""
+    rows = [f"{placeholder} = {original}" for placeholder, original in released]
+    return ("Freigegeben: Der Nutzer hat bestätigt, dass das kein Geheimnis ist. "
+            "Der Platzhalter in seiner Nachricht steht für diesen Originaltext:\n" + "\n".join(rows))
+
+
+async def _inject_released(adapter: Any, event: Any, session_key: str, released: List[tuple]) -> bool:
+    """Inject the released originals as an internal turn into the card's session (an internal event
+    skips the intake; the core's exception list keeps the run_conversation backstop quiet too)."""
+    try:
+        from gateway.platforms.event import MessageEvent, MessageType
+        from gateway.session_identity import replace_source
+        from gateway import wake
+        source = getattr(event, "source", None)
+        if source is None:
+            return False
+        if getattr(source, "message_id", None):
+            source = replace_source(source, message_id=None)
+        synth = MessageEvent(text=released_turn_text(released), message_type=MessageType.TEXT, source=source,
+                             internal=True, metadata={"gateway_session_key": session_key})
+        await wake.admit_internal_event(adapter, synth)
+        return True
+    except Exception as exc:   # never the exception text: it may carry the payload
+        logger.warning("secret_intake: release not injected (%s)", type(exc).__name__)
+        return False
+
+
 async def send_card(adapter: Any, event: Any, session_key: str, entries: List[Any]) -> bool:
     """Post the "Im Tresor speichern / Verwerfen" card; text notice when the adapter has no buttons."""
     source = getattr(event, "source", None)
@@ -133,8 +188,9 @@ async def send_card(adapter: Any, event: Any, session_key: str, entries: List[An
     picker = getattr(adapter, "send_choice_picker", None)
     if callable(picker):
         try:
-            result = await picker(chat_id, title, secret_intake.card_choices(entries), session_key, _answer,
-                                  metadata=metadata)
+            reports_user = getattr(adapter, "choice_picker_reports_user", False) is True
+            result = await picker(chat_id, title, secret_intake.card_choices(entries, release=reports_user),
+                                  session_key, _card_answer(adapter, event, session_key), metadata=metadata)
             if getattr(result, "success", True) is not False:
                 return True
         except Exception:

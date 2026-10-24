@@ -84,3 +84,21 @@ def test_cli_no_secret_no_prompt():
     cli = _cli("save")
     text = "nur Text"
     assert CLIChatTurnMixin._chat_secret_intake(cli, text) is text and cli.asked == []
+
+
+# -- WB-1261: „Kein Geheimnis“ in the CLI modal ---------------------------------------------------
+
+FAKE_BARE = "Zq8" + "FAKEk2Lm9Xp4Rt7Wv1Bn6Hj3Cs5Df8Gy0Qa4Ne"
+
+
+def test_cli_keep_gives_the_original_text_to_this_turn(capsys):
+    si._RELEASED.clear()
+    cli = _cli("keep")
+    text = f"nimm {FAKE_BARE} bitte"
+    out = CLIChatTurnMixin._chat_secret_intake(cli, text)
+    assert out == text
+    assert [c[0] for c in cli.asked[0]["choices"]] == ["save", "drop", "keep"]
+    printed = capsys.readouterr().out
+    assert "Kein Geheimnis" in printed and FAKE_BARE not in printed
+    assert all(e.status == "released" and e.value is None for e in si.store()._by_id.values())
+    si._RELEASED.clear()

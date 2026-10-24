@@ -260,3 +260,94 @@ async def test_telegram_picker_tap_on_an_old_card_does_not_apply_the_new_one():
     new = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(message_id=200))
     await a._handle_choice_picker_callback(new, "cp:0", "4711")
     assert calls == ["save:new"]
+
+
+# -- WB-1261: third button „Kein Geheimnis“ ------------------------------------------------------
+
+FAKE_BARE = "Zq8" + "FAKEk2Lm9Xp4Rt7Wv1Bn6Hj3Cs5Df8Gy0Qa4Ne"
+
+
+class ReleaseAdapter(PickerAdapter):
+    """An adapter whose picker reports who tapped (Telegram passes ``user_id``)."""
+    choice_picker_reports_user = True
+
+
+async def _card_for(adapter, text):
+    si._RELEASED.clear()
+    await _run(adapter, _event(text))
+    assert len(adapter.pickers) == 1
+    card = adapter.pickers[0]
+    return card, next((c["value"] for c in card["choices"] if c["value"].startswith("keep:")), None)
+
+
+async def _drain():
+    for _ in range(30):
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_kein_geheimnis_injects_the_original_into_the_session_and_saves_nothing(monkeypatch):
+    from hermes_constants import get_hermes_home
+    adapter = ReleaseAdapter()
+    card, keep = await _card_for(adapter, f"nimm {FAKE_BARE} bitte")
+    assert keep and any("Kein Geheimnis" in c["label"] for c in card["choices"])
+    admitted = []
+
+    async def fake_admit(ad, ev):
+        admitted.append((ad, ev))
+    monkeypatch.setattr("gateway.wake.admit_internal_event", fake_admit)
+    result = await card["cb"]("4711", keep, user_id="42")
+    await _drain()
+    assert "Kein Geheimnis" in result and FAKE_BARE not in result
+    assert len(admitted) == 1
+    ad, ev = admitted[0]
+    assert ad is adapter and ev.internal is True
+    assert "Freigegeben" in ev.text and "[GEHEIMNIS:api-key-1]" in ev.text and FAKE_BARE in ev.text
+    assert ev.source.chat_id == "4711" and ev.source.user_id == "42"
+    assert (ev.metadata or {}).get("gateway_session_key") == card["session_key"]
+    assert not (get_hermes_home() / "vault").exists() or VaultStore(get_hermes_home() / "vault").list_items() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", ["99", None])
+async def test_kein_geheimnis_from_a_stranger_is_refused(monkeypatch, user_id):
+    adapter = ReleaseAdapter()
+    card, keep = await _card_for(adapter, f"nimm {FAKE_BARE} bitte")
+    admitted = []
+
+    async def fake_admit(ad, ev):
+        admitted.append(ev)
+    monkeypatch.setattr("gateway.wake.admit_internal_event", fake_admit)
+    result = await card["cb"]("4711", keep, user_id=user_id)
+    await _drain()
+    assert admitted == [] and FAKE_BARE not in result and "⛔" in result
+    assert [e.status for e in si.store()._by_id.values()] == ["pending"]
+
+
+@pytest.mark.asyncio
+async def test_picker_without_user_report_offers_no_third_button():
+    adapter = PickerAdapter()
+    card, keep = await _card_for(adapter, f"nimm {FAKE_BARE} bitte")
+    assert keep is None and len(card["choices"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_telegram_picker_passes_the_tapping_user_to_a_card_callback():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    assert TelegramAdapter.choice_picker_reports_user is True
+    a = object.__new__(TelegramAdapter)
+    calls = []
+
+    async def cb(chat_id, value, user_id=None):
+        calls.append((value, user_id))
+        return "ok"
+
+    a._choice_picker_state = {"4711": {"msg_id": 200, "choices": [{"value": "keep:x"}],
+                                       "session_key": "k", "on_choice_selected": cb}}
+    a._edit_result_text = AsyncMock()
+    q = SimpleNamespace(answer=AsyncMock(), message=SimpleNamespace(message_id=200),
+                        from_user=SimpleNamespace(id=42))
+    await a._handle_choice_picker_callback(q, "cp:0", "4711")
+    assert calls == [("keep:x", "42")]

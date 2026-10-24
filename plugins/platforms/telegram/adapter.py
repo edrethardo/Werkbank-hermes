@@ -511,6 +511,16 @@ class _PollingStallError(RuntimeError):
     """
 
 
+def _accepts_user_id(callback) -> bool:
+    """True when a choice-picker callback takes ``user_id`` (WB-1261); older callbacks get two args."""
+    import inspect
+    try:
+        params = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "user_id" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
 class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -4355,6 +4365,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     _PROVIDER_PAGE_SIZE = 10
 
+    # WB-1261: ``_handle_choice_picker_callback`` hands the tapping user's id to a callback that takes
+    # ``user_id`` — the secret card offers „Kein Geheimnis“ only where the sender can be checked.
+    choice_picker_reports_user = True
+
     async def send_choice_picker(
         self, chat_id: str, title: str, choices: list, session_key: str, on_choice_selected,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -4409,7 +4423,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             await query.answer(text=_toast("platform.telegram.picker.expired"))
             return
         try:
-            result_text = await callback(chat_id, str(choice.get("value") or ""))
+            value = str(choice.get("value") or "")
+            if _accepts_user_id(callback):  # WB-1261: the secret card's „Kein Geheimnis“ checks the sender
+                user_id = str(getattr(getattr(query, "from_user", None), "id", "") or "") or None
+                result_text = await callback(chat_id, value, user_id=user_id)
+            else:
+                result_text = await callback(chat_id, value)
         except Exception as exc:
             logger.error("Choice picker selection failed: %s", exc)
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
