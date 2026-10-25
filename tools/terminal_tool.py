@@ -1647,7 +1647,7 @@ def _handle_terminal(args, **kw):
             )
     if heartbeat:
         notify_on_complete = True  # the heartbeat rides the completion delivery path
-    return terminal_tool(
+    call: Dict[str, Any] = dict(  # fork: approval-retry (WB-1301)
         command=args.get("command"),
         background=args.get("background", False),
         timeout=args.get("timeout"),
@@ -1660,6 +1660,16 @@ def _handle_terminal(args, **kw):
         heartbeat=heartbeat,
         persist_on_release=persist_on_release,
     )
+    if not isinstance(call["command"], str):  # fork: approval-retry
+        return terminal_tool(**call)  # fork: approval-retry
+    # fork: approval-retry — should this command's approval expire, the card can re-run exactly this
+    # fork: approval-retry — call (same task env, same cwd) once; see tools/approval_retry.py.
+    from tools import approval_retry  # fork: approval-retry
+    cwd = call["workdir"] or get_session_cwd(_current_session_key() or None)  # fork: approval-retry
+    rerun_call = {**call, "workdir": cwd}  # fork: approval-retry
+    with approval_retry.retry_target("terminal", call["command"], lambda: terminal_tool(**rerun_call),  # fork: approval-retry
+                                     cwd=cwd, task_id=call["task_id"]):  # fork: approval-retry
+        return terminal_tool(**call)  # fork: approval-retry
 
 
 registry.register(

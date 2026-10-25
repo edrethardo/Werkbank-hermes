@@ -47,19 +47,50 @@ def register_timeout_notice(
         still_current = getattr(runner._ctx, "_run_still_current", None)
         if callable(still_current) and not still_current():
             return
+        # fork: approval-retry (WB-1301) — runs on the agent thread that waited, so the tool's
+        # fork: approval-retry — retry target is visible; None for never-approvable / untargeted gates.
+        can_show = callable(getattr(getattr(runner._ctx, "_status_adapter", None), "show_approval_retry_card", None))  # fork: approval-retry
+        retry_token = (_retry_offer(runner._ctx, session_key, approval_data)  # fork: approval-retry
+                       if card_message_id and can_show else None)  # fork: approval-retry
         runner._schedule(
-            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s),
+            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s, retry_token=retry_token),
             "Approval timeout notice scheduling error")
 
     register_gateway_settle(session_key, request_id, settle)
 
 
-async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str], timeout_s: int) -> None:
+def _retry_offer(ctx, session_key: str, approval_data: dict) -> Optional[str]:  # fork: approval-retry
+    """Offer a one-shot re-run for the expired request (``tools.approval_retry``)."""  # fork: approval-retry
+    try:  # fork: approval-retry
+        from tools import approval_retry  # fork: approval-retry
+        return approval_retry.offer_for_timeout(  # fork: approval-retry
+            session_key, approval_data, source=getattr(ctx, "source", None),  # fork: approval-retry
+            session_id=getattr(ctx, "session_id", None))  # fork: approval-retry
+    except Exception:  # fork: approval-retry
+        logger.debug("Approval retry offer failed", exc_info=True)  # fork: approval-retry
+        return None  # fork: approval-retry
+
+
+async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str], timeout_s: int,
+                               retry_token: Optional[str] = None) -> None:  # fork: approval-retry
     from gateway.run import _interim_metadata
 
     adapter = ctx._status_adapter
     notice = format_approval_timed_out_notice(timeout_s)
     metadata = _interim_metadata(ctx._status_thread_metadata)
+    if retry_token:  # fork: approval-retry — the card itself gets "🔁 Nochmal ausführen" + "Verwerfen"
+        show = getattr(adapter, "show_approval_retry_card", None)  # fork: approval-retry
+        shown = False  # fork: approval-retry
+        if callable(show):  # fork: approval-retry
+            try:  # fork: approval-retry
+                shown = bool(await show(ctx._status_chat_id, card_message_id, retry_token,  # fork: approval-retry
+                                        notice=notice, command=command))  # fork: approval-retry
+            except Exception:  # fork: approval-retry
+                logger.debug("Approval retry card failed; plain timeout notice instead", exc_info=True)  # fork: approval-retry
+        if shown:  # fork: approval-retry
+            return  # fork: approval-retry
+        from tools import approval_retry  # fork: approval-retry
+        approval_retry.discard(retry_token)  # fork: approval-retry — no card, no way to press it
     try:
         # Plain markdown, not the card's platform markup: ``edit_message`` re-formats it itself.
         if card_message_id and await _edit_card(

@@ -44,7 +44,8 @@ Event types: ``user.message`` (delivery turn|nachgeschoben|eingereiht, client_me
 ``injected_by`` = the injecting plugin's id for a plugin injection),
 ``turn.start``, ``text.delta``, ``text.interim``, ``tool.start``, ``tool.progress``, ``tool.end``
 (output capped to 4 KB, ``truncated``), ``subagent.start|progress|end``, ``status``,
-``approval.request|resolved|expired|cancelled``, ``clarify.request|resolved|expired``,
+``approval.request|resolved|expired|cancelled``, ``approval.retried`` (an expired request re-run from
+its card: ``tool``, ``delivered_to``, ``exit_code`` — fork: approval-retry), ``clarify.request|resolved|expired``,
 ``turn.done``, ``turn.stopped``, ``error`` and ``overflow``. Texts live only in memory here; this
 module never logs them.
 """

@@ -231,6 +231,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             # cannot answer) is ``session_closed``; never the raw poll-state token "set".
             if state == "set":
                 reason = "resolved" if choice is not None else "session_closed"
+            elif state == "timeout" and choice is not None:  # fork: approval-retry (WB-1301)
+                # fork: approval-retry — an answer that landed in the deadline gap is honoured as an answer
+                # fork: approval-retry — (see below), so the surface must not paint it as a timeout either.
+                reason = "resolved"  # fork: approval-retry
             else:
                 reason = state
             try:

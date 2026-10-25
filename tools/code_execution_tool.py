@@ -961,8 +961,16 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
     if code is not None and not isinstance(code, str):
         return tool_error(f"execute_code received a {type(code).__name__} in 'code', but it "
                           "requires Python source as a string. Retry as execute_code(code=\"...\").")
-    return execute_code(code=code or "", task_id=kwargs.get("task_id"),
-                        enabled_tools=kwargs.get("enabled_tools"), reset=bool(args.get("reset", False)))
+    call = {"code": code or "", "task_id": kwargs.get("task_id"),  # fork: approval-retry (WB-1301)
+            "enabled_tools": kwargs.get("enabled_tools"), "reset": bool(args.get("reset", False))}  # fork: approval-retry
+    # fork: approval-retry — the gate sees exactly this text (check_execute_code_guard); an expired
+    # fork: approval-retry — approval can re-run the same script once in the same sandbox path.
+    from tools import approval_retry  # fork: approval-retry
+    with approval_retry.retry_target(  # fork: approval-retry
+            "execute_code", f"execute_code <<'PY'\n{call['code']}\nPY",  # fork: approval-retry
+            lambda: execute_code(**{**call, "reset": False}), preview=call["code"],  # fork: approval-retry
+            task_id=call["task_id"]):  # fork: approval-retry
+        return execute_code(**call)  # fork: approval-retry
 
 
 registry.register(

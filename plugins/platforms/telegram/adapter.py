@@ -4773,6 +4773,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 return
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
+            ("er:", self._handle_approval_retry_callback),  # fork: approval-retry (WB-1301)
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
@@ -4877,6 +4878,142 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
             self.resume_typing_for_chat(str(cb["chat_id"]))
+
+    # ── fork: approval-retry — "🔁 Nochmal ausführen" on an expired approval card (WB-1301) ──────────
+    # The offer, its one-shot claim and the re-run live in tools/approval_retry.py; delivery in
+    # gateway/approval_retry_gateway.py. This adapter only renders the card and maps taps/replies.
+
+    _RETRY_CARD_COMMAND_MAX = 1500
+
+    @staticmethod
+    def _retry_keyboard(token: str) -> "InlineKeyboardMarkup":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 Nochmal ausführen", callback_data=f"er:r:{token}")],
+            [InlineKeyboardButton("Verwerfen", callback_data=f"er:x:{token}")]])
+
+    @classmethod
+    def _retry_card_html(cls, command: str, status: str) -> str:
+        cmd = command if len(command) <= cls._RETRY_CARD_COMMAND_MAX else command[:cls._RETRY_CARD_COMMAND_MAX] + "…"
+        return f"{status}\n<pre>{_html.escape(cmd)}</pre>"
+
+    @classmethod
+    def retry_card_text(cls, command: str, notice: str) -> str:
+        """HTML of the expired card that carries the re-run button."""
+        return cls._retry_card_html(command, (
+            f"⌛ <b>Freigabe abgelaufen</b> — der Befehl lief nicht.\n<i>{_html.escape(notice)}</i>")) + (
+            "\n🔁 führt genau diesen Befehl einmal aus (24 h gültig, nur der Owner). "
+            "Eine Antwort „Nochmal“ auf diese Nachricht wirkt genauso.")
+
+    async def _edit_retry_card(self, chat_id: Any, message_id: Any, html_text: str, keyboard: Any = None) -> bool:
+        if not self._bot:
+            return False
+        try:
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id,
+                message_id=int(message_id), text=html_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return True
+        except Exception as exc:
+            logger.info("[%s] approval retry card not edited: %s", self.name, _redact_telegram_error_text(exc))
+            return False
+
+    async def show_approval_retry_card(self, chat_id: str, message_id: Any, token: str, *,
+                                       notice: str, command: str) -> bool:
+        """Turn the timed-out approval card into the "⌛ abgelaufen" card with the re-run buttons."""
+        if message_id is None:
+            return False
+        from tools import approval_retry
+        thread_id = None
+        for tok, st in list(self._approval_state.items()):
+            if isinstance(st, dict) and st.get("message_id") == str(message_id) and st.get("chat_id") == str(chat_id):
+                thread_id = st.get("thread_id")
+                self._approval_state.pop(tok, None)   # the old once/deny buttons are gone with this edit
+        if not await self._edit_retry_card(chat_id, message_id, self.retry_card_text(command, notice),
+                                           self._retry_keyboard(token)):
+            return False
+        return approval_retry.bind_card(token, platform="telegram", chat_id=chat_id, message_id=message_id,
+                                        thread_id=thread_id, display=command)
+
+    async def _handle_approval_retry_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """``er:r:<token>`` re-runs the expired request once; ``er:x:<token>`` drops the offer."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in ("r", "x"):
+            await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
+            return
+        if not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        from tools import approval_retry
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        claim = approval_retry.claim(
+            parts[2], platform="telegram", chat_id=cb.get("chat_id"), message_id=message_id,
+            thread_id=cb.get("thread_id"), user_id=getattr(query.from_user, "id", None), drop=parts[1] == "x")
+        user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+
+        async def toast(text: str) -> None:
+            await query.answer(text=text[:_TOAST_LIMIT])
+        await self._apply_retry_claim(claim, toast, user_display)
+
+    async def _maybe_approval_retry_reply(self, msg) -> bool:
+        """A text reply "Nochmal" / "retry" / "ja" to an expired card acts like its button."""
+        reply = getattr(msg, "reply_to_message", None)
+        if reply is None or not is_retry_word_text(getattr(msg, "text", None)):
+            return False
+        from tools import approval_retry
+        chat_id = str(getattr(msg, "chat_id", "") or getattr(getattr(msg, "chat", None), "id", ""))
+        token = approval_retry.token_for_card("telegram", chat_id, getattr(reply, "message_id", None))
+        offer = approval_retry.get_offer(token) if token else None
+        if offer is None:
+            return False
+        user = getattr(msg, "from_user", None)
+        claim = approval_retry.claim(
+            token, platform="telegram", chat_id=chat_id, message_id=getattr(reply, "message_id", None),
+            thread_id=offer.card.get("thread_id"), user_id=getattr(user, "id", None))
+        if claim.reason == "foreign":
+            return False   # not the owner: an ordinary message, the card stays as it is
+        user_display = getattr(user, "first_name", None) or t("platform.telegram.user_fallback")
+
+        async def toast(text: str) -> None:
+            metadata = {"thread_id": offer.card["thread_id"]} if offer.card.get("thread_id") else None
+            with contextlib.suppress(Exception):
+                await self.send(chat_id, text, metadata=metadata)
+        await self._apply_retry_claim(claim, toast, user_display, quiet_ok=True)
+        return True
+
+    async def _apply_retry_claim(self, claim, toast, user_display: str, *, quiet_ok: bool = False) -> None:
+        offer = claim.offer
+        texts = {
+            "foreign": "Nur der Owner dieser Sitzung darf das nochmal ausführen.",
+            "wrong_card": "Dieser Knopf gehört zu einer anderen Nachricht.",
+            "unknown": "Nicht mehr gültig — nichts ausgeführt.",
+            "used": "Schon erledigt — läuft nicht ein zweites Mal.",
+            "expired": "Abgelaufen (24 h) — nichts ausgeführt.",
+            "dropped": "Verworfen — nichts ausgeführt.",
+        }
+        if claim.reason != "ok":
+            await toast(texts.get(claim.reason, texts["unknown"]))
+            if offer is not None and claim.reason in ("expired", "dropped"):
+                status = ("⌛ <b>Nochmal-Knopf abgelaufen</b> (24 h) — nichts ausgeführt." if claim.reason == "expired"
+                          else f"🗑 <b>Verworfen</b> von {_html.escape(user_display)} — nichts ausgeführt.")
+                await self._edit_retry_card(offer.card["chat_id"], offer.card["message_id"],
+                                            self._retry_card_html(offer.display, status))
+            return
+        if not quiet_ok:
+            await toast("🔁 Läuft …")
+        await self._edit_retry_card(offer.card["chat_id"], offer.card["message_id"], self._retry_card_html(
+            offer.display, f"🔁 <b>Läuft</b> — nachträglich freigegeben von {_html.escape(user_display)} …"))
+        task = asyncio.ensure_future(self._run_approval_retry(offer, user_display))
+        _SETTLE_TASKS.add(task)
+        task.add_done_callback(_SETTLE_TASKS.discard)
+
+    async def _run_approval_retry(self, offer, user_display: str) -> None:
+        from gateway import approval_retry_gateway
+        try:
+            outcome, result = await approval_retry_gateway.run_and_deliver(self, offer)
+            line = approval_retry_gateway.outcome_line(outcome, result.exit_code)
+        except Exception as exc:
+            logger.warning("[%s] approval retry failed: %s", self.name, type(exc).__name__)
+            line = "⚠️ Nochmal ausführen ist fehlgeschlagen."
+        await self._edit_retry_card(offer.card["chat_id"], offer.card["message_id"], self._retry_card_html(
+            offer.display, f"{_html.escape(line)}\n<i>Freigegeben von {_html.escape(user_display)}.</i>"))
 
     # ── fork: werkbank-chat — a card answered on another surface (WB-1129) ──────────────────────────
 
@@ -6673,6 +6810,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
             return
+        if await self._maybe_approval_retry_reply(msg):  # fork: approval-retry — "Nochmal" on an expired card
+            return  # fork: approval-retry
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
@@ -7526,6 +7665,11 @@ def _clip(text: str, limit: int) -> str:  # fork: werkbank-chat
 _CHOICE_WORDS = {"once": "einmal erlaubt", "session": "für die Sitzung erlaubt",  # fork: werkbank-chat
                  "always": "immer erlaubt", "deny": "abgelehnt"}  # fork: werkbank-chat
 _SURFACE_WORDS = {"werkbank": "in der Werkbank"}  # fork: werkbank-chat
+
+
+def is_retry_word_text(text: Any) -> bool:  # fork: approval-retry
+    from tools.approval_retry import is_retry_word  # fork: approval-retry
+    return is_retry_word(text)  # fork: approval-retry
 
 
 def _settled_where(decided_by: str) -> str:  # fork: werkbank-chat

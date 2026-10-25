@@ -848,6 +848,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     actually asked, so a smart APPROVE never pays for redacting a large script.
     """
     from agent.redact import redact_sensitive_text
+    from tools import approval_retry  # fork: approval-retry (WB-1301)
+
+    # fork: approval-retry — the owner pressed "🔁 Nochmal ausführen" on this exact request's expired
+    # fork: approval-retry — card: that press IS the human "once" answer. Every floor already ran.
+    if approval_retry.consume_grant(command):  # fork: approval-retry
+        logger.info("Approval granted by an expired-card retry (session %s)", session_key)  # fork: approval-retry
+        return _user_approved(session_key, description) if spec.user_approved else _approved()  # fork: approval-retry
 
     smart_denied = False
     if smart:
