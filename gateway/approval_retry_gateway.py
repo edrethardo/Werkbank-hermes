@@ -6,7 +6,8 @@ Platform-neutral half of the "🔁 Nochmal ausführen" button: the adapter claim
 1. the requesting **subagent** is still running → its result is steered into it
    (``delegate_tool_registry.steer_subagent``);
 2. the requesting **main session** is still the live session for its key → an internal
-   ``[IMPORTANT: …]`` turn is injected into it (same path as other self-injected turns);
+   ``[IMPORTANT: …]`` turn is injected into it (same path as other self-injected turns) — command
+   and output only inside the neutralised data blocks of ``approval_retry.agent_notice``;
 3. otherwise (subagent finished, session reset/ended) → exit code and a shortened output go
    into the chat, the full output as a file.
 """
@@ -116,7 +117,10 @@ async def _post_to_chat(adapter: Any, offer: approval_retry.RetryOffer, result: 
 async def run_and_deliver(adapter: Any, offer: approval_retry.RetryOffer):
     """Execute the claimed offer and deliver; returns ``(outcome, result)`` with outcome
     ``subagent`` | ``session`` | ``chat`` | ``lost``."""
-    result = await asyncio.to_thread(approval_retry.execute, offer)
+    try:
+        result = await asyncio.to_thread(approval_retry.execute, offer)
+    finally:
+        approval_retry._release(offer)   # the captured context is never needed again
     notice = approval_retry.agent_notice(offer, result)
     outcome = "lost"
     if offer.subagent_id:

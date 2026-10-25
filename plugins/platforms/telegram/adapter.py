@@ -4967,8 +4967,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         claim = approval_retry.claim(
             token, platform="telegram", chat_id=chat_id, message_id=getattr(reply, "message_id", None),
             thread_id=offer.card.get("thread_id"), user_id=getattr(user, "id", None))
-        if claim.reason == "foreign":
-            return False   # not the owner: an ordinary message, the card stays as it is
+        if claim.reason not in ("ok", "dropped"):
+            # not the owner, or the card is already settled (used / expired / unknown): an
+            # ordinary message for the agent — "ja" may well mean something else by now.
+            if claim.reason == "expired" and claim.offer is not None:
+                with contextlib.suppress(Exception):
+                    await self._edit_retry_card(claim.offer.card["chat_id"], claim.offer.card["message_id"],
+                                                self._retry_card_html(claim.offer.display,
+                                                    "⌛ <b>Nochmal-Knopf abgelaufen</b> (24 h) — nichts ausgeführt."))
+            return False
         user_display = getattr(user, "first_name", None) or t("platform.telegram.user_fallback")
 
         async def toast(text: str) -> None:
