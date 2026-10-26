@@ -8,8 +8,9 @@ board ``docs/plugins.md`` "The Hermes chat view")::
                  is_error, truncated, message_id?, tool_calls?, kind?: system, herkunft?}],
      pending_approvals: [approval.request payload shape],
      pending_clarify:   [clarify.request payload shape],
-     subagents: [{id, parent_id, status, goal?, …}],
-     session: {model, context_percent, tool_count, errors}}
+     subagents: [{id, parent_id, status, goal?, model?, provider?, …}],
+     session: {model, context_percent, tool_count, errors, provider?, context_tokens?,
+               context_length?, compression_threshold?}}
 
 Order matters for "the snapshot fits the stream": the buffer position (``epoch``, ``seq``) is
 taken FIRST, the history is read AFTER. Anything that lands in the SessionDB in between is in

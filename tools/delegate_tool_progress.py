@@ -300,6 +300,8 @@ class _ChildProgressRelay:
         self.subagent_id, self.parent_id, self.depth, self.model, self.toolsets = (
             subagent_id, parent_id, depth, model, toolsets
         )
+        # WB-1309: set from the BUILT child (``_build_child_agent``) together with ``model``.
+        self.provider: Optional[str] = None
         self.batch: List[str] = []
         self.parent_scope: Any = None  # owning parent agent; set by _build_child_progress_callback
         self.tool_count = 0  # per-subagent running counter
@@ -315,7 +317,8 @@ class _ChildProgressRelay:
 
     def _identity_kwargs(self) -> Dict[str, Any]:
         kw: Dict[str, Any] = {"task_index": self.task_index, "task_count": self.task_count, "goal": self.goal_label}
-        kw.update({k: getattr(self, k) for k in ("subagent_id", "parent_id", "depth", "model") if getattr(self, k) is not None})
+        kw.update({k: getattr(self, k) for k in ("subagent_id", "parent_id", "depth", "model", "provider")
+                   if getattr(self, k, None) is not None})
         if self.toolsets is not None:
             kw["toolsets"] = list(self.toolsets)
         # child_session_id / delegation_id are filled into the shared ref once

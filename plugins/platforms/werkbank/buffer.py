@@ -48,6 +48,17 @@ _RECENT_ANSWERS = 20        # final answers of turn.done kept for the snapshot
 _TURN_STARTS = 200          # turn.start row marks kept: which answer row belongs to which turn
 _OBSERVED = 64              # session ids of one key with their observation mark
 _MARKED = ("user.message", "turn.start", "turn.done")
+# WB-1309: numbers a turn end carries for the board's status line (gateway/session_events._turn_context)
+_CONTEXT_FIELDS = ("context_tokens", "context_length", "compression_threshold")
+
+
+def _context_view(context: Dict[str, Any]) -> Dict[str, Any]:
+    """WB-1309: the snapshot's context fields; ``context_percent`` only from two real numbers."""
+    out = dict(context)
+    tokens, window = context.get("context_tokens"), context.get("context_length")
+    if tokens and window:
+        out["context_percent"] = round(tokens * 100 / window)
+    return out
 
 
 def initial_epoch(now: Optional[float] = None) -> int:
@@ -82,6 +93,8 @@ class SessionBuffer:
         self.pending_ids: deque = deque(maxlen=_PENDING_IDS)
         self.accepted_ids: "OrderedDict[str, None]" = OrderedDict()
         self.model: Optional[str] = None
+        # WB-1309: provider + context numbers of the last turn end (survive epochs like `model`)
+        self.context: Dict[str, Any] = {}
         # Survive epochs: what a snapshot must show even before the SessionDB has it.
         self.recent_users: deque = deque(maxlen=_RECENT_USERS)
         self.recent_answers: deque = deque(maxlen=_RECENT_ANSWERS)
@@ -407,13 +420,22 @@ class Buffers:
             buf.error_count += 1
         if type_ in ("turn.done", "turn.stopped", "error") and payload.get("model"):
             buf.model = str(payload["model"])
+        if type_ in ("turn.done", "turn.stopped", "error"):
+            # WB-1309: a turn end that names them replaces the whole set (never mixed turns)
+            numbers = {k: payload[k] for k in _CONTEXT_FIELDS
+                       if isinstance(payload.get(k), int) and not isinstance(payload.get(k), bool)
+                       and payload[k] > 0}
+            if isinstance(payload.get("provider"), str) and payload["provider"]:
+                numbers["provider"] = payload["provider"]
+            if numbers:
+                buf.context = numbers
         if type_ == "turn.start":
             buf.open_turn = None if id_ is None else str(id_)
         elif type_ in ("turn.done", "turn.stopped") or (type_ == "error" and id_ == buf.open_turn):
             buf.open_turn = None
         elif type_ == "subagent.start" and id_ is not None:
             buf.subagents[str(id_)] = {"id": str(id_), "parent_id": parent_id, "status": "laeuft",
-                                       **{k: payload[k] for k in ("goal", "model", "depth",
+                                       **{k: payload[k] for k in ("goal", "model", "provider", "depth",
                                                                    "child_session_id") if k in payload}}
             while len(buf.subagents) > 64:
                 buf.subagents.popitem(last=False)
@@ -452,7 +474,7 @@ class Buffers:
                     "observed": dict(buf.observed),
                     # counted since the board first asked for this session (this plugin process)
                     "session": {"model": buf.model, "tool_count": buf.tool_count,
-                                "errors": buf.error_count}}
+                                "errors": buf.error_count, **_context_view(buf.context)}}
 
     def sessions(self) -> Iterable[str]:
         with self.cond:

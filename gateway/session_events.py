@@ -543,6 +543,7 @@ class TurnScope:
     platform: Optional[str]
     turn_id: str
     tool_names: Dict[str, str] = field(default_factory=dict)
+    agent: Any = None  # WB-1309: the wired turn agent (provider, compressor); dropped at the turn end
 
     def emit(self, type_: str, id_: Optional[str] = None, parent_id: Optional[str] = None,
              payload: Optional[Dict[str, Any]] = None) -> None:
@@ -595,6 +596,41 @@ def _answer_row(messages: Any, history_offset: Any = None) -> Dict[str, Any]:
     return {}
 
 
+def _positive(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = int(value)
+    return number if number > 0 else None
+
+
+def _turn_context(scope: TurnScope, res: Dict[str, Any]) -> Dict[str, Any]:
+    """WB-1309: provider and context numbers of the turn, for the Werkbank chat's status line.
+
+    ``context_tokens`` = the prompt size of the last API call (``last_prompt_tokens``, what
+    ``/usage`` shows; it drops after a compression), ``context_length`` = the active model's window,
+    ``compression_threshold`` = where the compressor starts. The gateway result's numbers come
+    first (read from the turn's final agent), the wired agent fills the rest. Unknown or 0 is left
+    out — never estimated."""
+    agent, scope.agent = scope.agent, None
+    comp = getattr(agent, "context_compressor", None) if agent is not None else None
+    out: Dict[str, Any] = {}
+    provider = getattr(agent, "provider", None) if agent is not None else None
+    if isinstance(provider, str) and provider:
+        out["provider"] = provider
+    for name, from_res, from_comp in (("context_tokens", "last_prompt_tokens", "last_prompt_tokens"),
+                                      ("context_length", "context_length", "context_length"),
+                                      ("compression_threshold", None, "threshold_tokens")):
+        value = _positive(res.get(from_res)) if from_res else None
+        if value is None and comp is not None:
+            try:
+                value = _positive(getattr(comp, from_comp, None))
+            except Exception:
+                value = None
+        if value is not None:
+            out[name] = value
+    return out
+
+
 def end_turn(scope: Optional[TurnScope], *, result: Any = None, error: Optional[BaseException] = None) -> None:
     """Exactly one terminal event per turn: ``turn.done`` | ``turn.stopped`` | ``error``."""
     if scope is None:
@@ -610,6 +646,7 @@ def end_turn(scope: Optional[TurnScope], *, result: Any = None, error: Optional[
             "completed": res.get("completed"), "api_calls": res.get("api_calls", 0),
             "model": res.get("model"), "session_id": res.get("session_id") or scope.session_id,
         }
+        payload.update(_turn_context(scope, res))  # WB-1309: provider + context numbers, no text
         if res.get("session_id"):
             scope.session_id = res["session_id"]
         if res.get("interrupted"):
@@ -635,6 +672,7 @@ def wire_agent(scope: Optional[TurnScope], agent: Any) -> None:
     streaming mode and change delivery)."""
     if scope is None or agent is None:
         return
+    scope.agent = agent  # WB-1309: the turn end reads provider + compressor numbers from it
 
     def tee(name: str, observer: Callable[..., None], *, keep_none: bool = False) -> None:
         original = getattr(agent, name, None)
@@ -676,7 +714,7 @@ def wire_agent(scope: Optional[TurnScope], agent: Any) -> None:
     def on_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
         if event_type in _SUBAGENT_TYPES or event_type.startswith("subagent"):
             sub_id = kwargs.get("subagent_id")
-            payload = {k: kwargs.get(k) for k in ("goal", "status", "depth", "model", "child_session_id",
+            payload = {k: kwargs.get(k) for k in ("goal", "status", "depth", "model", "provider", "child_session_id",
                                                   "delegation_id", "tool_count", "duration_seconds")
                        if kwargs.get(k) is not None}
             if event_type not in _SUBAGENT_TYPES:

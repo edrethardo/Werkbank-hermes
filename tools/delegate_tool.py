@@ -312,6 +312,13 @@ def _build_child_agent(
     # reference), and no parent teardown can close it out from under a background child (#81267).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
+    # WB-1309: the relay was made before the runtime was resolved (model_profile, delegation
+    # provider, delegation.auto) — every relayed event names the model and provider the child got.
+    if child_progress_cb is not None:
+        for _name in ("model", "provider"):
+            _value = getattr(child, _name, None)
+            if isinstance(_value, str) and _value:
+                setattr(child_progress_cb, _name, _value)
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)
