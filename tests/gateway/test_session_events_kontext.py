@@ -125,3 +125,18 @@ def test_subagent_events_carry_model_and_provider(emitted):
     assert start["type"] == "subagent.start" and start["id"] == "sa-0-1"
     assert start["payload"]["model"] == "nemotron-super"
     assert start["payload"]["provider"] == "nvidia"
+
+
+def test_turn_end_releases_the_agent_on_every_path(emitted):
+    for kind, kw in (("done", dict(result=_result())),
+                     ("stopped", dict(result=_result(interrupted=True, interrupt_message="stop"))),
+                     ("failed result", dict(result=_result(failed=True, error="boom"))),
+                     ("raised error", dict(error=RuntimeError("boom"))),
+                     ("emit crashes", dict(result=_result()))):
+        scope = _scope()
+        session_events.wire_agent(scope, _Agent())
+        assert scope.agent is not None, kind
+        if kind == "emit crashes":
+            scope.emit = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("emit"))
+        session_events.end_turn(scope, **kw)
+        assert scope.agent is None, kind

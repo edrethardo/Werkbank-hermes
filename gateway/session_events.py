@@ -661,6 +661,8 @@ def end_turn(scope: Optional[TurnScope], *, result: Any = None, error: Optional[
             scope.emit("turn.done", scope.turn_id, None, payload)
     except Exception:
         logger.debug("turn end emit failed", exc_info=True)
+    finally:
+        scope.agent = None  # WB-1309: never keep the agent alive past the turn, error path included
 
 
 _SUBAGENT_TYPES = {"subagent.start": "subagent.start", "subagent.complete": "subagent.end"}

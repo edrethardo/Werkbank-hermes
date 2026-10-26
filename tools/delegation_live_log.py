@@ -229,6 +229,7 @@ def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
             inner_cb._flush()
 
     _cb._flush = _flush
+    _cb._inner = inner_cb  # WB-1309: lets the child run reach the relay under the wrapper
     return _cb
 
 

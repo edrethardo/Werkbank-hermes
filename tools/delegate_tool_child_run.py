@@ -770,11 +770,31 @@ class _ChildRun:
         self.wall_start = time.time()
         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
 
+    def sync_identity(self) -> None:
+        """WB-1309: write the child's CURRENT model/provider into the relay again — a fallback during
+        the run switches them, and the completion event must name what the child ended on."""
+        relay = self.child_progress_cb
+        for _ in range(4):  # bounded; read __dict__ so a mock's auto-attributes never look like a wrapper
+            inner = (getattr(relay, "__dict__", None) or {}).get("_inner")
+            if inner is None:
+                break
+            relay = inner  # live-transcript wrapper → the relay that owns model/provider
+        if relay is None:
+            return
+        for name in ("model", "provider"):
+            value = getattr(self.child, name, None)
+            if isinstance(value, str) and value:
+                try:
+                    setattr(relay, name, value)
+                except Exception:
+                    pass
+
     def finish_failed(
         self, entry: Dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "", status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
         the steer text that won the race with the failure, report the worktree."""
+        self.sync_identity()
         _safe_progress(
             self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
             duration_seconds=entry["duration_seconds"], summary=summary,
@@ -1012,6 +1032,7 @@ class _ChildRun:
         tool-output tail); every field is optional and degrades gracefully on the client."""
         if not self.child_progress_cb:
             return
+        self.sync_identity()
         child = self.child
         summary = entry["summary"]
         _files_read: list = []
