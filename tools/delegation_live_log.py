@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -210,6 +211,39 @@ class LiveTranscriptWriter:
             f"exit_reason={exit_reason}" if exit_reason else "",
             "(iteration budget exhausted)" if exit_reason == "max_iterations" else "",
             f"error: {_one_line(entry['error'], _RESULT_MAX)}" if entry.get("error") else ""))
+
+
+# WB-1332: the Werkbank board reads a stale log as a dead child (OOM, gateway
+# restart: no end marker is ever written). One long model or tool call writes
+# no line for many minutes, so the log is touched while the child runs.
+HEARTBEAT_SECONDS = 300
+
+
+@contextmanager
+def heartbeat(writer: Optional["LiveTranscriptWriter"], interval: Optional[float] = None):
+    """Touch ``writer.path`` every ``interval`` s while the body runs; stops with it.
+    A daemon thread, so it dies with the process — exactly what the reader needs."""
+    path = getattr(writer, "path", None)
+    if path is None:
+        yield
+        return
+    stop = threading.Event()
+    every = HEARTBEAT_SECONDS if interval is None else interval
+
+    def _beat():
+        while not stop.wait(every):
+            with _best_effort("heartbeat"):
+                if path.exists():
+                    os.utime(path, None)
+
+    t = threading.Thread(target=_beat, daemon=True,
+                         name=f"live-heartbeat-{writer.delegation_id}-{writer.task_index}")
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=1)
 
 
 def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
