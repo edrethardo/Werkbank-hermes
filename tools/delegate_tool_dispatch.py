@@ -65,11 +65,15 @@ class _Batch:
 
     def run_child(self, i: int, task: Dict[str, Any], child: Any) -> Dict[str, Any]:
         from tools.delegate_tool import _run_single_child
-        if isinstance(getattr(child, "_delegate_auto", None), dict) or getattr(child, "_delegate_transparent", None) is True:
-            # delegation.auto (WB-1260): trial slot, one fallback restart, model/provider in the entry.
-            from tools.delegation_auto import run_auto_child
-            return run_auto_child(self, i, task, child)
-        return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        from tools.delegation_live_log import heartbeat
+        writers = self.live_writers or []
+        # WB-1332: the live log is the child's sign of life for the Werkbank board.
+        with heartbeat(writers[i] if 0 <= i < len(writers) else None):
+            if isinstance(getattr(child, "_delegate_auto", None), dict) or getattr(child, "_delegate_transparent", None) is True:
+                # delegation.auto (WB-1260): trial slot, one fallback restart, model/provider in the entry.
+                from tools.delegation_auto import run_auto_child
+                return run_auto_child(self, i, task, child)
+            return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
 
 
 def _announce_batch(parent_agent, n_tasks: int, live_deleg_id: Optional[str]) -> None:
