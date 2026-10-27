@@ -43,6 +43,8 @@ LABEL_CAP = 200
 MAX_OPTIONS = 600           # a /model card lists at most this many models
 CHOICE_TTL_S = 30 * 60      # an unanswered card expires (like the Telegram picker state, which is
 ANSWER_TIMEOUT_S = 120.0    # replaced by the next one); the picked callback may take this long
+# A confirmation card lives exactly as long as its ``tools.slash_confirm`` entry (see
+# ``ChoiceSurface.send_slash_confirm``): a later pick would find nothing to run.
 
 _WRAPPED_ATTR = "_hm_plugin_command_wrapped"
 _TURN_ATTR = "_hm_plugin_command_turn"
@@ -194,6 +196,7 @@ class _Choice:
     platform: Optional[str]
     client_message_id: Optional[str]
     request: str = ""
+    ttl: float = CHOICE_TTL_S
     created: float = field(default_factory=time.monotonic)
 
     def payload(self) -> Dict[str, Any]:
@@ -210,8 +213,12 @@ def _clip(value: Any, cap: int) -> str:
     return str(value if value is not None else "")[:cap]
 
 
+class ChoiceExpired(Exception):
+    """Raised by a card's callback when what it would answer is gone (a timed-out confirmation)."""
+
+
 def _expired(choice: _Choice, now: Optional[float] = None) -> bool:
-    return ((time.monotonic() if now is None else now) - choice.created) > CHOICE_TTL_S
+    return ((time.monotonic() if now is None else now) - choice.created) > choice.ttl
 
 
 def _emit_closed(choice: _Choice, type_: str, extra: Optional[Dict[str, Any]] = None) -> None:
@@ -234,13 +241,13 @@ class ChoiceSurface:
         self.closed = False
 
     def _open(self, kind: str, title: str, options: List[Dict[str, Any]],
-              run: Callable[[int], Awaitable[Any]]):
+              run: Callable[[int], Awaitable[Any]], ttl: float = CHOICE_TTL_S):
         from gateway.platforms.base import SendResult
         if not self.session_key or not options:
             return SendResult(success=False, error="no choices")
         choice = _Choice("ch_" + secrets.token_hex(8), self.session_key, kind, _clip(title, TITLE_CAP),
                          options[:MAX_OPTIONS], run, asyncio.get_running_loop(), self.plugin_id,
-                         self.platform, self.client_message_id, self.request)
+                         self.platform, self.client_message_id, self.request, ttl)
         with _lock:
             # One open card per session, like Telegram's one picker per chat: the new one wins.
             replaced = [c for c in _open.values() if c.session_key == self.session_key]
@@ -292,10 +299,17 @@ class ChoiceSurface:
         options = [{"label": label, "is_current": False}
                    for label in ("Ja, einmal", "Ja, nicht mehr fragen", "Abbrechen")]
 
+        from tools import slash_confirm
+
         async def run(index: int):
-            from tools import slash_confirm
-            return await slash_confirm.resolve(session_key, confirm_id, picks[index])
-        return self._open("confirm", f"{title}\n\n{message}", options, run)
+            result = await slash_confirm.resolve(session_key, confirm_id, picks[index])
+            if result is None:  # stale, superseded or already answered: nothing ran
+                raise ChoiceExpired()
+            return result
+        # the card dies with the confirmation behind it, never later (a late pick would report
+        # "done" while slash_confirm had already dropped the command)
+        return self._open("confirm", f"{title}\n\n{message}", options, run,
+                          ttl=slash_confirm.DEFAULT_TIMEOUT_SECONDS)
 
 
 def pending(session_key: str) -> List[Dict[str, Any]]:
@@ -345,6 +359,9 @@ def answer(session_key: str, choice_id: str, index: Any, *, decided_by: str = "w
         text = asyncio.run_coroutine_threadsafe(choice.run(index), choice.loop).result(timeout=timeout)
         text = "" if text is None else str(text)
         failed = False
+    except ChoiceExpired:
+        _emit_closed(choice, "choice.expired", {"cause": "abgelaufen"})
+        return 404, {"error": "unknown choice", "grund": "Diese Auswahl ist abgelaufen."}
     except Exception as exc:
         logger.warning("Plugin choice %s failed: %s", choice.kind, type(exc).__name__)
         text, failed = f"Auswahl fehlgeschlagen ({type(exc).__name__}).", True

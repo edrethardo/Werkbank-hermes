@@ -1322,7 +1322,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # calls handle_message directly, so a teardown on the relay's inbound
         # handler left those turns muted.
 
-        _paused_notice = self._hm_estop_gate(event, source, is_internal)
+        # A board command (WB-1256) is internal only in transport: a person typed it, so the
+        # emergency stop and the external drain gate it like a chat message.  # fork: werkbank-chat
+        _gated_internal = is_internal and not plugin_commands.is_plugin_command(event)  # fork: werkbank-chat
+        _paused_notice = self._hm_estop_gate(event, source, _gated_internal)  # fork: werkbank-chat
         if _paused_notice is not None:
             return _paused_notice
 
@@ -1350,12 +1353,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
-            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
-            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
-            # only fall to zero. Reversible.
-            if self._external_drain_active:
-                logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
-                return t("gateway.busy.draining_maintenance")
+        # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
+        # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
+        # only fall to zero. Reversible.
+        if not _gated_internal and self._external_drain_active:  # fork: werkbank-chat (WB-1256)
+            logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
+            return t("gateway.busy.draining_maintenance")
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them

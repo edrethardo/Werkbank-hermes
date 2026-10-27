@@ -510,6 +510,10 @@ class GatewayBusySessionMixin:
 
     async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
         """Send a busy-path reply anchored to the event (thread metadata included)."""
+        from gateway import plugin_commands  # fork: werkbank-chat (WB-1256)
+        if plugin_commands.is_plugin_command(event):  # fork: werkbank-chat — a board command's notice
+            plugin_commands.emit_reply(event, content)  # goes to its stream, not the chat  # fork: werkbank-chat
+            return  # fork: werkbank-chat
         reply_anchor = self._reply_anchor_for_event(event)
         await adapter._send_with_retry(
             chat_id=event.source.chat_id, content=content,
@@ -825,7 +829,10 @@ class GatewayBusySessionMixin:
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
-        if event.internal and event.allow_gateway_control:
+        # A board command (WB-1256) is a person's message: it takes the chat's busy path below.
+        from gateway.plugin_commands import is_plugin_command  # fork: werkbank-chat (WB-1256)
+        _board_command = is_plugin_command(event)  # fork: werkbank-chat
+        if event.internal and event.allow_gateway_control and not _board_command:  # fork: werkbank-chat
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
@@ -865,7 +872,7 @@ class GatewayBusySessionMixin:
         # Internal synthetic events (delegation / background completions) must never interrupt or
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
         # queue them through the FIFO (security metadata kept apart).
-        if getattr(event, "internal", False):
+        if getattr(event, "internal", False) and not _board_command:  # fork: werkbank-chat (WB-1256)
             self._queue_or_replace_pending_event(session_key, event)
             return True
         if (

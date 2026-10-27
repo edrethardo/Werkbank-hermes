@@ -409,3 +409,145 @@ async def test_destructive_confirm_of_new_becomes_a_card_not_telegram_buttons():
     assert card["kind"] == "confirm" and len(card["options"]) == 3
     status, body = await _answer(KEY, card["choice_id"], 0)
     assert status == 200 and ran == ["once"] and body["text"] == "✨ Neue Sitzung."
+
+
+def _confirm_card(seen):
+    return _of(_settle(seen, lambda s: _of(s, "choice.request")), "choice.request")[0]["payload"]
+
+
+async def _open_confirm(runner, ran):
+    runner._slash_confirm_counter = None
+
+    async def on_confirm(choice):
+        ran.append(choice)
+        return "✨ Neue Sitzung."
+
+    async def inner(event):
+        return await runner._request_slash_confirm(event=event, command="new", title="/new",
+                                                   message="Wirklich neu?", handler=on_confirm)
+
+    await plugin_commands.handle(runner, _command_event("/new", cmid="wb-n"), inner)
+
+
+@pytest.mark.asyncio
+async def test_confirm_card_expires_with_its_slash_confirm_not_after_30_minutes():
+    """The confirmation behind the card lives ``slash_confirm.DEFAULT_TIMEOUT_SECONDS`` (300 s):
+    the card must close then too, not stay pickable for the generic 30 minutes."""
+    from tools import slash_confirm
+    seen = _subscribe()
+    runner, ran = _status_runner(), []
+    await _open_confirm(runner, ran)
+    card = _confirm_card(seen)
+    with plugin_commands._lock:
+        plugin_commands._open[card["choice_id"]].created -= slash_confirm.DEFAULT_TIMEOUT_SECONDS + 1
+    assert plugin_commands.pending(KEY) == []                   # gone with its confirmation
+    expired = _of(_settle(seen, lambda s: _of(s, "choice.expired")), "choice.expired")
+    assert expired[0]["payload"]["cause"] == "abgelaufen"
+    assert (await _answer(KEY, card["choice_id"], 0))[0] == 404
+    assert ran == []
+    slash_confirm.clear(KEY)
+
+
+@pytest.mark.asyncio
+async def test_late_pick_on_a_timed_out_confirmation_says_expired_not_done():
+    """slash_confirm dropped the command (stale): ``resolve`` returns None and runs nothing — the
+    board must hear "abgelaufen" (404), never a ``choice.resolved`` that looks like success."""
+    from tools import slash_confirm
+    seen = _subscribe()
+    runner, ran = _status_runner(), []
+    await _open_confirm(runner, ran)
+    card = _confirm_card(seen)
+    with slash_confirm._lock:
+        slash_confirm._pending[KEY]["created_at"] -= slash_confirm.DEFAULT_TIMEOUT_SECONDS + 1
+
+    status, body = await _answer(KEY, card["choice_id"], 0)
+
+    assert status == 404 and body["grund"] == "Diese Auswahl ist abgelaufen."
+    assert ran == []
+    _settle(seen, lambda s: _of(s, "choice.expired"))
+    assert [e["id"] for e in _of(seen, "choice.expired")] == [card["choice_id"]]
+    assert _of(seen, "choice.resolved") == []
+    assert plugin_commands.pending(KEY) == []
+
+
+# ── emergency stop, drain and busy: a board command is a person's message ────────────────────
+
+
+def _skill_turn_runner(monkeypatch):
+    """A runner on which ``/myskill`` would become an agent turn (the skill rewrite)."""
+    runner = _status_runner()
+    monkeypatch.setattr(runner, "_hm_dispatch_idle_commands", AsyncMock(return_value=(False, None)),
+                        raising=False)
+    monkeypatch.setattr(runner, "_is_session_running", lambda _k: False, raising=False)
+    monkeypatch.setattr(runner, "_hm_evict_idle_stale_agent", lambda _k: None, raising=False)
+    runner._external_drain_active = False
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_paused_gateway_refuses_a_board_skill_command_with_the_pause_notice(monkeypatch):
+    seen = _subscribe()
+    runner = _skill_turn_runner(monkeypatch)
+    notice = "⏸️ Hermes is paused (wartung). New work is on hold; run `hermes resume` to pick things back up."
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: notice)
+
+    assert await runner._handle_message(_command_event("/myskill mach was", cmid="wb-p")) is None
+
+    reply = _of(_settle(seen, lambda s: _of(s, "command.reply")), "command.reply")[0]
+    assert reply["id"] == "wb-p" and reply["payload"]["text"] == notice
+    runner._handle_message_with_agent.assert_not_called()
+    runner._hm_dispatch_idle_commands.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_paused_gateway_still_lets_internal_wakes_through(monkeypatch):
+    """Unchanged: a synthetic internal event (no board command) is not a new user turn."""
+    runner = _skill_turn_runner(monkeypatch)
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: "paused")
+    event = _command_event("[background done]")
+    event.metadata.pop(plugin_commands.COMMAND_FLAG)
+    assert runner._hm_estop_gate(event, event.source, True) is None
+
+
+@pytest.mark.asyncio
+async def test_external_drain_refuses_a_board_skill_command(monkeypatch):
+    from agent.i18n import t
+    seen = _subscribe()
+    runner = _skill_turn_runner(monkeypatch)
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: None)
+    runner._external_drain_active = True
+
+    assert await runner._handle_message(_command_event("/myskill mach was", cmid="wb-d")) is None
+
+    reply = _of(_settle(seen, lambda s: _of(s, "command.reply")), "command.reply")[0]
+    assert reply["id"] == "wb-d" and reply["payload"]["text"] == t("gateway.busy.draining_maintenance")
+    runner._handle_message_with_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_board_skill_command_while_busy_takes_the_chat_busy_path():
+    """Like a Telegram ``/myskill`` mid-run (interrupt mode): the running turn is interrupted and the
+    command queued — not parked silently like an internal wake. The ack goes to the stream."""
+    from tests.gateway.test_busy_session_ack import _make_adapter, _make_runner
+    seen = _subscribe()
+    runner, _sentinel = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    adapter = _make_adapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    agent = MagicMock()
+    agent.get_activity_summary.return_value = {
+        "api_call_count": 3, "max_iterations": 60, "current_tool": "terminal",
+        "last_activity_ts": time.time(), "last_activity_desc": "terminal", "seconds_since_activity": 1.0}
+    runner._running_agents[KEY] = agent
+    runner._running_agents_ts[KEY] = time.time() - 60
+    queued = []
+    runner._queue_or_replace_pending_event = lambda key, ev: queued.append((key, ev))
+
+    event = _command_event("/myskill mach was", cmid="wb-b")
+    assert await runner._handle_active_session_busy_message(event, KEY) is True
+
+    agent.interrupt.assert_called_once_with("/myskill mach was")
+    assert queued == [(KEY, event)]
+    adapter._send_with_retry.assert_not_called()                 # nothing to the chat
+    reply = _of(_settle(seen, lambda s: _of(s, "command.reply")), "command.reply")[0]
+    assert reply["id"] == "wb-b" and reply["payload"]["text"]
