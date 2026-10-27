@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
 from . import approvals, snapshot
+from . import commands as commands_mod
 from . import mirror as mirror_mod
 from . import uploads as uploads_mod
 
@@ -329,6 +330,8 @@ def _handler(app: WerkbankServer):
             parts = split.path.split("/")[1:]
             if split.path == "/v1/resolve":
                 return self._resolve((query.get("session_id") or [""])[0])
+            if split.path == "/v1/commands":             # WB-1256: the board's completion list
+                return self._json(200, {"commands": commands_mod.catalog()})
             if len(parts) >= 4 and parts[:2] == ["v1", "s"]:
                 key = self._session(parts)
                 if key is None:
@@ -523,6 +526,11 @@ def _handler(app: WerkbankServer):
                 return self._stop(key)
             if len(what) == 2 and what[0] in ("approvals", "clarify"):
                 return self._answer(key, what[0], urllib.parse.unquote(what[1]), body)
+            if len(what) == 2 and what[0] == "choices":    # WB-1256: a card a command opened
+                status, payload = commands_mod.answer_choice(key, urllib.parse.unquote(what[1]), body)
+                if status == 200:
+                    logger.info("werkbank: choice card answered from the board")
+                return self._json(status, payload)
             self._refuse(404, "not found", "Unbekannter Pfad.")
 
         # -- DELETE -----------------------------------------------------------------------------
@@ -602,6 +610,17 @@ def _handler(app: WerkbankServer):
                                     accepted=False)
             if not isinstance(cmid, str) or not ID_RE.fullmatch(cmid):
                 return self._refuse(400, "bad client_message_id", "Ungültige Nachrichten-ID.", accepted=False)
+            # WB-1256: a slash command goes to the gateway's command path — never to the model as text.
+            command = commands_mod.is_command(text)
+            if command and has_files:
+                return self._refuse(400, "command with attachments",
+                                    "Ein Befehl nimmt keine Anhänge mit — erst den Befehl, dann die Datei.",
+                                    accepted=False)
+            if command and not getattr(app.host, "supports_commands", False):
+                return self._refuse(501, "not implemented",
+                                    "Dieses Hermes führt Befehle aus dem Board noch nicht aus (inject_message ohne "
+                                    "as_command, WB-1256) — der Befehl wurde NICHT als Text gesendet.",
+                                    accepted=False)
             if has_files and (app.uploads is None or not getattr(app.host, "supports_media", False)):
                 return self._refuse(501, "not implemented",
                                     "Dieses Hermes nimmt noch keine Anhänge an (inject_message ohne media_urls, "
@@ -624,13 +643,15 @@ def _handler(app: WerkbankServer):
             # Hermes' answer — and only when the gateway can take the message at all (host pre-check).
             # A mirror that fails or is slow (host.MIRROR_WAIT_S) leaves no anchor.
             posted = None
-            if app.mirror_enabled():
+            if app.mirror_enabled() and not command:     # a command is no message for the topic
                 try:
                     posted = app.host.mirror(key, mirror_mod.with_attachments(text, files), app.mirror_name)
                 except Exception:
                     logger.info("werkbank: mirror line not delivered")
             anchor = getattr(posted, "message_id", None)
             extra = {"media": [(f["path"], f["type"]) for f in files]} if files else {}
+            if command:
+                extra["command"] = True
             try:
                 accepted, _ = app.host.inject(key, text, cmid, reply_to_message_id=anchor, **extra)
             except Exception:

@@ -610,6 +610,7 @@ class PluginContext:
         reply_to_message_id: str | None = None,  # fork: werkbank-chat
         media_urls: list[str] | None = None,  # fork: werkbank-chat
         media_types: list[str] | None = None,  # fork: werkbank-chat
+        as_command: bool = False,  # fork: werkbank-chat (WB-1256)
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -633,12 +634,18 @@ class PluginContext:
         ``media_urls`` / ``media_types`` (gateway only, both or neither, same length, at most 10) are
         attachments the turn gets like a photo or document sent in the chat: absolute paths of regular
         files under the plugin profile's ``cache/`` (where adapters cache downloads) and their MIME types.
+        ``as_command`` (gateway ``session_key`` only, no media; WB-1256): *content* is a slash command
+        of the session's owner. It takes the same command path (authorization, slash access gate,
+        busy policy, unknown-command notice) as the owner typing it in the session's chat; its reply
+        and any picker go to the session's event stream (``command.reply`` / ``choice.request``,
+        ``gateway/plugin_commands.py``), not to the chat and never to the model.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
         return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
                                      client_message_id=client_message_id,  # fork: werkbank-chat
                                      reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
-                                     media_urls=media_urls, media_types=media_types)  # fork: werkbank-chat
+                                     media_urls=media_urls, media_types=media_types,  # fork: werkbank-chat
+                                     as_command=as_command)  # fork: werkbank-chat (WB-1256)
 
     def interrupt_session(self, session_key: str) -> bool:  # fork: werkbank-chat
         """Stop the running turn of a messaging-gateway session the way ``/stop`` does.

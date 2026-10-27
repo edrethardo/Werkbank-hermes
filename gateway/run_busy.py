@@ -1395,7 +1395,8 @@ class GatewayBusySessionMixin:
         # Register FIRST so a fast button click cannot race the send_slash_confirm return.
         _slash_confirm_mod.register(session_key, confirm_id, command, handler)
 
-        adapter = self._delivery_adapter_for(source)
+        from gateway.plugin_commands import picker_surface  # fork: werkbank-chat (WB-1256) — board card
+        adapter = picker_surface() or self._delivery_adapter_for(source)  # fork: werkbank-chat
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
         if adapter is not None:

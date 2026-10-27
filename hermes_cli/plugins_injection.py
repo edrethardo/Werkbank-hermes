@@ -64,8 +64,13 @@ def inject_plugin_message(
     origin: Optional[Mapping[str, Any]], client_message_id: Optional[str] = None,  # fork: werkbank-chat
     reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
     media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
+    as_command: bool = False,  # fork: werkbank-chat (WB-1256)
 ) -> bool:
     manager = ctx._manager
+    if as_command and (origin is not None or not session_key or media_urls or media_types  # fork: werkbank-chat
+                       or role != "user"):  # fork: werkbank-chat
+        logger.warning("inject_message: as_command needs a gateway session_key, a user text, no media")  # fork: werkbank-chat
+        return False  # fork: werkbank-chat
     msg = content if role == "user" else f"[{role}] {content}"
     cli = manager._cli_ref
     # An origin names a messaging chat; the local REPL is never that chat.
@@ -103,7 +108,7 @@ def inject_plugin_message(
     # session_key; a miss falls through so a co-resident messaging gateway
     # still receives its own keys. An exception fails closed — do not also
     # hand the same text to the gateway.
-    if session_key and manager.has_tui_message_injector and not media:  # fork: werkbank-chat — TUI takes no media
+    if session_key and manager.has_tui_message_injector and not media and not as_command:  # fork: werkbank-chat — TUI takes no media
         try:
             if manager.inject_tui_message(session_key=session_key, content=msg, plugin_id=ctx.plugin_id,
                                           plugin_home=manager.home_path):  # fork: werkbank-chat
@@ -128,6 +133,8 @@ def inject_plugin_message(
         target["reply_to_message_id"] = reply_to_message_id  # fork: werkbank-chat
     if media:  # fork: werkbank-chat
         target["media_urls"], target["media_types"] = real_media, list(media_types)  # fork: werkbank-chat
+    if as_command:  # fork: werkbank-chat (WB-1256)
+        target["as_command"] = True  # fork: werkbank-chat
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:

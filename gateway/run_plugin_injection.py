@@ -97,6 +97,7 @@ class GatewayPluginInjectionMixin:
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
         reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
         media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
+        as_command: bool = False,  # fork: werkbank-chat (WB-1256)
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
@@ -116,6 +117,8 @@ class GatewayPluginInjectionMixin:
                                                           reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
                                                           media_urls=media_urls, media_types=media_types)  # fork: werkbank-chat
         else:
+            if as_command and (media_urls or media_types):  # fork: werkbank-chat (WB-1256)
+                return False  # fork: werkbank-chat — a command carries no attachments
             if not isinstance(session_key, str) or not self._plugin_session_in_own_profile(  # fork: werkbank-chat
                     session_key, plugin_home=plugin_home, plugin_id=plugin_id,  # fork: werkbank-chat
                     what="Plugin message injection"):  # fork: werkbank-chat
@@ -126,6 +129,7 @@ class GatewayPluginInjectionMixin:
                 client_message_id=client_message_id,  # fork: werkbank-chat
                 reply_to_message_id=reply_to_message_id,  # fork: werkbank-chat
                 media_urls=media_urls, media_types=media_types,  # fork: werkbank-chat
+                as_command=as_command,  # fork: werkbank-chat (WB-1256)
             )
         return self._submit_plugin_coroutine(coro, loop, plugin_id=plugin_id, target=target,  # fork: werkbank-chat
                                              what="Plugin message injection")  # fork: werkbank-chat
@@ -204,9 +208,13 @@ class GatewayPluginInjectionMixin:
         client_message_id: Optional[str] = None,  # fork: werkbank-chat
         reply_to_message_id: Optional[str] = None,  # fork: werkbank-chat
         media_urls: Optional[list] = None, media_types: Optional[list] = None,  # fork: werkbank-chat
+        as_command: bool = False,  # fork: werkbank-chat (WB-1256)
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter. ``reply_to_message_id``
-        becomes the turn's reply anchor (``reply_anchor_override``); ``message_id`` stays unset."""
+        becomes the turn's reply anchor (``reply_anchor_override``); ``message_id`` stays unset.
+        ``as_command`` (WB-1256): the text is a slash command of the session's owner — it may control
+        the gateway (``allow_gateway_control``) and takes the owner's command path; its reply and its
+        pickers go to the session's event stream (``gateway/plugin_commands.py``)."""
         if not self._plugin_injection_accepting():
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
@@ -216,6 +224,14 @@ class GatewayPluginInjectionMixin:
         from gateway.session_identity import replace_source
         source = replace_source(self._restored_source(entry))
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
+            if as_command:  # fork: werkbank-chat (WB-1256) — the board learns why nothing happened
+                from gateway import plugin_commands  # fork: werkbank-chat
+                plugin_commands.emit_reply(MessageEvent(  # fork: werkbank-chat
+                    text=content, message_type=MessageType.TEXT, source=source, internal=True,  # fork: werkbank-chat
+                    metadata={"hermes_plugin_id": plugin_id, "gateway_session_key": session_key,  # fork: werkbank-chat
+                              "gateway_session_id": entry.session_id,  # fork: werkbank-chat
+                              **_client_message_id_meta(client_message_id)}),  # fork: werkbank-chat
+                    "Befehl abgewiesen: diese Sitzung darf keine Befehle ausführen.", refused=True)  # fork: werkbank-chat
             return False
 
         adapter = self._delivery_adapter_for(source)
@@ -225,13 +241,14 @@ class GatewayPluginInjectionMixin:
         async with self._plugin_injection_scope(source):
             await adapter.handle_message(_with_media(MessageEvent(  # fork: werkbank-chat
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
+                allow_gateway_control=bool(as_command),  # fork: werkbank-chat (WB-1256)
                 reply_anchor_override=reply_to_message_id,  # fork: werkbank-chat
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                     "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                     "gateway_session_strict": True,
                     **_client_message_id_meta(client_message_id),  # fork: werkbank-chat
+                    **({"hermes_plugin_command": True} if as_command else {}),  # fork: werkbank-chat (WB-1256)
                 },
             ), media_urls, media_types))  # fork: werkbank-chat
         logger.info(

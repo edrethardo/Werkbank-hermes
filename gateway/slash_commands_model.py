@@ -467,7 +467,8 @@ class GatewayModelCommandsMixin:
             # degraded provider can't stall the reply (#74003). Mirrors the GUI read path.
             non_blocking_catalogs=True, probe_custom_providers=False, probe_current_custom_provider=True,
         )
-        adapter = self._delivery_adapter_for(ctx.source)
+        from gateway.plugin_commands import picker_surface  # fork: werkbank-chat (WB-1256) — board card
+        adapter = picker_surface() or self._delivery_adapter_for(ctx.source)  # fork: werkbank-chat
         if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
             async def _picker_switch(model_id: str, provider_slug: str) -> str:
                 # The picker callback binds the raw event source (pre-normalization).
@@ -720,7 +721,8 @@ class GatewayModelCommandsMixin:
     ) -> bool:
         """Send an interactive choice picker when the adapter *type* supports it (the /model gate);
         a failed send returns False (text fallback) instead of erroring."""
-        adapter = self._delivery_adapter_for(event.source)
+        from gateway.plugin_commands import picker_surface  # fork: werkbank-chat (WB-1256) — board card
+        adapter = picker_surface() or self._delivery_adapter_for(event.source)  # fork: werkbank-chat
         if adapter is None or getattr(type(adapter), "send_choice_picker", None) is None:
             return False
         try:

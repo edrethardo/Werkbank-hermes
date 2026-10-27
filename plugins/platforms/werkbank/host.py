@@ -63,6 +63,7 @@ class GatewayHost:
         self.supports_reply_anchor = accepts_kwarg(getattr(ctx, "inject_message", None),
                                                    "reply_to_message_id")      # WB-1148
         self.supports_media = accepts_kwarg(getattr(ctx, "inject_message", None), "media_urls")   # WB-1174
+        self.supports_commands = accepts_kwarg(getattr(ctx, "inject_message", None), "as_command")  # WB-1256
 
     # -- the live gateway -------------------------------------------------------------------------
     def owner(self) -> Any:
@@ -84,11 +85,17 @@ class GatewayHost:
     # -- send / stop ----------------------------------------------------------------------------
     def inject(self, session_key: str, text: str, client_message_id: str,
                reply_to_message_id: Optional[str] = None,
-               media: Optional[List[Tuple[str, str]]] = None) -> Tuple[bool, bool]:
+               media: Optional[List[Tuple[str, str]]] = None, command: bool = False) -> Tuple[bool, bool]:
         """(accepted, the id travels with the message). ``reply_to_message_id``: the message Hermes'
         answer replies to, passed only when this core knows the parameter. ``media``: ``(path, type)``
-        attachments (WB-1174); refused (False) when this core cannot take them."""
+        attachments (WB-1174); refused (False) when this core cannot take them. ``command``
+        (WB-1256): the text is a slash command (``as_command=True``); refused (False) — never sent as
+        text — when this core does not know the parameter."""
         kwargs: Dict[str, Any] = {}
+        if command:
+            if not self.supports_commands:
+                return False, self.supports_client_message_id
+            kwargs["as_command"] = True
         if media:
             if not self.supports_media:
                 return False, self.supports_client_message_id
@@ -307,6 +314,11 @@ class GatewayHost:
         except Exception:
             return []
         return [approval_payload(data, redact_command) for data in list_gateway_approvals(session_key)]
+
+    def pending_choices(self, session_key: str) -> List[Dict[str, Any]]:
+        """WB-1256: the open choice cards of the session (``gateway/plugin_commands.py``)."""
+        from .commands import pending_choices
+        return pending_choices(session_key)
 
     def pending_clarify(self, session_key: str) -> List[Dict[str, Any]]:
         try:

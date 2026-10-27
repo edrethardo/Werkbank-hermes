@@ -1290,6 +1290,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
+        from gateway import plugin_commands  # fork: werkbank-chat (WB-1256)
+        if plugin_commands.needs_wrapping(event):  # fork: werkbank-chat — board command: reply to the stream
+            return await plugin_commands.handle(self, event, self._handle_message)  # fork: werkbank-chat
         from gateway.run import _AGENT_PENDING_SENTINEL
         # WB-1212 backstop: events built by hand (interaction passthrough, tests, internal routes) skip
         # BasePlatformAdapter.handle_message; redact before admission hooks see the text. Idempotent.
@@ -1382,6 +1385,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 if _consumed:
                     return _consumer_reply
             from gateway import session_events  # fork: werkbank-chat
+            plugin_commands.mark_turn(event)  # fork: werkbank-chat (WB-1256) — a rewritten command runs as a turn
             session_events.user_message(_quick_key, event, "turn")  # fork: werkbank-chat
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)

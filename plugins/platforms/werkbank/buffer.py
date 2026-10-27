@@ -47,7 +47,8 @@ _RECENT_USERS = 200         # user.message events kept for the snapshot (rows no
 _RECENT_ANSWERS = 20        # final answers of turn.done kept for the snapshot
 _TURN_STARTS = 200          # turn.start row marks kept: which answer row belongs to which turn
 _OBSERVED = 64              # session ids of one key with their observation mark
-_MARKED = ("user.message", "turn.start", "turn.done")
+_RECENT_COMMANDS = 20       # command.reply events kept for the snapshot (WB-1256: never a SessionDB row)
+_MARKED = ("user.message", "turn.start", "turn.done", "command.reply")
 # WB-1309: numbers a turn end carries for the board's status line (gateway/session_events._turn_context)
 _CONTEXT_FIELDS = ("context_tokens", "context_length", "compression_threshold")
 
@@ -98,6 +99,7 @@ class SessionBuffer:
         # Survive epochs: what a snapshot must show even before the SessionDB has it.
         self.recent_users: deque = deque(maxlen=_RECENT_USERS)
         self.recent_answers: deque = deque(maxlen=_RECENT_ANSWERS)
+        self.recent_commands: deque = deque(maxlen=_RECENT_COMMANDS)   # WB-1256
         # turn_id -> {session_id, mark} of its turn.start, in arrival order (row ids, never the clock)
         self.turn_starts: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.confirmed_order = 0         # order of the newest answer whose row was confirmed
@@ -373,6 +375,12 @@ class Buffers:
                     "origin": origin, "ts": ts, "delivery": payload.get("delivery"),
                     "synthetic": payload.get("synthetic"), "session_id": sid, "mark": mark,
                     "order": buf.order})
+            if type_ == "command.reply" and (payload.get("text") or "").strip():
+                # WB-1256: a command's reply has no SessionDB row — the snapshot shows it from here
+                buf.recent_commands.append({
+                    "id": f"cmd:{id_ if id_ is not None else buf.seq + 1}", "command": payload.get("command"),
+                    "text": str(payload["text"]), "ts": ts, "session_id": sid, "mark": mark,
+                    "refused": bool(payload.get("refused"))})
             if type_ == "turn.start" and id_ is not None:
                 buf.turn_starts[str(id_)] = {"session_id": sid, "mark": mark, "order": buf.order}
                 while len(buf.turn_starts) > _TURN_STARTS:
@@ -469,6 +477,7 @@ class Buffers:
                     "session_id": buf.session_id, "platform": buf.platform,
                     "recent_users": [dict(u) for u in buf.recent_users],
                     "recent_answers": [dict(a) for a in buf.recent_answers],
+                    "recent_commands": [dict(c) for c in buf.recent_commands],
                     "turn_starts": [dict(t) for t in buf.turn_starts.values()],
                     "confirmed_order": buf.confirmed_order,
                     "observed": dict(buf.observed),

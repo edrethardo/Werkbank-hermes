@@ -316,6 +316,8 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
                          "from_buffer": True}))
         have_ids.add(str(board_id))
     _place(messages, waiting)
+    _place(messages, [(_int(c.get("mark")), _command_item(c)) for c in pos.get("recent_commands") or []
+                      if c.get("session_id") in allowed and not below(c.get("mark"))])
 
     answer_ids = [rid for rid in (_row_id(r) for r in rows if _is_answer_row(r)) if rid is not None]
     uids = _row_uids(rows)
@@ -357,6 +359,18 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
     return confirmed
 
 
+COMMAND_HERKUNFT = "befehl"   # hermes_view.js: a command's reply is a system line of this origin
+
+
+def _command_item(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """WB-1256: a command's reply (``command.reply``) as a system line — it has no SessionDB row."""
+    return {"id": entry.get("id"), "client_message_id": None, "message_id": None, "db_id": None,
+            "role": "system", "kind": "system", "herkunft": COMMAND_HERKUNFT, "origin": "werkbank",
+            "command": entry.get("command"), "text": entry.get("text") or "", "ts": entry.get("ts"),
+            "tool_call_id": None, "tool_name": None, "is_error": bool(entry.get("refused")),
+            "truncated": False, "from_buffer": True}
+
+
 def _place(messages: List[Dict[str, Any]], waiting: List[tuple]) -> None:
     """Put each buffered entry where its row mark says it arrived (WB-1175): before the first
     history item whose row id lies above the mark — row ids only grow, the clock is never read.
@@ -396,6 +410,17 @@ def _with_subagent(buffers, session_key: str, pending: Dict[str, Any]) -> Dict[s
     return {**pending, "subagent_id": sub} if sub else pending
 
 
+def _pending_choices(host, session_key: str) -> List[Dict[str, Any]]:
+    """WB-1256: open choice cards (``choice.request`` payload shape); none for a host without them."""
+    pending = getattr(host, "pending_choices", None)
+    if not callable(pending):
+        return []
+    try:
+        return [p for p in pending(session_key) or [] if isinstance(p, dict)]
+    except Exception:
+        return []
+
+
 def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
     if buffers.get(session_key) is None:
         return None
@@ -425,6 +450,7 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
         "pending_approvals": [_with_subagent(buffers, session_key, p)
                               for p in host.pending_approvals(session_key) or []],
         "pending_clarify": list(host.pending_clarify(session_key) or []),
+        "pending_choices": list(_pending_choices(host, session_key)),
         "subagents": pos["subagents"],
         "session": session,
     }
