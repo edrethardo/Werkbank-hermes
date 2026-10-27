@@ -155,6 +155,10 @@ async def handle(runner: Any, event: Any, inner: Callable[[Any], Awaitable[Any]]
     meta = _meta(event)
     surface = ChoiceSurface(str(meta.get("gateway_session_key") or ""), meta.get("hermes_plugin_id"),
                             meta.get("client_message_id"), _platform(event))
+    # the command as sent rides with its cards like with command.reply (the stream can be faster than
+    # the board's POST: the board draws the sender's bubble above the card from it)
+    from gateway.session_events import _redact
+    surface.request = _redact(str(getattr(event, "text", "") or ""))[:REQUEST_CAP]
     token = _surface.set(surface)
     try:
         result = await inner(event)
@@ -189,11 +193,13 @@ class _Choice:
     plugin_id: Optional[str]
     platform: Optional[str]
     client_message_id: Optional[str]
+    request: str = ""
     created: float = field(default_factory=time.monotonic)
 
     def payload(self) -> Dict[str, Any]:
         return {"choice_id": self.choice_id, "kind": self.kind, "title": self.title,
-                "options": [dict(o) for o in self.options], "client_message_id": self.client_message_id}
+                "options": [dict(o) for o in self.options], "client_message_id": self.client_message_id,
+                "request": self.request}
 
 
 _lock = threading.Lock()
@@ -223,6 +229,7 @@ class ChoiceSurface:
         self.session_key = session_key
         self.plugin_id = plugin_id
         self.client_message_id = client_message_id
+        self.request = ""
         self.platform = platform
         self.closed = False
 
@@ -233,7 +240,7 @@ class ChoiceSurface:
             return SendResult(success=False, error="no choices")
         choice = _Choice("ch_" + secrets.token_hex(8), self.session_key, kind, _clip(title, TITLE_CAP),
                          options[:MAX_OPTIONS], run, asyncio.get_running_loop(), self.plugin_id,
-                         self.platform, self.client_message_id)
+                         self.platform, self.client_message_id, self.request)
         with _lock:
             # One open card per session, like Telegram's one picker per chat: the new one wins.
             replaced = [c for c in _open.values() if c.session_key == self.session_key]

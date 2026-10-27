@@ -325,6 +325,10 @@ async def test_model_picker_becomes_a_card_and_the_pick_switches_the_model(tmp_p
     request = _of(_settle(seen, lambda s: _of(s, "choice.request")), "choice.request")[0]
     card = request["payload"]
     assert request["session_key"] == KEY and card["kind"] == "model"
+    # the command as sent rides with the card: a board whose POST has not returned yet draws the
+    # sender's bubble ABOVE the card (the stream can be faster than the POST)
+    assert card["request"] == "/model" and card["client_message_id"] == "wb-m"
+    assert plugin_commands.pending(KEY)[0]["request"] == "/model"
     labels = [o["label"] for o in card["options"]]
     assert "gpt-5.5" in labels
     assert [p["choice_id"] for p in plugin_commands.pending(KEY)] == [card["choice_id"]]
