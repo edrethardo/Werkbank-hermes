@@ -181,4 +181,5 @@ def delegated_child_subprocess_env(
     if not (is_delegated_child_process_context() or os.environ.get("HERMES_KANBAN_TASK")
             or (env and (env.get("HERMES_KANBAN_TASK") or env.get(DELEGATED_CHILD_ENV_MARKER)))):
         return None if env is None else dict(env)
-    return scrub_kanban_env(os.environ if env is None else env)
+    from agent import delegation_identity  # fork: werkbank (WB-1338) — the child's own ids
+    return dict(delegation_identity.apply(scrub_kanban_env(os.environ if env is None else env)))

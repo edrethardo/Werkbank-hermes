@@ -109,6 +109,12 @@ produced; its fields are in the snapshot's `session`.
   open for its own session). The pick runs the command's own applier (the same one a Telegram tap
   runs) and closes the card exactly once (`choice.resolved`). One open card per session: a newer
   card replaces it (`choice.expired`, `cause: ersetzt`).
+* `POST /v1/s/{key}/subagents/steer {delegation_id, task_index, text}` (WB-1338, `subagents.py`) →
+  `{steered: true}`: queues `text` into a RUNNING subagent of THIS session (its live record's
+  `delegation_id`, transcript `task-<task_index>.log`, owner = this session) via
+  `steer_subagent` — it lands at the child's next iteration boundary. A child of another session or
+  an unknown one: `404`; a finished child: `409` (`grund` „Subagent beendet …“); bad ids/text: `400`.
+  The text is never logged.
 * `GET /v1/commands` (WB-1256) → `{commands: [{name, args, description}]}`: the gateway's slash
   commands (registry, gateway-available, plus plugin commands) for the board's completion.
 * `POST /v1/s/{key}/uploads {name, data}` (WB-1174, `uploads.py`) → `{upload_id, name, type, size, kind}`.

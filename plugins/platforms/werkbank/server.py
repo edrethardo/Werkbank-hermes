@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Optional
 from . import approvals, snapshot
 from . import commands as commands_mod
 from . import mirror as mirror_mod
+from . import subagents as subagents_mod
 from . import uploads as uploads_mod
 
 logger = logging.getLogger("plugins.platforms.werkbank")
@@ -530,6 +531,12 @@ def _handler(app: WerkbankServer):
                 status, payload = commands_mod.answer_choice(key, urllib.parse.unquote(what[1]), body)
                 if status == 200:
                     logger.info("werkbank: choice card answered from the board")
+                return self._json(status, payload)
+            if what == ["subagents", "steer"]:              # WB-1338: write to a running child
+                buf = app.buffers.get(key)
+                ids = {getattr(buf, "session_id", None), app.host.current_session_id(key)}
+                status, payload = subagents_mod.steer(ids, body)
+                logger.info("werkbank: subagent steer from the board (status=%s)", status)
                 return self._json(status, payload)
             self._refuse(404, "not found", "Unbekannter Pfad.")
 
