@@ -144,6 +144,19 @@ def test_zu_grosse_datei_wird_karte_ohne_bytes(tmp_path):
         srv.server.stop()
 
 
+def test_zu_grosse_datei_wird_gar_nicht_erst_gelesen(tmp_path):
+    """The limit is checked on the size BEFORE copying (a 2 GB video is never read); the copy's own
+    stop at the limit is only the second line (a file that grows while it is copied)."""
+    src = _files(tmp_path, gross_pdf=PDF)
+    box = outbox_mod.Outbox(tmp_path / "home", max_file=100)
+
+    def no_copy(*_a, **_k):
+        raise AssertionError("copied although over the limit")
+    box._copy = no_copy
+    [f] = box.ingest(KEY_SESSION, [(str(src["gross_pdf"]), False)], ["r"])
+    assert f["fehlt"] == "zu_gross" and f["id"] is None
+
+
 def test_nicht_beobachtete_sitzung_kopiert_nichts(tmp_path):
     src = _files(tmp_path, bild_png=PNG)
     srv = _server(tmp_path)
@@ -498,8 +511,11 @@ def test_hls_stufen_240_480_720_niedrigste_zuerst_4s_segmente(tmp_path):
     # a 4-s 240p segment stays near its ~300 kbit/s video (+ 64 kbit/s audio)
     first = box.hls_path(KEY_SESSION, meta["id"], f"{tok}-240-00004.ts")[0]
     assert first.stat().st_size * 8 / 4 < 520_000
-    # nothing beside the file's own names, never another session
+    # nothing beside the file's own names, never another session — also not a file that IS there
+    other = master.parent / "0123456789abcdef-240.m3u8"
+    other.write_text("#EXTM3U\n", encoding="utf-8")
     assert box.hls_path(KEY_SESSION, meta["id"], "0123456789abcdef-240.m3u8") is None
+    other.unlink()
     assert box.hls_path(KEY_SESSION, meta["id"], "meta.json") is None
     assert box.hls_path("agent:other", meta["id"], "master.m3u8") is None
 
