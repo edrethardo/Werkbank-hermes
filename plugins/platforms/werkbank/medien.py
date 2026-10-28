@@ -138,3 +138,16 @@ class Werkstatt:
         os.chmod(part, 0o600)
         os.replace(part, out)
         return True
+
+    def ffmpeg_raw(self, args: List[str], *, timeout: Optional[float] = None) -> bool:
+        """``ffmpeg -y -v error <args>`` as it is (HLS: the muxer names its own files); nice, ionice,
+        time limit and ``umask 077`` like :meth:`ffmpeg`. The caller cleans up on failure."""
+        if not self.ffmpeg_bin:
+            return False
+        cmd = self._prefix + [self.ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-threads", THREADS, *args]
+        try:
+            done = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, timeout=timeout or self.timeout, umask=0o077)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return done.returncode == 0

@@ -62,6 +62,12 @@ VARIANTS = {"klein": ("klein.webp", "image/webp"), "gross": ("gross.webp", "imag
             "m4a": ("play.m4a", "audio/mp4")}
 KLEIN_PX, GROSS_PX, POSTER_PX = 360, 2048, 480
 VIDEO_KURZSEITE = 1080
+# HLS tiers (short side, video bit/s, audio bit/s), lowest first; 4 s segments
+HLS_STUFEN = ((240, 300_000, 64_000), (480, 800_000, 96_000), (720, 2_000_000, 128_000),
+              (1080, 4_500_000, 128_000))
+HLS_SEGMENT_S = 4
+HLS_PLAYLIST = "application/vnd.apple.mpegurl"
+HLS_NAME_RE = re.compile(r"master\.m3u8|[0-9a-f]{16}-\d{3,4}(?:-\d{5}\.ts|\.m3u8)")
 
 _FTYP_VIDEO = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ",
                b"M4VP", b"mmp4", b"MSNV", b"3gp4", b"3gp5", b"3g2a")
@@ -207,7 +213,7 @@ class Outbox:
         out = {k: meta[k] for k in ("id", "name", "type", "size", "kind", "nur_download", "abspielbar")
                if k in meta}
         out["fassungen"] = dict(meta.get("fassungen") or {})
-        for k in ("voice", "dauer", "breite", "hoehe", "grund", "fehlt", "grenze"):
+        for k in ("voice", "dauer", "breite", "hoehe", "grund", "fehlt", "grenze", "hls_stufen"):
             if meta.get(k) not in (None, ""):
                 out[k] = meta[k]
         return out
@@ -356,6 +362,8 @@ class Outbox:
         elif meta["kind"] == VIDEO:
             f["poster"] = WARTET
             f["mp4"] = WARTET
+            f["hls"] = WARTET
+            meta["hls_token"] = secrets.token_hex(8)       # segment names nobody can guess
         elif meta["kind"] == AUDIO and meta["type"] in ("audio/ogg", "audio/webm"):
             f["m4a"] = WARTET
 
@@ -369,6 +377,7 @@ class Outbox:
         elif meta["kind"] == VIDEO:
             w.submit(lambda: self._job_video_head(digest, fid), prio=0)
             w.submit(lambda: self._job_video_mp4(digest, fid), prio=1)
+            w.submit(lambda: self._job_hls_plan(digest, fid), prio=2)
         elif meta["kind"] == AUDIO:
             w.submit(lambda: self._job_audio(digest, fid), prio=1)
 
@@ -481,6 +490,133 @@ class Outbox:
                  "-movflags", "+faststart"], out, fmt="mp4")
             how = "kodiert"
         self._done(digest, fid, "mp4", ok, mp4_weg=how if ok else None)
+
+    # -- HLS (WB-1321 Nachtrag „nicht immer gutes Internet“) -------------------------------------
+    def hls_tiers(self, view: Dict[str, Any]) -> List[Tuple[int, int, int, int, int]]:
+        """``[(height-or-short-side, width, height, video bit/s, audio bit/s)]`` lowest first: 240p
+        always, 480/720 when the source has them, 1080 only when it has 1080."""
+        v = (view or {}).get("v") or {}
+        try:
+            w, h = int(v.get("width") or 0), int(v.get("height") or 0)
+        except (TypeError, ValueError):
+            w = h = 0
+        if w <= 0 or h <= 0:
+            w, h = 640, 360
+        short = min(w, h)
+        tiers = []
+        for stufe, vbit, abit in HLS_STUFEN:
+            if stufe != HLS_STUFEN[0][0] and stufe > short:
+                continue
+            if w >= h:
+                oh = stufe
+                ow = max(2, int(round(w * stufe / h / 2)) * 2)
+            else:
+                ow = stufe
+                oh = max(2, int(round(h * stufe / w / 2)) * 2)
+            tiers.append((stufe, ow, oh, vbit, abit))
+        return tiers
+
+    def _job_hls_plan(self, digest: str, fid: str) -> None:
+        """One job per tier, lowest first (all at priority 2: a new file's preview still goes first)."""
+        meta = self._meta(digest, fid)
+        if meta is None:
+            return
+        tiers = self.hls_tiers(meta.get("probe") or {})
+        with self._lock:
+            meta["hls_plan"] = [t[0] for t in tiers]
+            meta["hls_stufen"] = []
+            self._save(meta)
+        for tier in tiers:
+            self.werkstatt.submit(lambda t=tier: self._job_hls_tier(digest, fid, t), prio=2)
+
+    def _job_hls_tier(self, digest: str, fid: str, tier) -> None:
+        stufe, ow, oh, vbit, abit = tier
+        meta = self._meta(digest, fid)
+        if meta is None or not meta.get("hls_token"):
+            return
+        folder = self._folder(digest, fid)
+        tok = meta["hls_token"]
+        has_audio = bool((meta.get("probe") or {}).get("a"))
+        name = f"{tok}-{stufe}"
+        part = folder / f"{name}.m3u8.part"
+        level = "4.0" if stufe >= 1080 else ("3.1" if stufe >= 720 else "3.0")
+        profile = "high" if stufe >= 1080 else "main"
+        args = ["-i", str(folder / "original"), "-map", "0:v:0", *(["-map", "0:a:0"] if has_audio else []),
+                "-sn", "-dn", "-vf", f"scale={ow}:{oh}", "-c:v", "libx264", "-profile:v", profile,
+                "-level:v", level, "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                "-b:v", str(vbit), "-maxrate", str(int(vbit * 1.07)), "-bufsize", str(int(vbit * 1.5)),
+                "-force_key_frames", f"expr:gte(t,n_forced*{HLS_SEGMENT_S})", "-sc_threshold", "0"]
+        if has_audio:
+            args += ["-c:a", "aac", "-b:a", str(abit), "-ac", "2"]
+        args += ["-f", "hls", "-hls_time", str(HLS_SEGMENT_S), "-hls_playlist_type", "vod",
+                 "-hls_flags", "independent_segments",
+                 "-hls_segment_filename", str(folder / f"{name}-%05d.ts"), str(part)]
+        ok = self.werkstatt.ffmpeg_raw(args)
+        if ok and part.is_file():
+            os.chmod(part, 0o600)
+            os.replace(part, folder / f"{name}.m3u8")
+        else:
+            ok = False
+            for leftover in list(folder.glob(f"{name}-*.ts")) + [part]:
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+        with self._lock:
+            meta = self._meta(digest, fid)
+            if meta is None:
+                return
+            done = [s for s in meta.get("hls_stufen") or [] if s != stufe]
+            if ok:
+                done.append(stufe)
+            meta["hls_stufen"] = sorted(done)
+            plan = meta.get("hls_plan") or []
+            if done:
+                self._write_master(folder, meta, has_audio)
+                meta["fassungen"]["hls"] = BEREIT                # playable from the first tier on
+            elif stufe == (plan[-1] if plan else stufe):
+                meta["fassungen"]["hls"] = FEHLER
+            try:
+                self._save(meta)
+            except OSError:
+                pass
+
+    def _write_master(self, folder: Path, meta: Dict[str, Any], has_audio: bool) -> None:
+        """The master playlist of the tiers built so far, LOWEST FIRST: Safari starts with the
+        first variant (a quick start on a weak line) and climbs when the line allows."""
+        tiers = {t[0]: t for t in self.hls_tiers(meta.get("probe") or {})}
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-INDEPENDENT-SEGMENTS"]
+        for stufe in sorted(meta.get("hls_stufen") or []):
+            _s, ow, oh, vbit, abit = tiers.get(stufe, (stufe, 0, 0, 0, 0))
+            codec = {240: "avc1.4d401e", 480: "avc1.4d401e", 720: "avc1.4d401f"}.get(stufe, "avc1.640028")
+            codecs = codec + (",mp4a.40.2" if has_audio else "")
+            band = int((vbit + (abit if has_audio else 0)) * 1.15)
+            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={band},AVERAGE-BANDWIDTH={vbit + (abit if has_audio else 0)},'
+                         f'RESOLUTION={ow}x{oh},CODECS="{codecs}"')
+            lines.append(f"{meta['hls_token']}-{stufe}.m3u8")
+        part = folder / "master.m3u8.part"
+        fd = os.open(str(part), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        os.replace(part, folder / "master.m3u8")
+
+    def hls_path(self, session_key: str, fid: str, name: str) -> Optional[Tuple[Path, str]]:
+        """``(path, media type)`` of the master playlist, a tier playlist or a segment of a file of
+        THIS session. Only names of the file's own token — nothing else in the folder."""
+        meta = self.get(session_key, fid)
+        if meta is None or not meta.get("hls_token") or not isinstance(name, str):
+            return None
+        tok = re.escape(meta["hls_token"])
+        if name == "master.m3u8":
+            media_type = HLS_PLAYLIST
+        elif re.fullmatch(tok + r"-\d{3,4}\.m3u8", name):
+            media_type = HLS_PLAYLIST
+        elif re.fullmatch(tok + r"-\d{3,4}-\d{5}\.ts", name):
+            media_type = "video/mp2t"
+        else:
+            return None
+        found = self._folder(meta["digest"], fid) / name
+        return (found, media_type) if found.is_file() and not found.is_symlink() else None
 
     def _job_audio(self, digest: str, fid: str) -> None:
         folder = self._folder(digest, fid)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import shutil
 import stat
 import struct
@@ -385,7 +386,8 @@ def test_video_wird_faststart_h264_aac_mit_poster(tmp_path):
     src = _make(tmp_path, "roh.avi", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=25:duration=2",
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:v", "mpeg4", "-c:a", "pcm_s16le")
     box, meta = _ingest(tmp_path, src)
-    assert meta["kind"] == "video" and meta["fassungen"] == {"poster": "bereit", "mp4": "bereit"}
+    assert meta["kind"] == "video"
+    assert meta["fassungen"] == {"poster": "bereit", "mp4": "bereit", "hls": "bereit"}
     assert meta["mp4_weg"] == "kodiert" and meta["abspielbar"] is False and 1.5 <= meta["dauer"] <= 2.5
     mp4, ctype = box.path(KEY_SESSION, meta["id"], "mp4")
     assert ctype == "video/mp4" and _faststart(mp4)
@@ -448,3 +450,92 @@ def test_bild_bekommt_kleine_und_grosse_webp_vorschau(tmp_path):
     g = next(s for s in _probe(gross)["streams"])
     assert (k["width"], k["height"]) == (360, 240) and g["width"] == 2048 and abs(g["height"] - 1365) <= 1
     assert klein.stat().st_size < 40_000 and gross.stat().st_size < src.stat().st_size
+
+
+# ── HLS: several tiers, lowest first ─────────────────────────────────────────────────────────
+
+
+def _master(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            attrs = dict(re.findall(r'([A-Z-]+)=("[^"]*"|[^,]*)', line[len("#EXT-X-STREAM-INF:"):]))
+            out.append((attrs, lines[i + 1]))
+    return lines, out
+
+
+@needs_ffmpeg
+def test_hls_stufen_240_480_720_niedrigste_zuerst_4s_segmente(tmp_path):
+    src = _make(tmp_path, "film.mp4", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=9",
+                "-f", "lavfi", "-i", "sine=duration=9", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-shortest")
+    box, meta = _ingest(tmp_path, src)
+    assert meta["fassungen"]["hls"] == "bereit" and meta["hls_stufen"] == [240, 480, 720]
+    tok = meta["hls_token"]
+    assert re.fullmatch(r"[0-9a-f]{16}", tok)
+    master, mtype = box.hls_path(KEY_SESSION, meta["id"], "master.m3u8")
+    assert mtype == "application/vnd.apple.mpegurl"
+    lines, variants = _master(master)
+    assert lines[0] == "#EXTM3U"
+    assert [v[1] for v in variants] == [f"{tok}-240.m3u8", f"{tok}-480.m3u8", f"{tok}-720.m3u8"]   # lowest first
+    assert [v[0]["RESOLUTION"] for v in variants] == ["426x240", "854x480", "1280x720"]
+    bands = [int(v[0]["BANDWIDTH"]) for v in variants]
+    assert bands == sorted(bands) and bands[0] < 500_000 and 'mp4a.40.2' in variants[0][0]["CODECS"]
+    for stufe, (attrs, name) in zip((240, 480, 720), variants):
+        playlist, ptype = box.hls_path(KEY_SESSION, meta["id"], name)
+        text = playlist.read_text(encoding="utf-8")
+        durations = [float(d) for d in re.findall(r"#EXTINF:([0-9.]+)", text)]
+        assert len(durations) == 3 and max(durations) <= 4.1 and "#EXT-X-ENDLIST" in text
+        segs = [l for l in text.splitlines() if l and not l.startswith("#")]
+        assert all(re.fullmatch(tok + rf"-{stufe}-\d{{5}}\.ts", s) for s in segs)
+        seg, stype = box.hls_path(KEY_SESSION, meta["id"], segs[0])
+        assert stype == "video/mp2t" and stat.S_IMODE(seg.stat().st_mode) == 0o600
+        v = next(s for s in _probe(playlist)["streams"] if s["codec_type"] == "video")
+        assert (v["codec_name"], v["height"]) == ("h264", stufe)
+    # a 240p segment stays near its ~300 kbit/s video (+ 64 kbit/s audio)
+    first = box.hls_path(KEY_SESSION, meta["id"], f"{tok}-240-00000.ts")[0]
+    assert first.stat().st_size * 8 / 4 < 520_000
+    # nothing beside the file's own names, never another session
+    assert box.hls_path(KEY_SESSION, meta["id"], "0123456789abcdef-240.m3u8") is None
+    assert box.hls_path(KEY_SESSION, meta["id"], "meta.json") is None
+    assert box.hls_path("agent:other", meta["id"], "master.m3u8") is None
+
+
+@needs_ffmpeg
+def test_hls_1080_nur_wenn_die_quelle_es_hat(tmp_path):
+    src = _make(tmp_path, "gross.mp4", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=5:duration=1",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p")
+    box, meta = _ingest(tmp_path, src)
+    assert meta["hls_stufen"] == [240, 480, 720, 1080]
+    _lines, variants = _master(box.hls_path(KEY_SESSION, meta["id"], "master.m3u8")[0])
+    assert variants[-1][0]["RESOLUTION"] == "1920x1080" and "mp4a" not in variants[-1][0]["CODECS"]   # no audio
+    small = _make(tmp_path, "klein.mp4", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=5:duration=1",
+                  "-c:v", "libx264", "-pix_fmt", "yuv420p")
+    box2, meta2 = _ingest(tmp_path / "zwei", small)
+    assert meta2["hls_stufen"] == [240]
+
+
+@needs_ffmpeg
+def test_hls_route_mit_range_nur_eigene_sitzung(tmp_path):
+    src = _make(tmp_path, "film.mp4", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=5",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p")
+    srv = _server(tmp_path, ffmpeg=True)
+    try:
+        _done(srv, f"MEDIA:{src}")
+        [ev] = _stream(srv)
+        fid = ev["payload"]["files"][0]["id"]
+        status, meta = call(srv.port, "GET", session_path("files", fid), srv.key)
+        assert meta["fassungen"]["hls"] == "bereit" and "hls_token" not in meta
+        status, head, body = _get(srv.port, session_path("files", fid, "hls", "master.m3u8"), srv.key)
+        assert status == 200 and head["Content-Type"] == "application/vnd.apple.mpegurl"
+        tier = [l for l in body.decode().splitlines() if l and not l.startswith("#")][0]
+        status, head, body = _get(srv.port, session_path("files", fid, "hls", tier), srv.key)
+        seg = [l for l in body.decode().splitlines() if l and not l.startswith("#")][0]
+        status, head, body = _get(srv.port, session_path("files", fid, "hls", seg), srv.key, {"Range": "bytes=0-187"})
+        assert status == 206 and head["Content-Type"] == "video/mp2t" and len(body) == 188 and body[0] == 0x47
+        assert _get(srv.port, session_path("files", fid, "hls", "../original"), srv.key)[0] == 400
+        assert _get(srv.port, session_path("files", fid, "hls", "0" * 16 + "-240.m3u8"), srv.key)[0] == 404
+        assert _get(srv.port, session_path("files", fid, "hls", "master.m3u8"), "falsch")[0] == 401
+    finally:
+        srv.server.stop()

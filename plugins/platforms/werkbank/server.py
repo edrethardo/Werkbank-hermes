@@ -364,11 +364,14 @@ def _handler(app: WerkbankServer):
                     return self._upload_file(key, urllib.parse.unquote(what[1]))
                 if len(what) in (2, 3) and what[0] == "files":          # WB-1321
                     return self._outbox_file(key, what[1], what[2] if len(what) == 3 else None)
+                if len(what) == 4 and what[0] == "files" and what[2] == "hls":      # WB-1321: HLS
+                    return self._outbox_file(key, what[1], "hls", hls_name=what[3])
             self._refuse(404, "not found", "Unbekannter Pfad.")
 
-        def _outbox_file(self, key: str, fid: str, variant: Optional[str]):
+        def _outbox_file(self, key: str, fid: str, variant: Optional[str], hls_name: Optional[str] = None):
             """WB-1321: a file Hermes sent in THIS session — its metadata, or the bytes of one variant
-            (``original`` or a ready playback version) with single-range support (206/416)."""
+            (``original`` or a ready playback version, or an HLS playlist/segment) with single-range
+            support (206/416)."""
             if app.outbox is None:
                 return self._refuse(501, "no outbox", "Dateiablage ist nicht eingerichtet.")
             if not outbox_mod.ID_RE.fullmatch(fid or ""):
@@ -378,9 +381,14 @@ def _handler(app: WerkbankServer):
                 if meta is None:
                     return self._refuse(404, "unknown file", "Diese Datei gibt es (nicht mehr).")
                 return self._json(200, app.outbox.public(meta))
-            if variant != "original" and variant not in outbox_mod.VARIANTS:
+            if variant == "hls":
+                if not outbox_mod.HLS_NAME_RE.fullmatch(hls_name or ""):
+                    return self._refuse(400, "bad hls name", "Unbekannter HLS-Teil.")
+                found = app.outbox.hls_path(key, fid, hls_name)
+            elif variant != "original" and variant not in outbox_mod.VARIANTS:
                 return self._refuse(400, "bad variant", "Unbekannte Fassung.")
-            found = app.outbox.path(key, fid, variant)
+            else:
+                found = app.outbox.path(key, fid, variant)
             if found is None:
                 return self._refuse(404, "unknown file", "Diese Datei oder Fassung gibt es (noch) nicht.")
             path, media_type = found

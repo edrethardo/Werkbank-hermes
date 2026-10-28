@@ -221,6 +221,16 @@ raw tags. Now:
   multi-range header → the whole file (`200`). Streamed in 256 KiB chunks.
 * Housekeeping on every new file: folders older than 30 days go, then the oldest until all outbox
   files of the profile together are ≤ 4 GiB (a folder a job still writes into stays).
+* **HLS** (WB-1321, second step, for weak lines): after the MP4 (priority 2, one job per tier,
+  LOWEST first) a video gets 4-s HLS segments in tiers 240p (~300 kbit/s video + 64 kbit/s audio),
+  480p (~800 + 96), 720p (~2000 + 128) as far as the source's short side reaches, 1080p (~4500 + 128)
+  only when the source has 1080; H.264 Main (1080: High), AAC, a keyframe every 4 s. `fassungen.hls`
+  is `bereit` as soon as the 240p tier exists (`hls_stufen` lists the built ones); the master
+  playlist lists the tiers lowest first (Safari starts there and climbs), `BANDWIDTH`,
+  `AVERAGE-BANDWIDTH`, `RESOLUTION`, `CODECS`. Names: `master.m3u8`, `<token>-<tier>.m3u8`,
+  `<token>-<tier>-<n>.ts` — the 64-bit token is per file and never in an answer. `GET
+  /v1/s/{key}/files/{id}/hls/<name>` → the playlist (`application/vnd.apple.mpegurl`) or segment
+  (`video/mp2t`), same Range rules; a name not of this file's token → `404`, any other shape `400`.
 
 ## Snapshot
 
