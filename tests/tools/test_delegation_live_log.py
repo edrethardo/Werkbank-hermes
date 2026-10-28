@@ -233,6 +233,20 @@ def test_goal_header_is_redacted():
     assert "deploy using" in body
 
 
+def test_header_names_the_parent_session(tmp_path):
+    """fork: werkbank (WB-1338) — the transcript head names the chat that delegated, so the board can
+    check a child's HERMES_PARENT_SESSION_ID against the file instead of trusting the environment."""
+    _id, _w, paths = create_live_transcripts([{"goal": "g"}], home=tmp_path,
+                                             parent_session="20261028_154807_354623")
+    head = Path(paths[0]).read_text(encoding="utf-8").split("=" * 40)[0]
+    assert "\nparent_session: 20261028_154807_354623\n" in head
+    _id, _w, paths = create_live_transcripts([{"goal": "g"}], home=tmp_path,
+                                             parent_session="../x\nparent_session: evil")
+    assert "parent_session:" not in Path(paths[0]).read_text(encoding="utf-8")
+    _id, _w, paths = create_live_transcripts([{"goal": "g"}], home=tmp_path)
+    assert "parent_session:" not in Path(paths[0]).read_text(encoding="utf-8")
+
+
 def test_manifest_goal_is_redacted():
     """manifest.json shares the mounted dir with the .log files.
 

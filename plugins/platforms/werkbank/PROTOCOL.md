@@ -114,7 +114,10 @@ produced; its fields are in the snapshot's `session`.
   `delegation_id`, transcript `task-<task_index>.log`, owner = this session) via
   `steer_subagent` — it lands at the child's next iteration boundary. A child of another session or
   an unknown one: `404`; a finished child: `409` (`grund` „Subagent beendet …“); bad ids/text: `400`.
-  The text is never logged.
+  Lookup, ownership check and the steer run under ONE delegate-registry lock (no recycled id gets
+  the text). The gateway log gets only the status, never the text; the text itself becomes part of
+  the child's conversation like every steer (its session/transcript, or `missed_steer` in the
+  delegate result when the child finished before the next boundary).
 * `GET /v1/commands` (WB-1256) → `{commands: [{name, args, description}]}`: the gateway's slash
   commands (registry, gateway-available, plus plugin commands) for the board's completion.
 * `POST /v1/s/{key}/uploads {name, data}` (WB-1174, `uploads.py`) → `{upload_id, name, type, size, kind}`.

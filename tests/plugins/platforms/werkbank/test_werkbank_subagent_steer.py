@@ -91,3 +91,53 @@ def test_bad_requests(srv, children, body):
     agent = children("sa-0", 0)
     assert steer(srv, **body)[0] == 400
     assert agent.steered == []
+
+
+def test_ownership_check_and_steer_hold_one_registry_lock(srv, children, monkeypatch):
+    """Review WB-1338: between the ownership check and the steer the record must not change. A
+    recycled id (the record swapped for another chat's child right after a lock release) never
+    gets the text: check and ``agent.steer`` run under ONE ``_active_subagents_lock``."""
+    mine = children("sa-1", 1)
+    foreign = _Agent(1)
+    real = reg._active_subagents_lock
+
+    class _SwapOnRelease:
+        swapped = False
+
+        def __enter__(self):
+            real.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            real.release()
+            if not _SwapOnRelease.swapped:
+                _SwapOnRelease.swapped = True
+                reg._active_subagents["sa-1"] = {
+                    "subagent_id": "sa-1", "delegation_id": DELEG, "agent": foreign,
+                    "owner_agent_session_id": "20990101_000000_ffffff", "status": "running",
+                    "accepting_steer": True}
+            return False
+
+        def acquire(self, *a, **kw):
+            return real.acquire(*a, **kw)
+
+        def release(self):
+            return real.release()
+
+        def locked(self):
+            return real.locked()
+
+    monkeypatch.setattr(reg, "_active_subagents_lock", _SwapOnRelease())
+    status, body = steer(srv, delegation_id=DELEG, task_index=1, text="nur für meins")
+    assert foreign.steered == [], "die Zeile ging an das Kind einer anderen Sitzung"
+    assert (status, mine.steered) == (200, ["nur für meins"])
+
+
+def test_steer_text_never_reaches_the_gateway_log(srv, children, caplog):
+    import logging as _logging
+    children("sa-1", 1)
+    secret_line = "streng-vertraulich-7f3a"
+    with caplog.at_level(_logging.DEBUG):
+        assert steer(srv, delegation_id=DELEG, task_index=1, text=secret_line)[0] == 200
+        assert steer(srv, delegation_id=DELEG, task_index=9, text=secret_line)[0] == 404
+    assert secret_line not in caplog.text

@@ -36,6 +36,9 @@ _KICKOFF_MAX = 500
 # event type arrives (or on completion); capped so a huge reply can't hold memory.
 _STREAM_BUFFER_FLUSH_CHARS = 4000
 _TIME_FMT = "%Y-%m-%d %H:%M:%S"
+# fork: werkbank (WB-1338) — the shape of a session id in the `parent_session:` header line
+import re as _re
+_PARENT_SESSION_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 
 
 def live_transcript_root(home: Optional[Path] = None) -> Path:
@@ -94,7 +97,8 @@ class LiveTranscriptWriter:
     failure flips ``_ok`` off and later calls become debug-logged no-ops."""
 
     def __init__(self, delegation_id: str, task_index: int, goal: str,
-                 context: Optional[str] = None, root: Optional[Path] = None):
+                 context: Optional[str] = None, root: Optional[Path] = None,
+                 parent_session: Optional[str] = None):
         self.delegation_id = delegation_id
         self.task_index = task_index
         self._ok = False
@@ -102,6 +106,11 @@ class LiveTranscriptWriter:
         self._stream_buf: List[str] = []
         self._stream_len = 0
         self.path: Optional[Path] = None
+        # fork: werkbank (WB-1338) — the chat that delegated, so a reader can check a child's
+        # HERMES_PARENT_SESSION_ID against the file; only a well-formed id, never free text
+        parent_line = (f"parent_session: {parent_session}\n"
+                       if isinstance(parent_session, str) and _PARENT_SESSION_RE.fullmatch(parent_session)
+                       else "")
         with _best_effort(f"init ({delegation_id} task {task_index})"):
             goal_line = _one_line(goal, _KICKOFF_MAX)
             d = (root if root is not None else live_transcript_root()) / delegation_id
@@ -110,6 +119,7 @@ class LiveTranscriptWriter:
             path.write_text(
                 "=== Hermes subagent live transcript ===\n"
                 f"delegation: {delegation_id}   task: {task_index}\n"
+                + parent_line +
                 f"goal: {_redact(goal_line)}\n"  # header bypasses event(), so redact here too
                 f"started: {time.strftime(_TIME_FMT)}\n"
                 "(append-only; streams while the subagent runs — tail -f me)\n"
@@ -272,6 +282,7 @@ def create_live_transcripts(
     delegation_id: Optional[str] = None, model: Optional[str] = None,
     provider: Optional[str] = None,
     home: Optional[Path] = None,
+    parent_session: Optional[str] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """One pre-headered writer per task + a manifest.json; prunes stale dirs.
     Returns ``(delegation_id, writers, paths)``; on any top-level failure
@@ -289,7 +300,8 @@ def create_live_transcripts(
         deleg_id = delegation_id or f"deleg_{uuid.uuid4().hex[:8]}"
         root = live_transcript_root(home)
         made = [LiveTranscriptWriter(deleg_id, i, str(t.get("goal", "")),
-                                     context=t.get("context") or context, root=root)
+                                     context=t.get("context") or context, root=root,
+                                     parent_session=parent_session)
                 for i, t in enumerate(task_list)]
         writers: List[Optional[LiveTranscriptWriter]] = [w if w.path is not None else None for w in made]
         paths: List[str] = [str(w.path) for w in made if w.path is not None]

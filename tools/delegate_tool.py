@@ -815,6 +815,7 @@ def delegate_task(
         live_deleg_id, live_writers, live_paths = create_live_transcripts(
             task_list, context, model=creds.get("model"), provider=creds.get("provider"),
             home=_live_home,
+            parent_session=getattr(parent_agent, "session_id", None),  # fork: werkbank (WB-1338)
         )
         _announce_batch(parent_agent, len(task_list), live_deleg_id)
         origin = _capture_origin()

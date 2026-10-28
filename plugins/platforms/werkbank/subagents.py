@@ -24,12 +24,6 @@ DELEG_RE = re.compile(r"deleg_[0-9a-f]{6,32}")
 MAX_STEER_TEXT = 20_000
 
 
-def _records():
-    from tools import delegate_tool_registry as reg
-    with reg._active_subagents_lock:
-        return [(sid, dict(r)) for sid, r in reg._active_subagents.items()]
-
-
 def _task_of(record: Dict[str, Any]):
     path = getattr(record.get("agent"), "_live_transcript_path", None)
     if not isinstance(path, str):
@@ -48,16 +42,25 @@ def steer(session_ids: Iterable[str], body: Dict[str, Any]) -> Tuple[int, Dict[s
         return 400, {"error": "bad text", "grund": f"Bitte einen Text senden (höchstens {MAX_STEER_TEXT} "
                                                   "Zeichen).", "steered": False}
     mine = {s for s in session_ids if s}
-    found = [(sid, r) for sid, r in _records()
-             if r.get("delegation_id") == deleg and _task_of(r) == task
-             and (r.get("owner_agent_session_id") in mine or r.get("owner_session_id") in mine)]
-    if len(found) != 1:
-        return 404, {"error": "unknown subagent", "steered": False,
-                     "grund": "Diesen Subagenten gibt es in dieser Sitzung nicht (mehr)."}
-    sid, record = found[0]
-    if not record.get("accepting_steer", False):
-        return 409, {"error": "finished", "steered": False, "grund": "Subagent beendet — er nimmt nichts mehr an."}
     from tools import delegate_tool_registry as reg
-    if not reg.steer_subagent(sid, text.strip()):
+    # Review WB-1338: find, ownership check and ``agent.steer`` under ONE registry lock (the same
+    # lock ``steer_subagent`` and ``_close_subagent_steering`` hold) — a record swapped between a
+    # snapshot and the steer (recycled id, another chat's child) can never get the text.
+    with reg._active_subagents_lock:
+        found = [r for _sid, r in reg._active_subagents.items()
+                 if r.get("delegation_id") == deleg and _task_of(r) == task
+                 and (r.get("owner_agent_session_id") in mine or r.get("owner_session_id") in mine)]
+        if len(found) != 1:
+            return 404, {"error": "unknown subagent", "steered": False,
+                         "grund": "Diesen Subagenten gibt es in dieser Sitzung nicht (mehr)."}
+        record = found[0]
+        agent = record.get("agent")
+        ok = False
+        if record.get("accepting_steer", False) and agent is not None:
+            try:
+                ok = bool(agent.steer(text.strip()))
+            except Exception:                    # never the text in a log line
+                ok = False
+    if not ok:
         return 409, {"error": "finished", "steered": False, "grund": "Subagent beendet — er nimmt nichts mehr an."}
     return 200, {"steered": True}
