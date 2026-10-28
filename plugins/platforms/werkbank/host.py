@@ -41,12 +41,16 @@ NEW_SESSION_WAIT_S = 15.0            # WB-1342: thread + session creation on the
 
 
 class NewSessionRefused(Exception):
-    """WB-1342: ``new_session`` could not open the chat — ``status`` and a short German reason."""
+    """WB-1342: ``new_session`` could not open the chat — ``status`` and a short German reason.
+    ``extra``: what exists in spite of the refusal (the start turn refused AFTER thread and session
+    were created: ``{angelegt, session_id, session_key, thread_id}``), so the board keeps the chat
+    as a draft instead of an orphaned topic; ``{}`` when nothing was created."""
 
-    def __init__(self, status: int, grund: str) -> None:
+    def __init__(self, status: int, grund: str, extra: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(grund)
         self.status = status
         self.grund = grund
+        self.extra = dict(extra or {})
 
 
 def accepts_kwarg(func: Any, name: str) -> bool:
@@ -195,7 +199,9 @@ class GatewayHost:
             ok = False
         if not ok:
             raise NewSessionRefused(503, f"Thema und Sitzung {session_id} sind angelegt, aber Hermes hat "
-                                         "die Startanweisung nicht angenommen.")
+                                         "die Startanweisung nicht angenommen.",
+                                    extra={"angelegt": True, "session_id": session_id,
+                                           "session_key": session_key, "thread_id": thread_id})
         logger.info("werkbank: new chat opened from the board (thread created, start turn injected)")
         return {"session_key": session_key, "session_id": session_id, "thread_id": thread_id}
 

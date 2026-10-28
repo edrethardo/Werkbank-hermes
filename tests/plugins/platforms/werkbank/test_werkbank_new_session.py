@@ -207,4 +207,30 @@ def test_host_start_refused_is_503_with_the_session_named(tmp_path, loop):
     with pytest.raises(NewSessionRefused) as e:
         host.new_session(KEY_SESSION, "Neues Projekt", "x")
     assert e.value.status == 503 and NEW_SID in e.value.grund
+    # the board keeps it as a draft: the refusal carries what exists (WB-1342 Nachbesserung)
+    assert e.value.extra == {"angelegt": True, "session_id": NEW_SID,
+                             "session_key": "agent:main:telegram:dm:4711:77", "thread_id": "77"}
     assert len(injected) == 1
+
+
+def test_host_gateway_not_running_names_nothing(tmp_path, loop):
+    from plugins.platforms.werkbank.host import NewSessionRefused
+
+    host, _adapter, _store, _injected = _host(tmp_path, loop, running=False)
+    with pytest.raises(NewSessionRefused) as e:
+        host.new_session(KEY_SESSION, "Neues Projekt", "x")
+    assert e.value.extra == {}
+
+
+def test_new_session_503_with_session_carries_it(srv):
+    from plugins.platforms.werkbank.host import NewSessionRefused
+
+    srv.host.answer = NewSessionRefused(
+        503, "Thema und Sitzung sind angelegt, aber Hermes hat die Startanweisung nicht angenommen.",
+        extra={"angelegt": True, "session_id": NEW_SID, "session_key": "agent:main:telegram:dm:4711:77",
+               "thread_id": "77"})
+    status, body = post(srv, {"next_to": KEY_SESSION, "title": "Neues Projekt", "text": "Start"})
+    assert status == 503
+    assert (body["angelegt"], body["session_id"], body["session_key"], body["thread_id"]) == (
+        True, NEW_SID, "agent:main:telegram:dm:4711:77", "77")
+    assert body["error"] == "refused" and "Startanweisung" in body["grund"]

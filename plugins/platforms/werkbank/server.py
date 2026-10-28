@@ -563,7 +563,9 @@ def _handler(app: WerkbankServer):
                 out = create(next_to, title.strip(), text)
             except NewSessionRefused as e:
                 logger.info("werkbank: new chat refused (status=%s)", e.status)
-                return self._refuse(e.status, "refused", e.grund)
+                extra = {k: e.extra[k] for k in ("angelegt", "session_id", "session_key", "thread_id")
+                         if k in e.extra}
+                return self._refuse(e.status, "refused", e.grund, **extra)
             self._json(200, {"session_key": str(out["session_key"]), "session_id": str(out["session_id"]),
                              "thread_id": str(out.get("thread_id") or "")})
 

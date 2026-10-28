@@ -129,6 +129,9 @@ produced; its fields are in the snapshot's `session`.
   an internal plugin row, no owner bubble. Unknown `next_to`: `404`; a chat that cannot host a
   thread (or a core without the pieces): `501`; thread or session not created: `502`; gateway not
   taking messages, or the start turn refused (`grund` names the session that exists then): `503`.
+  A `503` AFTER thread and session were created carries them: `{angelegt: true, session_id,
+  session_key, thread_id}` — the board keeps that chat as an open draft („Start nicht angenommen –
+  schreib im Chat einfach los“) instead of leaving an orphaned topic.
   One call opens one thread — the board never retries it on its own. The text is never logged.
 * `POST /v1/s/{key}/uploads {name, data}` (WB-1174, `uploads.py`) → `{upload_id, name, type, size, kind}`.
   ONE file, `data` base64; the request body may be up to 28 MiB (every other POST: 512 KiB), refused
