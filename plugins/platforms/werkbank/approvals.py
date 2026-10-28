@@ -26,6 +26,7 @@ Nothing here logs a command, a question or an answer.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
@@ -88,23 +89,57 @@ def _clarify_entry(session_key: str, clarify_id: str) -> Optional[Any]:
         return entry if entry is not None and entry.session_key == session_key else None
 
 
+def _structured_clarify_value(entry: Any, body: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """WB-1357: ``(value, None)`` or ``(None, Grund)`` for the unambiguous answer forms: ``selected``
+    (0-based option indices — labels may contain commas), ``other`` (free text, never an index)
+    and ``skip: true``. Exactly one form per request."""
+    from tools import clarify_gateway
+    forms = [k for k in ("selected", "other", "skip") if k in body]
+    if len(forms) != 1 or "answer" in body:
+        return None, "Bitte genau eine Antwortform senden."
+    form = forms[0]
+    if form == "skip":
+        return (clarify_gateway.SKIPPED, None) if body["skip"] is True else (None, "skip muss true sein.")
+    if form == "other":
+        text = body["other"]
+        if not isinstance(text, str) or len(text) > MAX_ANSWER:
+            return None, "Bitte eine Antwort als Text senden."
+        text = _CONTROL.sub("", text).strip()
+        return (text, None) if text else (None, "Bitte eine Antwort als Text senden.")
+    picked, choices = body["selected"], list(entry.choices or [])
+    if (not choices or not isinstance(picked, list) or not picked or len(picked) > len(choices)
+            or any(type(i) is not int or not 0 <= i < len(choices) for i in picked)
+            or len(set(picked)) != len(picked)):
+        return None, "Diese Auswahl passt zu keiner der angebotenen Möglichkeiten."
+    if not entry.multi_select:
+        return (str(choices[picked[0]]).strip(), None) if len(picked) == 1 else (
+            None, "Hier ist nur eine Auswahl möglich.")
+    return json.dumps([str(choices[i]).strip() for i in sorted(picked)], ensure_ascii=False), None
+
+
 def answer_clarify(session_key: str, clarify_id: str, body: Dict[str, Any]) -> Answer:
     from tools import clarify_gateway
 
+    structured = any(k in body for k in ("selected", "other", "skip"))
     text = body.get("answer")
-    if not isinstance(text, str) or len(text) > MAX_ANSWER:
+    if not structured and (not isinstance(text, str) or len(text) > MAX_ANSWER):
         return _refuse(400, "bad answer", "Bitte eine Antwort als Text senden.")
-    text = _CONTROL.sub("", text)
     entry = _clarify_entry(session_key, clarify_id)
     if entry is None:
         return _refuse(404, "unknown clarify", "Diese Rückfrage wartet in dieser Sitzung nicht (mehr).")
     if entry.event.is_set():
         return 200, {"resolved": False}
-    if not text.strip():
-        return _refuse(400, "bad answer", "Bitte eine Antwort als Text senden.")
-    value, _why = clarify_gateway._coerce_text_response_detailed(entry, text)
-    if value is None:
-        return _refuse(400, "bad answer", "Diese Antwort passt zu keiner der angebotenen Möglichkeiten.")
+    if structured:
+        value, why = _structured_clarify_value(entry, body)
+        if value is None:
+            return _refuse(400, "bad answer", why or "Bitte eine Antwort senden.")
+    else:
+        text = _CONTROL.sub("", text)
+        if not text.strip():
+            return _refuse(400, "bad answer", "Bitte eine Antwort als Text senden.")
+        value, _why = clarify_gateway._coerce_text_response_detailed(entry, text)
+        if value is None:
+            return _refuse(400, "bad answer", "Diese Antwort passt zu keiner der angebotenen Möglichkeiten.")
     resolved = clarify_gateway.resolve_gateway_clarify(clarify_id, value, decided_by=DECIDED_BY,
                                                        session_key=session_key)
     return 200, {"resolved": bool(resolved)}

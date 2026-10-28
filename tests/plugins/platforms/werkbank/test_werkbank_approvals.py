@@ -414,3 +414,81 @@ def test_child_request_carries_the_subagent_id_in_stream_and_snapshot(plugin_ser
     status, snap = call(srv.port, "GET", session_path("snapshot"), srv.key)
     assert status == 200
     assert snap["pending_approvals"][0]["subagent_id"] == "sa-0-abc"
+
+
+# ── WB-1357: structured clarify answers (indices / other / skip) ────────────────────────────
+
+COMMA_LABELS = ["Oberfläche: Hinweise, Erklärtexte", "Ablauf: erst prüfen, dann bauen", "Sonstiges"]
+
+
+def post_clarify_body(srv, cid, body, key=KEY_SESSION):
+    return call(srv.port, "POST", session_path("clarify", cid, key=key), srv.key, body)
+
+
+def test_wb1357_multi_select_with_comma_labels_by_index(plugin_server):
+    import json
+    srv = plugin_server
+    _resolve(srv)
+    entry = clarify_gateway.register("clar-m", KEY_SESSION, "Was?", COMMA_LABELS, multi_select=True)
+    assert post_clarify_body(srv, "clar-m", {"selected": [0, 1]}) == (200, {"resolved": True})
+    assert json.loads(entry.response) == COMMA_LABELS[:2]
+
+
+def test_wb1357_single_select_with_comma_label_by_index(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    entry = clarify_gateway.register("clar-s", KEY_SESSION, "Was?", COMMA_LABELS)
+    assert post_clarify_body(srv, "clar-s", {"selected": [1]}) == (200, {"resolved": True})
+    assert entry.response == COMMA_LABELS[1]
+
+
+def test_wb1357_selected_out_of_range_duplicates_or_too_many_is_400(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    clarify_gateway.register("clar-s", KEY_SESSION, "Was?", COMMA_LABELS)
+    for bad in ({"selected": [3]}, {"selected": [-1]}, {"selected": [True]}, {"selected": []},
+                {"selected": [0, 1]}, {"selected": "0"}):
+        assert post_clarify_body(srv, "clar-s", bad)[0] == 400, bad
+    clarify_gateway.register("clar-m", KEY_SESSION, "Was?", COMMA_LABELS, multi_select=True)
+    assert post_clarify_body(srv, "clar-m", {"selected": [0, 0]})[0] == 400
+
+
+def test_wb1357_other_free_text_on_choice_question_is_accepted(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    entry = clarify_gateway.register("clar-o", KEY_SESSION, "Was?", COMMA_LABELS)
+    assert post_clarify_body(srv, "clar-o", {"other": "  etwas ganz anderes, mit Komma "}) == (200, {"resolved": True})
+    assert entry.response == "etwas ganz anderes, mit Komma"
+    multi = clarify_gateway.register("clar-p", KEY_SESSION, "Was?", COMMA_LABELS, multi_select=True)
+    assert post_clarify_body(srv, "clar-p", {"other": "2"}) == (200, {"resolved": True})
+    assert multi.response == "2"                      # free text stays text, never an index
+    clarify_gateway.register("clar-q", KEY_SESSION, "Was?", COMMA_LABELS)
+    assert post_clarify_body(srv, "clar-q", {"other": "  "})[0] == 400
+
+
+def test_wb1357_skip_resolves_as_skipped_even_with_choices(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    entry = clarify_gateway.register("clar-k", KEY_SESSION, "Was?", COMMA_LABELS, multi_select=True)
+    assert post_clarify_body(srv, "clar-k", {"skip": True}) == (200, {"resolved": True})
+    assert entry.response == clarify_gateway.SKIPPED
+
+
+def test_wb1357_two_questions_answered_one_after_the_other(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    one = clarify_gateway.register("clar-1", KEY_SESSION, "Erste?", COMMA_LABELS[:2])
+    two = clarify_gateway.register("clar-2", KEY_SESSION, "Zweite?", COMMA_LABELS, multi_select=True)
+    assert post_clarify_body(srv, "clar-2", {"selected": [2]}) == (200, {"resolved": True})
+    assert not one.event.is_set()
+    assert post_clarify_body(srv, "clar-1", {"selected": [0]}) == (200, {"resolved": True})
+    assert one.response == COMMA_LABELS[0] and two.response == '["Sonstiges"]'
+
+
+def test_wb1357_mixing_answer_with_structured_fields_or_two_forms_is_400(plugin_server):
+    srv = plugin_server
+    _resolve(srv)
+    clarify_gateway.register("clar-1", KEY_SESSION, "Was?", COMMA_LABELS)
+    for bad in ({"answer": "Sonstiges", "selected": [2]}, {"selected": [0], "skip": True},
+                {"other": "x", "skip": True}, {"skip": "ja"}, {}):
+        assert post_clarify_body(srv, "clar-1", bad)[0] == 400, bad
