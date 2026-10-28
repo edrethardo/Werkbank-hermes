@@ -66,6 +66,10 @@ VIDEO_KURZSEITE = 1080
 HLS_STUFEN = ((240, 300_000, 64_000), (480, 800_000, 96_000), (720, 2_000_000, 128_000),
               (1080, 4_500_000, 128_000))
 HLS_SEGMENT_S = 4
+# The first 4 s come as 1-s segments (a keyframe every second there, then every 4 s): a player on a
+# weak line starts after ~1 s of video instead of waiting for whole 4-s segments (E2E: 9 s → see report)
+HLS_START_SEGMENT_S = 1
+HLS_KEYFRAMES = "expr:if(lt(t,4),gte(t,n_forced),gte(t,(n_forced-3)*4))"
 HLS_PLAYLIST = "application/vnd.apple.mpegurl"
 HLS_NAME_RE = re.compile(r"master\.m3u8|[0-9a-f]{16}-\d{3,4}(?:-\d{5}\.ts|\.m3u8)")
 
@@ -545,10 +549,11 @@ class Outbox:
                 "-sn", "-dn", "-vf", f"scale={ow}:{oh}", "-c:v", "libx264", "-profile:v", profile,
                 "-level:v", level, "-pix_fmt", "yuv420p", "-preset", "veryfast",
                 "-b:v", str(vbit), "-maxrate", str(int(vbit * 1.07)), "-bufsize", str(int(vbit * 1.5)),
-                "-force_key_frames", f"expr:gte(t,n_forced*{HLS_SEGMENT_S})", "-sc_threshold", "0"]
+                "-force_key_frames", HLS_KEYFRAMES, "-sc_threshold", "0"]
         if has_audio:
             args += ["-c:a", "aac", "-b:a", str(abit), "-ac", "2"]
-        args += ["-f", "hls", "-hls_time", str(HLS_SEGMENT_S), "-hls_playlist_type", "vod",
+        args += ["-f", "hls", "-hls_time", str(HLS_SEGMENT_S), "-hls_init_time", str(HLS_START_SEGMENT_S),
+                 "-hls_playlist_type", "vod",
                  "-hls_flags", "independent_segments",
                  "-hls_segment_filename", str(folder / f"{name}-%05d.ts"), str(part)]
         ok = self.werkstatt.ffmpeg_raw(args)

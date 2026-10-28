@@ -486,15 +486,17 @@ def test_hls_stufen_240_480_720_niedrigste_zuerst_4s_segmente(tmp_path):
         playlist, ptype = box.hls_path(KEY_SESSION, meta["id"], name)
         text = playlist.read_text(encoding="utf-8")
         durations = [float(d) for d in re.findall(r"#EXTINF:([0-9.]+)", text)]
-        assert len(durations) == 3 and max(durations) <= 4.1 and "#EXT-X-ENDLIST" in text
+        # quick start: four 1-s segments, then 4-s segments (9 s: 1+1+1+1+4+1)
+        assert durations[:4] == [1.0] * 4 and durations[4] == 4.0 and max(durations) <= 4.1
+        assert abs(sum(durations) - 9.0) < 0.2 and "#EXT-X-ENDLIST" in text
         segs = [l for l in text.splitlines() if l and not l.startswith("#")]
         assert all(re.fullmatch(tok + rf"-{stufe}-\d{{5}}\.ts", s) for s in segs)
         seg, stype = box.hls_path(KEY_SESSION, meta["id"], segs[0])
         assert stype == "video/mp2t" and stat.S_IMODE(seg.stat().st_mode) == 0o600
         v = next(s for s in _probe(playlist)["streams"] if s["codec_type"] == "video")
         assert (v["codec_name"], v["height"]) == ("h264", stufe)
-    # a 240p segment stays near its ~300 kbit/s video (+ 64 kbit/s audio)
-    first = box.hls_path(KEY_SESSION, meta["id"], f"{tok}-240-00000.ts")[0]
+    # a 4-s 240p segment stays near its ~300 kbit/s video (+ 64 kbit/s audio)
+    first = box.hls_path(KEY_SESSION, meta["id"], f"{tok}-240-00004.ts")[0]
     assert first.stat().st_size * 8 / 4 < 520_000
     # nothing beside the file's own names, never another session
     assert box.hls_path(KEY_SESSION, meta["id"], "0123456789abcdef-240.m3u8") is None
