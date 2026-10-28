@@ -39,8 +39,11 @@ MAX_UPLOAD_BODY = 28 * 1024 * 1024  # WB-1174: one file of uploads.MAX_FILE as b
 MAX_TEXT = 200_000
 NEW_TITLE_MAX = 60                  # WB-1342: title of a new chat (a Telegram topic name)
 MAX_STREAMS = 32
+MAX_FILE_TRANSFERS = 16              # WB-1321: outbox file transfers at once; beyond it 503 + Retry-After
+FILE_RETRY_AFTER_S = 2
 MAX_CONNECTIONS = 64                 # connections not authenticated yet; beyond it the OLDEST one goes
-MAX_AUTHENTICATED = MAX_STREAMS + 16 # authenticated connections (streams + requests): an own quota
+# authenticated connections: streams + file transfers + 16 for snapshots and other requests
+MAX_AUTHENTICATED = MAX_STREAMS + MAX_FILE_TRANSFERS + 16
 HEADER_DEADLINE_S = 10.0             # request line + headers (+ POST body) must arrive within this
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")      # = the board's bruecke.ID_RE
 _KEY_MAX = 512
@@ -155,6 +158,10 @@ class WerkbankServer:
             buffers.outbox = outbox
         self.open_streams = 0
         self._streams_lock = threading.Lock()
+        # WB-1321 Härtung: byte transfers of outbox files (originals, versions, HLS) have their own
+        # quota inside the authenticated one, so streams and snapshots always keep room
+        self.max_file_transfers = MAX_FILE_TRANSFERS
+        self.open_file_transfers = 0
         self._httpd: Optional[_Server] = None
         self._thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
@@ -199,6 +206,17 @@ class WerkbankServer:
     def give_stream(self) -> None:
         with self._streams_lock:
             self.open_streams -= 1
+
+    def take_file_transfer(self) -> bool:
+        with self._streams_lock:
+            if self.open_file_transfers >= self.max_file_transfers:
+                return False
+            self.open_file_transfers += 1
+            return True
+
+    def give_file_transfer(self) -> None:
+        with self._streams_lock:
+            self.open_file_transfers = max(0, self.open_file_transfers - 1)
 
     @property
     def closing(self) -> bool:
@@ -392,6 +410,22 @@ def _handler(app: WerkbankServer):
             if found is None:
                 return self._refuse(404, "unknown file", "Diese Datei oder Fassung gibt es (noch) nicht.")
             path, media_type = found
+            if not app.take_file_transfer():
+                self.send_response(503)
+                data = json.dumps({"error": "busy", "grund": "Zu viele Datei-Übertragungen gleichzeitig."}).encode()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Retry-After", str(FILE_RETRY_AFTER_S))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            try:
+                self._send_file(path, media_type)
+            finally:
+                app.give_file_transfer()
+
+        def _send_file(self, path, media_type: str) -> None:
             try:
                 handle = open(path, "rb")
             except OSError:

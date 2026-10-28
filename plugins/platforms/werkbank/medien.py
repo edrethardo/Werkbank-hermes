@@ -6,6 +6,12 @@ One worker thread, ONE ffmpeg job at a time, never in a request thread. Every jo
 
 Without ``ffmpeg``/``ffprobe`` on the PATH nothing is converted (``available`` is False); the outbox
 then serves originals only and says so (``grund``).
+
+Härtung (WB-1321 review): every input is opened with ``-protocol_whitelist file`` and the demuxer
+the outbox's sniff found (``-f jpeg_pipe`` …) — free probing would let a text file with a JPEG
+magic be read as SDP and open ``rtp://``/``udp://``. A command whose ``-i`` lacks both is refused
+without running. Every output is capped by ``-fs`` (``max_bytes``) and ``-t`` (``MAX_DAUER_S``);
+an output that reached the size cap was cut and counts as failed.
 """
 
 from __future__ import annotations
@@ -25,10 +31,26 @@ logger = logging.getLogger("plugins.platforms.werkbank")
 JOB_TIMEOUT_S = 900          # one ffmpeg run (a 50 MB video at veryfast stays far below)
 PROBE_TIMEOUT_S = 30
 THREADS = "2"                # ffmpeg threads: the gateway machine keeps its cores
+MAX_BYTES = 4 * 50 * 1024 * 1024     # -fs of one output: 4 × the outbox's MAX_FILE
+MAX_DAUER_S = 7200                   # -t of one output: two hours of media at most
 
 
 def _which(name: str) -> Optional[str]:
     return shutil.which(name)
+
+
+def inputs_locked(args: List[str]) -> bool:
+    """True when every ``-i`` of *args* comes right after ``-protocol_whitelist file -f <demuxer>``
+    (and there is at least one)."""
+    found = False
+    for i, arg in enumerate(args):
+        if arg != "-i":
+            continue
+        found = True
+        if i < 4 or args[i - 4:i - 1] != ["-protocol_whitelist", "file", "-f"] or not args[i - 1] \
+                or args[i - 1].startswith("-") or i + 1 >= len(args):
+            return False
+    return found
 
 
 class Werkstatt:
@@ -36,11 +58,14 @@ class Werkstatt:
     (tests) runs it at once in the caller's thread."""
 
     def __init__(self, *, ffmpeg: Optional[str] = "auto", ffprobe: Optional[str] = "auto",
-                 synchron: bool = False, timeout: float = JOB_TIMEOUT_S) -> None:
+                 synchron: bool = False, timeout: float = JOB_TIMEOUT_S, max_bytes: int = MAX_BYTES,
+                 max_dauer_s: int = MAX_DAUER_S) -> None:
         self.ffmpeg_bin = _which("ffmpeg") if ffmpeg == "auto" else ffmpeg
         self.ffprobe_bin = _which("ffprobe") if ffprobe == "auto" else ffprobe
         self.synchron = synchron
         self.timeout = timeout
+        self.max_bytes = int(max_bytes)
+        self.max_dauer_s = int(max_dauer_s)
         self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
         self._count = 0
         self._thread: Optional[threading.Thread] = None
@@ -98,14 +123,18 @@ class Werkstatt:
         self._queue.put((99, 0, None))
 
     # -- tools ------------------------------------------------------------------------------------
-    def probe(self, path: Path) -> Optional[Dict[str, Any]]:
-        if not self.ffprobe_bin:
+    def _limits(self) -> List[str]:
+        return ["-fs", str(self.max_bytes), "-t", str(self.max_dauer_s)]
+
+    def probe(self, path: Path, demuxer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """``ffprobe`` of *path* read as *demuxer* over the file protocol only; None without one."""
+        if not self.ffprobe_bin or not demuxer:
             return None
         try:
             done = subprocess.run(
                 [self.ffprobe_bin, "-v", "error", "-print_format", "json", "-show_streams", "-show_format",
-                 str(path)], stdin=subprocess.DEVNULL, capture_output=True, timeout=PROBE_TIMEOUT_S,
-                umask=0o077)
+                 "-protocol_whitelist", "file", "-f", demuxer, "-i", str(path)],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=PROBE_TIMEOUT_S, umask=0o077)
         except (OSError, subprocess.SubprocessError):
             return None
         if done.returncode != 0:
@@ -117,16 +146,18 @@ class Werkstatt:
         return data if isinstance(data, dict) else None
 
     def ffmpeg(self, args: List[str], out: Path, *, fmt: str, timeout: Optional[float] = None) -> bool:
-        """``ffmpeg -y -v error <args> -f <fmt> <out>.part`` → renamed to *out* (0600) on success."""
-        if not self.ffmpeg_bin:
+        """``ffmpeg -y -v error <args> -fs … -t … -f <fmt> <out>.part`` → renamed to *out* (0600) on
+        success. Refused (False, nothing run) unless every input is locked (:func:`inputs_locked`)."""
+        if not self.ffmpeg_bin or not inputs_locked(args):
             return False
         part = out.with_name(out.name + ".part")
         cmd = self._prefix + [self.ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-threads", THREADS,
-                              *args, "-f", fmt, str(part)]
+                              *args, *self._limits(), "-f", fmt, str(part)]
         try:
             done = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, timeout=timeout or self.timeout, umask=0o077)
-            ok = done.returncode == 0 and part.is_file() and part.stat().st_size > 0
+            size = part.stat().st_size if part.is_file() else 0
+            ok = done.returncode == 0 and 0 < size < self.max_bytes      # at the cap: -fs cut it
         except (OSError, subprocess.SubprocessError):
             ok = False
         if not ok:
@@ -141,10 +172,12 @@ class Werkstatt:
 
     def ffmpeg_raw(self, args: List[str], *, timeout: Optional[float] = None) -> bool:
         """``ffmpeg -y -v error <args>`` as it is (HLS: the muxer names its own files); nice, ionice,
-        time limit and ``umask 077`` like :meth:`ffmpeg`. The caller cleans up on failure."""
-        if not self.ffmpeg_bin:
+        time limit, ``umask 077``, locked inputs and ``-fs``/``-t`` (before the last argument, the
+        output) like :meth:`ffmpeg`. The caller cleans up on failure."""
+        if not self.ffmpeg_bin or not args or not inputs_locked(args[:-1]):
             return False
-        cmd = self._prefix + [self.ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-threads", THREADS, *args]
+        cmd = self._prefix + [self.ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-threads", THREADS,
+                              *args[:-1], *self._limits(), args[-1]]
         try:
             done = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, timeout=timeout or self.timeout, umask=0o077)

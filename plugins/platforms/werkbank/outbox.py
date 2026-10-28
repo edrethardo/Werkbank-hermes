@@ -25,6 +25,14 @@ bot upload limit) per file; a bigger one becomes a card without bytes. Old files
 Playback versions (``medien.Werkstatt``, background, one job at a time): images get a small
 (≤ 360 px) and a large (≤ 2048 px) WebP preview, videos a JPEG poster and a faststart H.264/AAC MP4
 (remuxed when the original already fits), audio iOS cannot play (Ogg/Opus, WebM) an AAC ``.m4a``.
+
+Härtung (WB-1321 review): the source is opened ``O_NOFOLLOW|O_NONBLOCK`` (a FIFO never blocks the
+hook thread), must be a regular file, and the path the open descriptor really names
+(``/proc/self/fd/N``) passes the gateway's delivery check again — a directory symlink swapped
+after the gateway's filter cannot reach a denied place. ffmpeg reads an original only as the
+demuxer of its sniffed type over the file protocol (``DEMUXER``). Below ``MIN_FREE`` free disk no
+versions are made; ``prune`` runs after every real copy and every finished version. A failed
+takeover of a (session, path) is remembered ``NEGATIV_S`` so snapshots do not re-read it.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import stat
 import threading
 import time
@@ -72,6 +81,17 @@ HLS_START_SEGMENT_S = 1
 HLS_KEYFRAMES = "expr:if(lt(t,4),gte(t,n_forced),gte(t,(n_forced-3)*4))"
 HLS_PLAYLIST = "application/vnd.apple.mpegurl"
 HLS_NAME_RE = re.compile(r"master\.m3u8|[0-9a-f]{16}-\d{3,4}(?:-\d{5}\.ts|\.m3u8)")
+
+# Härtung (WB-1321 review): ffmpeg/ffprobe read an original only as the demuxer its sniffed type
+# names (never free probing: a JPEG magic in front of an SDP text otherwise opens rtp://)
+DEMUXER = {"image/jpeg": "jpeg_pipe", "image/png": "png_pipe", "image/gif": "gif", "image/webp": "webp_pipe",
+           "video/mp4": "mov", "video/quicktime": "mov", "audio/mp4": "mov",
+           "video/x-matroska": "matroska", "video/webm": "matroska", "audio/webm": "matroska",
+           "video/x-msvideo": "avi", "audio/ogg": "ogg", "audio/wav": "wav", "audio/mpeg": "mp3",
+           "audio/flac": "flac", "audio/aac": "aac"}
+MIN_FREE = 2 * 1024 * 1024 * 1024    # below this much free disk no playback versions (originals only)
+NEGATIV_S = 600                      # a failed takeover of (session, path) is not retried for this long
+NEGATIV_MAX = 4096
 
 _FTYP_VIDEO = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ",
                b"M4VP", b"mmp4", b"MSNV", b"3gp4", b"3gp5", b"3g2a")
@@ -164,18 +184,45 @@ def _digest(session_key: str) -> str:
     return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24]
 
 
+def _free_space(path: Path) -> int:
+    """Free bytes on the file system of *path* (its nearest existing parent)."""
+    probe = Path(path)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return shutil.disk_usage(str(probe)).free
+    except OSError:
+        return 0
+
+
+def _deliverable(real: str, session_key: str) -> bool:
+    """The gateway's own per-path check (``validate_media_delivery_path``: denylist, strict mode) on
+    the path the OPEN descriptor really names — no remote fetch fallback. False without the core."""
+    try:
+        from gateway.platforms.base import validate_media_delivery_path
+    except Exception:
+        return False
+    try:
+        return validate_media_delivery_path(real, session_key=session_key) == real
+    except Exception:
+        return False
+
+
 class Outbox:
     """Thread-safe: the hook thread ingests, HTTP threads read, the workshop thread finishes."""
 
     def __init__(self, home: Path, *, werkstatt: Any = None, clock: Callable[[], float] = time.time,
-                 max_file: int = MAX_FILE, max_total: int = MAX_TOTAL, keep_s: float = KEEP_S) -> None:
+                 max_file: int = MAX_FILE, max_total: int = MAX_TOTAL, keep_s: float = KEEP_S,
+                 free_space: Callable[[Path], int] = _free_space, min_free: int = MIN_FREE) -> None:
         self.root = Path(home) / "plugin-data" / "werkbank" / "outbox"
         self.werkstatt = werkstatt
         self.clock = clock
         self.max_file, self.max_total, self.keep_s = max_file, max_total, keep_s
+        self.free_space, self.min_free = free_space, min_free
         self._lock = threading.RLock()
         self._loaded: set = set()                       # session digests read from disk
         self._items: Dict[str, Dict[str, Any]] = {}     # file id -> meta
+        self._negativ: Dict[Tuple[str, str], Tuple[float, Any]] = {}   # (digest, path) -> (until, answer)
 
     # -- index ------------------------------------------------------------------------------------
     def _folder(self, digest: str, fid: str) -> Path:
@@ -273,39 +320,102 @@ class Outbox:
         refs = [str(r) for r in refs if isinstance(r, (str, int)) and not isinstance(r, bool) and str(r)]
         digest = _digest(session_key)
         out: List[Dict[str, Any]] = []
+        copied = False
         for order, (src, is_voice) in enumerate(media[:MAX_PER_TURN]):
-            entry = self._ingest_one(session_key, digest, str(src), bool(is_voice), refs, order)
+            src = str(src)
+            known = self._negativ_get(digest, src)
+            if known is not None:                 # failed a moment ago: no re-open, no re-read
+                entry = known[1]
+            else:
+                entry, new = self._ingest_one(session_key, digest, src, bool(is_voice), refs, order)
+                copied = copied or new
+                if entry is None or entry.get("id") is None:
+                    self._negativ_put(digest, src, entry)
             if entry is not None:
-                out.append(entry)
-        self.prune()
+                out.append(dict(entry))
+        if copied:                                # prune only when something really landed
+            self.prune()
         return out
 
-    def _ingest_one(self, session_key, digest, src, is_voice, refs, order) -> Optional[Dict[str, Any]]:
+    def _negativ_get(self, digest: str, src: str) -> Optional[Tuple[float, Any]]:
+        with self._lock:
+            hit = self._negativ.get((digest, src))
+            if hit is None:
+                return None
+            if hit[0] <= self.clock():
+                del self._negativ[(digest, src)]
+                return None
+            return hit
+
+    def _negativ_put(self, digest: str, src: str, entry: Optional[Dict[str, Any]]) -> None:
+        with self._lock:
+            now = self.clock()
+            if len(self._negativ) >= NEGATIV_MAX:
+                for k in [k for k, v in self._negativ.items() if v[0] <= now]:
+                    del self._negativ[k]
+                while len(self._negativ) >= NEGATIV_MAX:
+                    del self._negativ[next(iter(self._negativ))]
+            self._negativ[(digest, src)] = (now + NEGATIV_S, dict(entry) if entry else None)
+
+    @staticmethod
+    def _open_source(src: str) -> Optional[int]:
+        """A read descriptor of *src* that cannot hang or follow a last-component symlink:
+        ``O_NOFOLLOW|O_NONBLOCK`` (a FIFO opens at once), not a regular file → None, then
+        ``O_NONBLOCK`` is taken back for the copy. Raises OSError when it cannot be opened."""
+        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                return None
+            if hasattr(os, "O_NONBLOCK"):
+                import fcntl
+                fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _fd_path(fd: int) -> Optional[str]:
+        """The real path the open descriptor names (every directory symlink resolved)."""
+        try:
+            return os.path.realpath(f"/proc/self/fd/{fd}") if os.path.isdir("/proc/self/fd") else None
+        except OSError:
+            return None
+
+    def _ingest_one(self, session_key, digest, src, is_voice, refs, order) -> Tuple[Optional[Dict[str, Any]], bool]:
         name = os.path.basename(src)
         try:
-            fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            fd = self._open_source(src)
         except OSError:
             # the gateway's filter resolved symlinks already; a vanished file is a card without bytes
             return {"id": None, "name": uploads_mod.clean_name(name, _ext(name)), "size": 0, "kind": DATEI,
-                    "fassungen": {}, "fehlt": "nicht_lesbar"}
+                    "fassungen": {}, "fehlt": "nicht_lesbar"}, False
+        if fd is None:                                  # FIFO, device, directory: nothing to send
+            return None, False
         with os.fdopen(fd, "rb") as source:
+            real = self._fd_path(source.fileno())
+            # a directory symlink swapped after the gateway's check: the descriptor's REAL path
+            # must pass the same delivery check again (denylist: ~/.ssh, ~/.hermes/.env, /etc …)
+            if not real or not _deliverable(real, session_key):
+                logger.info("werkbank: outbox source refused after open (delivery policy)")
+                return None, False
             st = os.fstat(source.fileno())
-            if not stat.S_ISREG(st.st_mode):
-                return None
-            src_key = hashlib.sha256(f"{os.path.realpath(src)}\0{st.st_size}\0{st.st_mtime_ns}".encode()).hexdigest()
+            src_key = hashlib.sha256(f"{real}\0{st.st_size}\0{st.st_mtime_ns}".encode()).hexdigest()
             with self._lock:
                 self._load(digest)
                 same = next((m for m in self._items.values()
                              if m.get("digest") == digest and m.get("src") == src_key), None)
                 if same is not None:
                     self._add_refs(same, refs)
-                    return self.public(same)
+                    return self.public(same), False
             head = source.read(4096)
             kind, media_type, download_only = sniff(head, name)
             shown = uploads_mod.clean_name(name, _ext(name))
             if st.st_size > self.max_file:
                 return {"id": None, "name": shown, "size": st.st_size, "kind": kind, "type": media_type,
-                        "fassungen": {}, "fehlt": "zu_gross", "grenze": self.max_file}
+                        "fassungen": {}, "fehlt": "zu_gross", "grenze": self.max_file}, False
             fid = "fx_" + secrets.token_hex(16)
             folder = self._folder(digest, fid)
             try:
@@ -317,7 +427,7 @@ class Outbox:
                 logger.info("werkbank: outbox copy failed (%s)", type(exc).__name__)
                 return {"id": None, "name": shown, "size": st.st_size, "kind": kind, "type": media_type,
                         "fassungen": {}, "fehlt": "zu_gross" if isinstance(exc, ValueError) else "nicht_lesbar",
-                        "grenze": self.max_file}
+                        "grenze": self.max_file}, False
         meta = {"id": fid, "digest": digest, "src": src_key, "name": shown, "type": media_type, "size": size,
                 "kind": kind, "nur_download": download_only, "voice": bool(is_voice and kind == AUDIO) or None,
                 "abspielbar": kind in (BILD, AUDIO) or (kind == VIDEO and media_type == "video/mp4"),
@@ -327,7 +437,7 @@ class Outbox:
             self._items[fid] = meta
             self._save(meta)
         self._queue(meta)
-        return self.public(meta)
+        return self.public(meta), True
 
     def _copy(self, source, head: bytes, target: Path) -> int:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -357,6 +467,11 @@ class Outbox:
             return
         if w is None or not getattr(w, "available", False):
             meta["grund"] = "ffmpeg fehlt auf dem Hermes-Rechner: nur das Original"
+            return
+        if meta.get("type") not in DEMUXER:
+            return
+        if not self._room():
+            meta["grund"] = "zu wenig freier Speicher auf dem Hermes-Rechner: nur das Original"
             return
         f = meta["fassungen"]
         if meta["kind"] == BILD:
@@ -390,6 +505,26 @@ class Outbox:
             meta = self._items.get(fid)
             return meta if meta and meta.get("digest") == digest else None
 
+    def _room(self) -> bool:
+        """At least ``min_free`` bytes free where the outbox lives (else: originals only)."""
+        try:
+            return int(self.free_space(self.root)) >= self.min_free
+        except Exception:
+            return False
+
+    def _input(self, digest: str, fid: str) -> List[str]:
+        """``-protocol_whitelist file -f <demuxer of the sniffed type> -i <original>``; [] without a
+        known demuxer (the workshop then refuses the job)."""
+        meta = self._meta(digest, fid) or {}
+        demux = DEMUXER.get(meta.get("type") or "")
+        if not demux:
+            return []
+        return ["-protocol_whitelist", "file", "-f", demux, "-i", str(self._folder(digest, fid) / "original")]
+
+    def _probe(self, digest: str, fid: str) -> Optional[Dict[str, Any]]:
+        meta = self._meta(digest, fid) or {}
+        return self.werkstatt.probe(self._folder(digest, fid) / "original", DEMUXER.get(meta.get("type") or ""))
+
     def _done(self, digest: str, fid: str, variant: str, ok: bool, **info) -> None:
         with self._lock:
             meta = self._meta(digest, fid)
@@ -401,6 +536,8 @@ class Outbox:
                 self._save(meta)
             except OSError:
                 pass
+        if ok:                                       # a new version takes space: keep the total
+            self.prune()
 
     @staticmethod
     def _longest(px: int) -> str:
@@ -408,15 +545,16 @@ class Outbox:
 
     def _job_image(self, digest: str, fid: str) -> None:
         folder = self._folder(digest, fid)
-        src = str(folder / "original")
+        src = self._input(digest, fid)
         w = self.werkstatt
-        ok = w.ffmpeg(["-i", src, "-frames:v", "1", "-vf", self._longest(KLEIN_PX), "-c:v", "libwebp",
-                       "-quality", "55"], folder / VARIANTS["klein"][0], fmt="webp", timeout=60)
+        ok = self._room() and w.ffmpeg([*src, "-frames:v", "1", "-vf", self._longest(KLEIN_PX), "-c:v", "libwebp",
+                                        "-quality", "55"], folder / VARIANTS["klein"][0], fmt="webp", timeout=60)
         self._done(digest, fid, "klein", ok)
         meta = self._meta(digest, fid)
         if meta and "gross" in meta["fassungen"]:
-            ok = w.ffmpeg(["-i", src, "-frames:v", "1", "-vf", self._longest(GROSS_PX), "-c:v", "libwebp",
-                           "-quality", "80"], folder / VARIANTS["gross"][0], fmt="webp", timeout=120)
+            ok = self._room() and w.ffmpeg([*src, "-frames:v", "1", "-vf", self._longest(GROSS_PX), "-c:v",
+                                            "libwebp", "-quality", "80"], folder / VARIANTS["gross"][0],
+                                           fmt="webp", timeout=120)
             self._done(digest, fid, "gross", ok)
 
     @staticmethod
@@ -426,8 +564,7 @@ class Outbox:
     def _job_video_head(self, digest: str, fid: str) -> None:
         """Probe (duration, size, does the original play as it is) and the poster."""
         folder = self._folder(digest, fid)
-        src = folder / "original"
-        probe = self.werkstatt.probe(src)
+        probe = self._probe(digest, fid)
         video = (self._streams(probe, "video") or [{}])[0]
         audio = (self._streams(probe, "audio") or [None])[0]
         try:
@@ -444,9 +581,11 @@ class Outbox:
                 meta.update(dauer=dauer, breite=video.get("width"), hoehe=video.get("height"),
                             abspielbar=bool(playable), probe=self._probe_view(probe))
                 self._save(meta)
-        args = ["-i", str(src), "-frames:v", "1", "-vf", self._longest(POSTER_PX), "-c:v", "mjpeg", "-q:v", "7"]
-        ok = self.werkstatt.ffmpeg(["-ss", "0.5"] + args, folder / VARIANTS["poster"][0], fmt="mjpeg", timeout=60)
-        if not ok:                                   # shorter than half a second
+        args = [*self._input(digest, fid), "-frames:v", "1", "-vf", self._longest(POSTER_PX), "-c:v", "mjpeg",
+                "-q:v", "7"]
+        ok = self._room() and self.werkstatt.ffmpeg(["-ss", "0.5"] + args, folder / VARIANTS["poster"][0],
+                                                    fmt="mjpeg", timeout=60)
+        if not ok and self._room():                  # shorter than half a second
             ok = self.werkstatt.ffmpeg(args, folder / VARIANTS["poster"][0], fmt="mjpeg", timeout=60)
         self._done(digest, fid, "poster", ok)
 
@@ -480,15 +619,18 @@ class Outbox:
         view = meta.get("probe") or {}
         out = folder / VARIANTS["mp4"][0]
         maps = ["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]
-        if self.remux_enough(view):
-            ok = self.werkstatt.ffmpeg(["-i", str(folder / "original"), *maps, "-c", "copy",
+        src = self._input(digest, fid)
+        if not self._room():
+            ok, how = False, None
+        elif self.remux_enough(view):
+            ok = self.werkstatt.ffmpeg([*src, *maps, "-c", "copy",
                                         "-movflags", "+faststart"], out, fmt="mp4")
             how = "remux"
         else:
             scale = (f"scale='if(gte(iw,ih),-2,min({VIDEO_KURZSEITE},iw))':"
                      f"'if(gte(iw,ih),min({VIDEO_KURZSEITE},ih),-2)',scale=trunc(iw/2)*2:trunc(ih/2)*2")
             ok = self.werkstatt.ffmpeg(
-                ["-i", str(folder / "original"), *maps, "-vf", scale,
+                [*src, *maps, "-vf", scale,
                  "-c:v", "libx264", "-profile:v", "high", "-level:v", "4.1", "-pix_fmt", "yuv420p",
                  "-preset", "veryfast", "-crf", "26", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
                  "-movflags", "+faststart"], out, fmt="mp4")
@@ -545,7 +687,7 @@ class Outbox:
         part = folder / f"{name}.m3u8.part"
         level = "4.0" if stufe >= 1080 else ("3.1" if stufe >= 720 else "3.0")
         profile = "high" if stufe >= 1080 else "main"
-        args = ["-i", str(folder / "original"), "-map", "0:v:0", *(["-map", "0:a:0"] if has_audio else []),
+        args = [*self._input(digest, fid), "-map", "0:v:0", *(["-map", "0:a:0"] if has_audio else []),
                 "-sn", "-dn", "-vf", f"scale={ow}:{oh}", "-c:v", "libx264", "-profile:v", profile,
                 "-level:v", level, "-pix_fmt", "yuv420p", "-preset", "veryfast",
                 "-b:v", str(vbit), "-maxrate", str(int(vbit * 1.07)), "-bufsize", str(int(vbit * 1.5)),
@@ -556,7 +698,7 @@ class Outbox:
                  "-hls_playlist_type", "vod",
                  "-hls_flags", "independent_segments",
                  "-hls_segment_filename", str(folder / f"{name}-%05d.ts"), str(part)]
-        ok = self.werkstatt.ffmpeg_raw(args)
+        ok = self._room() and self.werkstatt.ffmpeg_raw(args)
         if ok and part.is_file():
             os.chmod(part, 0o600)
             os.replace(part, folder / f"{name}.m3u8")
@@ -585,6 +727,8 @@ class Outbox:
                 self._save(meta)
             except OSError:
                 pass
+        if ok:
+            self.prune()
 
     def _write_master(self, folder: Path, meta: Dict[str, Any], has_audio: bool) -> None:
         """The master playlist of the tiers built so far, LOWEST FIRST: Safari starts with the
@@ -625,13 +769,14 @@ class Outbox:
 
     def _job_audio(self, digest: str, fid: str) -> None:
         folder = self._folder(digest, fid)
-        probe = self.werkstatt.probe(folder / "original")
+        probe = self._probe(digest, fid)
         try:
             dauer = round(float((probe or {}).get("format", {}).get("duration")), 1)
         except (TypeError, ValueError):
             dauer = None
-        ok = self.werkstatt.ffmpeg(["-i", str(folder / "original"), "-vn", "-c:a", "aac", "-b:a", "128k",
-                                    "-movflags", "+faststart"], folder / VARIANTS["m4a"][0], fmt="mp4")
+        ok = self._room() and self.werkstatt.ffmpeg([*self._input(digest, fid), "-vn", "-c:a", "aac", "-b:a",
+                                                     "128k", "-movflags", "+faststart"],
+                                                    folder / VARIANTS["m4a"][0], fmt="mp4")
         self._done(digest, fid, "m4a", ok, dauer=dauer)
 
     # -- housekeeping -----------------------------------------------------------------------------
