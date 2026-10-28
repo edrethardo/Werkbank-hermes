@@ -138,6 +138,17 @@ class Buffers:
         self._next_epoch = initial_epoch() if epoch_start is None else epoch_start
         self._clock = clock
         self.closed = False
+        self.outbox: Any = None              # WB-1321: outbox.Outbox — files of Hermes' replies
+
+    def _with_files(self, event: Any) -> Any:
+        """WB-1321: a reply's ``MEDIA:`` files go to the outbox (a COPY of the event carries their
+        metadata; the core's dict stays as the core made it). Never raises."""
+        if self.outbox is None:
+            return event
+        try:
+            return self.outbox.annotate(event, self.get)
+        except Exception:
+            return event
 
     # -- row marks ----------------------------------------------------------------------------
     def _mark(self, session_key: str, session_id: Optional[str]) -> Optional[int]:
@@ -314,6 +325,7 @@ class Buffers:
         """``on_gateway_session_event`` subscriber. Never raises, never logs a text."""
         if not isinstance(event, dict):
             return
+        event = self._with_files(event)        # WB-1321
         key = event.get("session_key")
         if not isinstance(key, str):
             return
@@ -385,7 +397,7 @@ class Buffers:
                 buf.turn_starts[str(id_)] = {"session_id": sid, "mark": mark, "order": buf.order}
                 while len(buf.turn_starts) > _TURN_STARTS:
                     buf.turn_starts.popitem(last=False)
-            elif type_ == "turn.done" and payload.get("final_response"):
+            elif type_ == "turn.done" and (payload.get("final_response") or payload.get("files")):
                 start = buf.turn_starts.get(str(id_)) if id_ is not None else None
                 uid, row_id = payload.get("message_uid"), payload.get("row_id")
                 row_id = row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
@@ -410,7 +422,8 @@ class Buffers:
                     mark: Optional[int], start: Optional[Dict[str, Any]], uid: Optional[str],
                     row_id: Optional[int]) -> None:
         buf.recent_answers.append({
-            "turn_id": None if id_ is None else str(id_), "text": str(payload["final_response"]),
+            "turn_id": None if id_ is None else str(id_), "text": str(payload.get("final_response") or ""),
+            "files": list(payload.get("files") or []) or None,        # WB-1321
             "ts": ts, "session_id": sid, "mark": mark,
             # the turn's own start, or None: it began before this plugin observed the session
             "start_mark": start["mark"] if start else None, "started": start is not None,

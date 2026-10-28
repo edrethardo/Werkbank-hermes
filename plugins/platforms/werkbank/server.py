@@ -12,6 +12,7 @@ import binascii
 import hmac
 import json
 import logging
+import os
 import re
 import socket
 import threading
@@ -24,6 +25,7 @@ from typing import Any, Callable, Dict, Optional
 from . import approvals, snapshot
 from . import commands as commands_mod
 from . import mirror as mirror_mod
+from . import outbox as outbox_mod
 from . import subagents as subagents_mod
 from . import uploads as uploads_mod
 
@@ -133,7 +135,7 @@ class WerkbankServer:
                  mirror_enabled: Callable[[], bool] = lambda: True, mirror_name: str = "",
                  max_streams: int = MAX_STREAMS,
                  max_connections: int = MAX_CONNECTIONS, max_authenticated: int = MAX_AUTHENTICATED,
-                 header_deadline: float = HEADER_DEADLINE_S, uploads: Any = None) -> None:
+                 header_deadline: float = HEADER_DEADLINE_S, uploads: Any = None, outbox: Any = None) -> None:
         if not key or any(c.isspace() for c in key):
             raise ValueError("unusable key")
         self._wanted = ("Bearer " + key).encode("utf-8")
@@ -148,6 +150,9 @@ class WerkbankServer:
         self.max_authenticated = max_authenticated
         self.header_deadline = header_deadline
         self.uploads = uploads              # WB-1174: uploads.Uploads, None = attachments off
+        self.outbox = outbox                # WB-1321: outbox.Outbox, None = Hermes' files off
+        if outbox is not None and getattr(buffers, "outbox", None) is None:
+            buffers.outbox = outbox
         self.open_streams = 0
         self._streams_lock = threading.Lock()
         self._httpd: Optional[_Server] = None
@@ -348,6 +353,8 @@ def _handler(app: WerkbankServer):
                             found = app.uploads.attachments(key, message.get("client_message_id"))
                             if found:
                                 message["attachments"] = found
+                    if app.outbox is not None:           # WB-1321: Hermes' files, tags out of the text
+                        app.outbox.dress(key, body.get("messages") or [])
                     return self._json(200, body)
                 if what == ["events"]:
                     return self._events(key, query)
@@ -355,7 +362,59 @@ def _handler(app: WerkbankServer):
                     return self._tool_output(key, urllib.parse.unquote(what[1]))
                 if len(what) == 2 and what[0] == "uploads":
                     return self._upload_file(key, urllib.parse.unquote(what[1]))
+                if len(what) in (2, 3) and what[0] == "files":          # WB-1321
+                    return self._outbox_file(key, what[1], what[2] if len(what) == 3 else None)
             self._refuse(404, "not found", "Unbekannter Pfad.")
+
+        def _outbox_file(self, key: str, fid: str, variant: Optional[str]):
+            """WB-1321: a file Hermes sent in THIS session — its metadata, or the bytes of one variant
+            (``original`` or a ready playback version) with single-range support (206/416)."""
+            if app.outbox is None:
+                return self._refuse(501, "no outbox", "Dateiablage ist nicht eingerichtet.")
+            if not outbox_mod.ID_RE.fullmatch(fid or ""):
+                return self._refuse(400, "bad file id", "Ungültige Datei-ID.")
+            if variant is None:
+                meta = app.outbox.get(key, fid)
+                if meta is None:
+                    return self._refuse(404, "unknown file", "Diese Datei gibt es (nicht mehr).")
+                return self._json(200, app.outbox.public(meta))
+            if variant != "original" and variant not in outbox_mod.VARIANTS:
+                return self._refuse(400, "bad variant", "Unbekannte Fassung.")
+            found = app.outbox.path(key, fid, variant)
+            if found is None:
+                return self._refuse(404, "unknown file", "Diese Datei oder Fassung gibt es (noch) nicht.")
+            path, media_type = found
+            try:
+                handle = open(path, "rb")
+            except OSError:
+                return self._refuse(404, "unknown file", "Diese Datei gibt es (nicht mehr).")
+            with handle:
+                size = os.fstat(handle.fileno()).st_size
+                wanted = outbox_mod.parse_range(self.headers.get("Range"), size)
+                if wanted == "416":
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end = wanted if isinstance(wanted, tuple) else (0, size - 1)
+                self.send_response(206 if isinstance(wanted, tuple) else 200)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Accept-Ranges", "bytes")
+                if isinstance(wanted, tuple):
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(max(0, end - start + 1)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                handle.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = handle.read(min(outbox_mod.CHUNK, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
 
         def _resolve(self, session_id: str):
             if not ID_RE.fullmatch(session_id or ""):

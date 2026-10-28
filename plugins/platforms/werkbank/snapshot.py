@@ -213,6 +213,8 @@ def message_item(row: Dict[str, Any], origin: Optional[str] = None,
     else:
         item["text"] = raw
     calls = row.get("tool_calls")
+    if role == "assistant" and isinstance(row.get("message_uid"), str) and row["message_uid"]:
+        item["message_uid"] = row["message_uid"]          # WB-1321: the outbox finds the row's files by it
     if role == "assistant" and isinstance(calls, list) and calls:
         item["tool_calls"] = [
             {"id": c.get("id"), "name": (c.get("function") or {}).get("name") or c.get("name")}
@@ -327,7 +329,8 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
     shown: List[tuple] = []
     for answer in pos.get("recent_answers") or []:
         order = _int(answer.get("order")) or 0
-        if (answer.get("session_id") not in allowed or not (answer.get("text") or "").strip()
+        if (answer.get("session_id") not in allowed
+                or not ((answer.get("text") or "").strip() or answer.get("files"))
                 or order <= confirmed_order):
             continue
         if answer.get("message_uid"):
@@ -355,7 +358,8 @@ def _complete(messages: List[Dict[str, Any]], rows: List[Dict[str, Any]], pos: D
         messages.append({"id": str(answer_id), "client_message_id": None, "message_id": None, "db_id": None,
                          "role": "assistant", "text": answer.get("text"), "ts": answer.get("ts"),
                          "origin": None, "tool_call_id": None, "tool_name": None, "is_error": False,
-                         "truncated": False, "from_buffer": True})
+                         "truncated": False, "from_buffer": True,
+                         **({"files": list(answer["files"])} if answer.get("files") else {})})   # WB-1321
     return confirmed
 
 

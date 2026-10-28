@@ -107,9 +107,9 @@ class FakeHost:
         return self.outputs.get(tool_call_id)
 
 
-def running_server(tmp_path, fake_host, *, ring=5000, mirror=True, uploads=True):
+def running_server(tmp_path, fake_host, *, ring=5000, mirror=True, uploads=True, outbox=None):
     """(server, key, buffers, host, uploads) — a running plugin server on a free port. Uploads (WB-1174)
-    land in ``tmp_path/cache``."""
+    land in ``tmp_path/cache``; ``outbox`` (WB-1321) is an ``outbox.Outbox`` or None."""
     from plugins.platforms.werkbank import buffer, keyfile, server
     from plugins.platforms.werkbank import uploads as uploads_mod
 
@@ -117,8 +117,9 @@ def running_server(tmp_path, fake_host, *, ring=5000, mirror=True, uploads=True)
     buffers = buffer.Buffers(plugin_id="platforms/werkbank", ring=ring, watermark=fake_host.row_watermark)
     store = uploads_mod.Uploads(tmp_path) if uploads else None
     srv = server.WerkbankServer(key, buffers, fake_host, port=0, heartbeat=0.1,
-                                mirror_enabled=lambda: mirror, uploads=store).start()
-    return SimpleNamespace(server=srv, key=key, buffers=buffers, host=fake_host, port=srv.port, uploads=store)
+                                mirror_enabled=lambda: mirror, uploads=store, outbox=outbox).start()
+    return SimpleNamespace(server=srv, key=key, buffers=buffers, host=fake_host, port=srv.port, uploads=store,
+                           outbox=outbox)
 
 
 def call(port, method, path, key=None, body=None, timeout=5.0):

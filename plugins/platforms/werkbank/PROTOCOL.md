@@ -54,7 +54,7 @@ WB-1126 event types, the WB-1132 field names and snapshot obligations). The boar
 | `approval.request` | request id | `request_id`, `command`/`description` (redacted like the Telegram card), `pattern_key(s)`, `allow_permanent`, `allow_session`, `smart_denied`, `surface`, `delegated_child`, for a child `child_session_id` and (plugin, from `subagent.start`) `subagent_id` |
 | `approval.resolved\|expired\|cancelled` | request id | `request_id`, `choice`, `decided_by` / `cause` |
 | `clarify.request\|resolved\|expired` | clarify id | `clarify_id`, `question`, `choices`, `multi_select` / `answer`, `decided_by` |
-| `turn.done` | turn id | `final_response` (redacted), `completed`, `api_calls`, `model`, `session_id`; `message_uid`, `row_id` of the answer's SessionDB row once it is written; WB-1309: `provider`, `context_tokens`, `context_length`, `compression_threshold` when known (also on `turn.stopped` and a failed turn's `error`) |
+| `turn.done` | turn id | `final_response` (redacted), `completed`, `api_calls`, `model`, `session_id`; `message_uid`, `row_id` of the answer's SessionDB row once it is written; WB-1309: `provider`, `context_tokens`, `context_length`, `compression_threshold` when known (also on `turn.stopped` and a failed turn's `error`); WB-1321 (plugin): `files` — see „Files Hermes sends“ |
 | `turn.stopped` | turn id | as `turn.done` plus `reason` |
 | `error` | turn id | `stage`/`failure_reason`, `error_type`, `message` |
 | `command.reply` | the board's `client_message_id` | WB-1256: the reply of a slash command the board sent — `command` (name), `text` (redacted, ≤ 20 000 chars, may be empty when the command opened a card instead), `request` (the command text as sent, redacted, ≤ 2 000 chars — the stream can be faster than the board's POST), `client_message_id`, `refused` (the gateway's authorization refused the session) |
@@ -181,6 +181,46 @@ produced; its fields are in the snapshot's `session`.
   already. `clarify.resolved` carries `decided_by`.
 * `GET /v1/s/{key}/tools/{tool_call_id}/output` → `{tool_call_id, output}` (full text, redacted,
   ≤ 1 MB) from the SessionDB; `404` when unknown.
+
+## Files Hermes sends (WB-1321, `outbox.py`, `medien.py`)
+
+Why: this plugin has no messaging adapter. The gateway hands a reply's `MEDIA:<path>` files only to
+the session origin's adapter (`gateway/platforms/base.py` `_deliver_media_attachments` → `send_voice`
+/ `send_video` / `send_document` / image batch; streamed replies
+`gateway/run_notifications.py` `_deliver_media_from_response`); the board saw only the text with the
+raw tags. Now:
+
+* On `turn.done` / `turn.stopped` of a watched session the plugin reads the tags with the gateway's
+  OWN `BasePlatformAdapter.extract_media` + `filter_media_delivery_paths` (the files Telegram gets,
+  the same denylist) and COPIES each (≤ 10 per turn) into
+  `<home>/plugin-data/werkbank/outbox/<sha256(session_key)[:24]>/<file id>/original` (directories
+  0700, files 0600, `O_EXCL`, `meta.json` beside it — survives a gateway restart). The core's event dict
+  is never changed (Telegram's delivery reads its own copy); the buffered event gets
+  `payload.files` and `final_response` without the tags. The same source file (path, size, mtime)
+  in one session is one entry.
+* `files: [{id, name, type, size, kind: bild|audio|video|datei, nur_download, abspielbar,
+  fassungen: {variant: wartet|bereit|fehler}, voice?, dauer?, breite?, hoehe?, grund?}]`. `id` =
+  `fx_<32 hex>` (128 random bits). `type` comes from the bytes (magic), never the model's word; HTML
+  and SVG (and anything unknown) are `nur_download: true`. Over 50 MB (Telegram's bot limit):
+  `{id: null, fehlt: "zu_gross", grenze, size, name, kind}`; vanished: `fehlt: "nicht_lesbar"`.
+* Snapshot: every assistant message loses its `MEDIA:` tags; `files` come from the outbox by the
+  row's `message_uid` (now on assistant items) or the turn id, else — for the newest 10 answers with
+  tags only — the files are taken over at snapshot time.
+* Versions, built in the background by ONE worker (`nice -n 15`, `ionice -c 3`, 900 s limit, `umask
+  077`, `.part` + rename; previews before playback versions before HLS): images `klein` (WebP ≤ 360 px)
+  and `gross` (WebP ≤ 2048 px; not for GIF — the original keeps its frames); videos `poster` (JPEG
+  ≤ 480 px) and `mp4` (H.264 High ≤ L4.1, yuv420p, AAC 128 kbit/s, CRF 26, `veryfast`, short side
+  ≤ 1080, `+faststart`; only remuxed when the original already is H.264/AAC in MP4/MOV within those
+  limits); Ogg/WebM audio `m4a` (AAC). Without `ffmpeg`/`ffprobe`: no versions, `grund` says so.
+  `abspielbar`: the original itself plays in a browser (`ffprobe`: H.264 yuv420p in MP4/MOV).
+* `GET /v1/s/{key}/files/{id}` → the public entry (state of the versions). `GET
+  /v1/s/{key}/files/{id}/{original|klein|gross|poster|mp4|m4a}` → the bytes of a file of THIS
+  session (another session's id: `404`; a version not ready: `404`; a bad id/variant: `400`), its own
+  media type, `X-Content-Type-Options: nosniff`, `Accept-Ranges: bytes`; `Range: bytes=a-b|a-|-n`
+  → `206` + `Content-Range`, beyond the end → `416` + `Content-Range: bytes */size`; a malformed or
+  multi-range header → the whole file (`200`). Streamed in 256 KiB chunks.
+* Housekeeping on every new file: folders older than 30 days go, then the oldest until all outbox
+  files of the profile together are ≤ 4 GiB (a folder a job still writes into stays).
 
 ## Snapshot
 

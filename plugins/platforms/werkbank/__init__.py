@@ -77,7 +77,7 @@ def plugin_home(ctx: Any) -> Path:
 
 def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[int] = None) -> Optional[Instance]:
     """Key file, buffers, server. ``None`` (logged, no text) when the key or the port is not usable."""
-    from . import buffer, keyfile, server, uploads
+    from . import buffer, keyfile, medien, outbox, server, uploads
     from .host import GatewayHost
 
     try:
@@ -93,7 +93,8 @@ def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[
         srv = server.WerkbankServer(key, buffers, host, settings.port if port is None else port,
                                     mirror_enabled=lambda: mirror,
                                     mirror_name=getattr(settings, "mirror_name", ""),
-                                    uploads=uploads.Uploads(home)).start()   # WB-1174
+                                    uploads=uploads.Uploads(home),            # WB-1174
+                                    outbox=outbox.Outbox(home, werkstatt=medien.Werkstatt())).start()  # WB-1321
     except OSError as exc:
         logger.warning("werkbank: cannot listen on 127.0.0.1:%s (%s)", settings.port, type(exc).__name__)
         return None
