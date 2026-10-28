@@ -35,6 +35,7 @@ HEARTBEAT_S = 15.0
 MAX_BODY = 512 * 1024
 MAX_UPLOAD_BODY = 28 * 1024 * 1024  # WB-1174: one file of uploads.MAX_FILE as base64 in JSON, plus room
 MAX_TEXT = 200_000
+NEW_TITLE_MAX = 60                  # WB-1342: title of a new chat (a Telegram topic name)
 MAX_STREAMS = 32
 MAX_CONNECTIONS = 64                 # connections not authenticated yet; beyond it the OLDEST one goes
 MAX_AUTHENTICATED = MAX_STREAMS + 16 # authenticated connections (streams + requests): an own quota
@@ -513,6 +514,8 @@ def _handler(app: WerkbankServer):
 
         def _post(self, body: Dict[str, Any]):
             parts = urllib.parse.urlsplit(self.path).path.split("/")[1:]
+            if parts == ["v1", "sessions"]:                  # WB-1342: a new chat for a new project
+                return self._new_session(body)
             if len(parts) < 4 or parts[:2] != ["v1", "s"]:
                 return self._refuse(404, "not found", "Unbekannter Pfad.")
             key = self._session(parts)
@@ -539,6 +542,30 @@ def _handler(app: WerkbankServer):
                 logger.info("werkbank: subagent steer from the board (status=%s)", status)
                 return self._json(status, payload)
             self._refuse(404, "not found", "Unbekannter Pfad.")
+
+        def _new_session(self, body: Dict[str, Any]):
+            """WB-1342: ``POST /v1/sessions {next_to, title, text}`` — a new chat (sibling thread +
+            session) next to the chat of the session ``next_to``, its first turn started with *text*
+            (``host.new_session``). The text is never logged."""
+            next_to, title, text = body.get("next_to"), body.get("title"), body.get("text")
+            if not isinstance(next_to, str) or not _valid_key(next_to):
+                return self._refuse(400, "bad next_to", "Ungültige Vorlage-Sitzung.")
+            if (not isinstance(title, str) or not title.strip() or len(title) > NEW_TITLE_MAX
+                    or not title.isprintable()):
+                return self._refuse(400, "bad title", "Bitte einen einzeiligen Titel (höchstens 60 Zeichen).")
+            if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+                return self._refuse(400, "bad text", "Bitte eine Startanweisung senden (höchstens 200 000 Zeichen).")
+            create = getattr(app.host, "new_session", None)
+            if not callable(create):
+                return self._refuse(501, "not implemented", "Dieses Hermes-Plugin legt keine neuen Chats an.")
+            from .host import NewSessionRefused
+            try:
+                out = create(next_to, title.strip(), text)
+            except NewSessionRefused as e:
+                logger.info("werkbank: new chat refused (status=%s)", e.status)
+                return self._refuse(e.status, "refused", e.grund)
+            self._json(200, {"session_key": str(out["session_key"]), "session_id": str(out["session_id"]),
+                             "thread_id": str(out.get("thread_id") or "")})
 
         # -- DELETE -----------------------------------------------------------------------------
         def do_DELETE(self):  # noqa: N802

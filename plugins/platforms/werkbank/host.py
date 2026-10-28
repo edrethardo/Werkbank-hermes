@@ -37,6 +37,16 @@ TOOL_OUTPUT_MAX = 1024 * 1024        # GET tools/{id}/output: the full text, up 
 _TOOL_SCAN = 500                     # newest messages searched for a tool call id
 MIRROR_WAIT_S = 5.0                  # the board's POST waits this long for the mirror's message id
 _ANCHOR_RE = re.compile(r"[0-9]{1,20}")   # = the core's reply_to_message_id check (plugins_injection.py)
+NEW_SESSION_WAIT_S = 15.0            # WB-1342: thread + session creation on the gateway loop
+
+
+class NewSessionRefused(Exception):
+    """WB-1342: ``new_session`` could not open the chat — ``status`` and a short German reason."""
+
+    def __init__(self, status: int, grund: str) -> None:
+        super().__init__(grund)
+        self.status = status
+        self.grund = grund
 
 
 def accepts_kwarg(func: Any, name: str) -> bool:
@@ -131,6 +141,63 @@ class GatewayHost:
         if adapter is None or loop is None or loop.is_closed():
             return None
         return adapter, source, loop
+
+    def new_session(self, next_to: str, title: str, text: str) -> Dict[str, Any]:
+        """WB-1342: a NEW chat next to the chat of *next_to* — a sibling thread (Telegram DM topic,
+        Slack/Matrix/Discord thread; the same rules as ``/branch``), that thread's own session, and a
+        first turn started with *text* through ``inject_message(origin=…)``. No client message id:
+        the start instruction is the board's, not the owner's words, so it stays hidden.
+
+        Returns ``{session_key, session_id, thread_id}``; raises ``NewSessionRefused`` (404 unknown
+        *next_to*, 501 chat without threads, 502 thread not created, 503 gateway not taking it)."""
+        chat = self._chat(next_to)
+        if chat is None:
+            raise NewSessionRefused(404, "Die Vorlage-Sitzung hat keinen erreichbaren Chat.")
+        if not self.injection_possible():
+            raise NewSessionRefused(503, "Das Gateway nimmt gerade keine Nachrichten an.")
+        adapter, source, loop = chat
+        try:
+            from gateway.slash_commands_branch_thread import branch_dest_source, branch_thread_parent
+        except Exception:
+            raise NewSessionRefused(501, "Dieses Hermes kann keine Nebenthemen anlegen.") from None
+        parent = branch_thread_parent(source)
+        create = getattr(adapter, "create_handoff_thread", None)
+        if not parent or not callable(create):
+            raise NewSessionRefused(501, "Dieser Chat kann kein neues Thema neben sich anlegen.")
+        owner = self.owner()
+        store = getattr(owner, "async_session_store", None)
+        if store is None:
+            raise NewSessionRefused(501, "Dieses Hermes hat keinen Sitzungsspeicher für ein neues Thema.")
+
+        async def _open():
+            thread_id = await create(parent, title)
+            if not thread_id:
+                return None
+            dest = branch_dest_source(source, parent_id=parent, thread_id=str(thread_id), title=title)
+            entry = await store.get_or_create_session(dest)
+            return dest, entry, str(thread_id)
+
+        try:
+            opened = asyncio.run_coroutine_threadsafe(_open(), loop).result(timeout=NEW_SESSION_WAIT_S)
+        except Exception:
+            logger.warning("werkbank: new chat thread not opened", exc_info=False)
+            opened = None
+        if opened is None:
+            raise NewSessionRefused(502, "Der Chat hat kein neues Thema angelegt.")
+        dest, entry, thread_id = opened
+        session_id = str(getattr(entry, "session_id", "") or "")
+        session_key = str(getattr(entry, "session_key", "") or "")
+        if not session_id or not session_key:
+            raise NewSessionRefused(502, "Das neue Thema hat keine Sitzung bekommen.")
+        try:
+            ok = bool(self.ctx.inject_message(text, origin=dest.to_dict()))
+        except Exception:
+            ok = False
+        if not ok:
+            raise NewSessionRefused(503, f"Thema und Sitzung {session_id} sind angelegt, aber Hermes hat "
+                                         "die Startanweisung nicht angenommen.")
+        logger.info("werkbank: new chat opened from the board (thread created, start turn injected)")
+        return {"session_key": session_key, "session_id": session_id, "thread_id": thread_id}
 
     def injection_possible(self) -> bool:
         """Can the gateway take a plugin message right now? Checked BEFORE the mirror goes out, so a

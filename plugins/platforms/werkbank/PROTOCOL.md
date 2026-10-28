@@ -120,6 +120,16 @@ produced; its fields are in the snapshot's `session`.
   delegate result when the child finished before the next boundary).
 * `GET /v1/commands` (WB-1256) → `{commands: [{name, args, description}]}`: the gateway's slash
   commands (registry, gateway-available, plus plugin commands) for the board's completion.
+* `POST /v1/sessions {next_to, title, text}` (WB-1342, `host.new_session`) →
+  `{session_key, session_id, thread_id}`: a NEW chat for the board's „+“ (new project). Next to the
+  chat of the session `next_to` (a key of THIS profile) the adapter opens a sibling thread named
+  `title` (≤ 60 characters, one line; Telegram DM topic, Slack/Matrix/Discord thread — the rules of
+  `/branch`), the session store creates that thread's session, and its first turn starts with
+  `text` through `inject_message(origin=…)` WITHOUT a client message id — the start instruction is
+  an internal plugin row, no owner bubble. Unknown `next_to`: `404`; a chat that cannot host a
+  thread (or a core without the pieces): `501`; thread or session not created: `502`; gateway not
+  taking messages, or the start turn refused (`grund` names the session that exists then): `503`.
+  One call opens one thread — the board never retries it on its own. The text is never logged.
 * `POST /v1/s/{key}/uploads {name, data}` (WB-1174, `uploads.py`) → `{upload_id, name, type, size, kind}`.
   ONE file, `data` base64; the request body may be up to 28 MiB (every other POST: 512 KiB), refused
   `413` from `Content-Length` before it is read; the file ≤ 20 MiB (`413`). The bytes decide the type,
