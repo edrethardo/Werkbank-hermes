@@ -457,14 +457,23 @@ class GatewayHost:
         return prompt, agent
 
     def context_write(self, session_key: str, session_id: Optional[str],
-                      messages: List[Dict[str, Any]]) -> Tuple[bool, str]:
+                      messages: List[Dict[str, Any]],
+                      expected: Optional[str] = None) -> Tuple[bool, str]:
         """Replace the active transcript, rewind-style (the rows stay on disk as ``active = 0``), with
         the database's own turn-lease fence; then evict the cached agent so the next turn rebuilds
-        its prompt from what is written."""
+        its prompt from what is written.
+
+        ``expected`` is the fingerprint (``kontext.fingerprint``) of the transcript the change was
+        made on. ``replace_messages`` has no compare-and-swap, so the transcript is read again right
+        before the write; a mismatch answers ``(False, kontext.WRITE_STALE)`` and writes nothing."""
         db = self._db(session_key)
         write = getattr(db, "replace_messages", None)
         if not session_id or not callable(write):
             return False, "Diese Sitzung hat keinen schreibbaren Verlauf."
+        if expected is not None:
+            from . import kontext as kontext_mod
+            if kontext_mod.fingerprint(self.context_messages(session_key, session_id)) != expected:
+                return False, kontext_mod.WRITE_STALE
         try:
             write(session_id, messages, archive_dropped=True, reject_active_turn_lease=True)
         except Exception as exc:

@@ -695,3 +695,115 @@ def test_real_db_undo_after_the_history_moved_on_is_refused(tmp_path):
     assert err.value.status == 409 and err.value.error == "moved on"
     assert _view(db) == moved
     assert kontext.counts(snaps, SID) == 1                  # the snapshot stays for the owner to see
+
+
+def test_real_db_write_with_a_moved_fingerprint_is_stale_and_writes_nothing(tmp_path):
+    """``replace_messages`` has no compare-and-swap: the host re-reads right before writing."""
+    from plugins.platforms.werkbank import kontext
+
+    db, _runner, host, _buffers, _snaps = _real_env(tmp_path)
+    before = _view(db)
+    current = host.context_messages(KEY_SESSION, SID)
+    ok, grund = host.context_write(KEY_SESSION, SID, current[:1], expected="0" * 64)
+    assert ok is False and grund == kontext.WRITE_STALE
+    assert _view(db) == before
+
+
+# ── Nachtrag: kein Lost-Update, Zusammenfassung nicht editierbar ────────────────────────────
+def test_two_concurrent_edits_both_land_or_one_is_refused_never_lost(tmp_path):
+    import threading
+    import time
+
+    srv = _server(tmp_path)
+    try:
+        read = srv.host.context_messages
+
+        def slow_read(session_key, session_id):
+            out = read(session_key, session_id)
+            time.sleep(0.05)                                # widen the read → write window
+            return out
+
+        srv.host.context_messages = slow_read
+        barrier = threading.Barrier(2)
+        results: Dict[int, Any] = {}
+
+        def run(rid: int, old: str, new: str):
+            barrier.wait()
+            results[rid] = _post(srv, "edit", {"ops": [{"op": "edit", "id": rid, "text": new,
+                                                        "base": _base(old)}]})
+
+        threads = [threading.Thread(target=run, args=(1, "erste Frage", "Frage EINS")),
+                   threading.Thread(target=run, args=(5, "zweite Frage", "Frage ZWEI"))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        statuses = {rid: status for rid, (status, _a) in results.items()}
+        assert set(statuses) == {1, 5} and set(statuses.values()) <= {200, 409}, results
+        assert 200 in statuses.values()
+        texts = [m["content"] for m in srv.host.conversation]
+        for rid, wanted, index in ((1, "Frage EINS", 0), (5, "Frage ZWEI", 4)):
+            if statuses[rid] == 200:
+                assert texts[index] == wanted, (results, texts)   # an acknowledged edit survives
+        assert len(srv.host.context_writes) == list(statuses.values()).count(200)
+    finally:
+        srv.server.stop()
+
+
+def test_a_transcript_moved_between_read_and_write_is_409_stale(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        read = srv.host.context_messages
+        calls = []
+
+        def moving_read(session_key, session_id):
+            out = read(session_key, session_id)
+            if not calls:                                   # another writer lands after the read
+                srv.host.conversation = srv.host.conversation + [_row(7, "user", "fremd")]
+            calls.append(1)
+            return out
+
+        srv.host.context_messages = moving_read
+        status, answer = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": "neu",
+                                                      "base": _base("erste Frage")}]})
+        assert status == 409 and answer["error"] == "stale", answer
+        assert srv.host.context_writes == []
+        assert srv.host.conversation[0]["content"] == "erste Frage"
+        assert srv.host.conversation[-1]["content"] == "fremd"
+        assert _inspect(srv)["undo"] == 0                   # the refused change leaves no snapshot
+    finally:
+        srv.server.stop()
+
+
+def test_a_held_session_lock_answers_busy_instead_of_racing(tmp_path, monkeypatch):
+    from plugins.platforms.werkbank import kontext
+
+    srv = _server(tmp_path)
+    monkeypatch.setattr(kontext, "LOCK_WAIT_S", 0.05)
+    lock = kontext._session_lock(KEY_SESSION)
+    assert lock.acquire(timeout=1)
+    try:
+        for path, body in (("edit", {"ops": [{"op": "remove", "id": 1}]}), ("undo", {}),
+                           ("compress", {"instruction": "x"})):
+            status, answer = _post(srv, path, body)
+            assert status == 409 and answer["error"] == "busy", (path, answer)
+        assert srv.host.context_writes == [] and srv.host.compress_calls == []
+    finally:
+        lock.release()
+        srv.server.stop()
+
+
+def test_a_compression_summary_is_not_editable_only_removable(tmp_path):
+    summary = "[Zusammenfassung] bisher besprochen: A und B"
+    srv = _server(tmp_path, conversation=[_row(1, "user", summary, _compressed_summary=True),
+                                          _row(2, "assistant", "ok"),
+                                          _row(3, "user", "weiter"), _row(4, "assistant", "gut")])
+    try:
+        status, answer = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": "erfunden",
+                                                      "base": _base(summary)}]})
+        assert status == 409 and answer["error"] == "not editable", answer
+        assert srv.host.context_writes == [] and srv.host.conversation[0]["content"] == summary
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
+        assert status == 200, out
+    finally:
+        srv.server.stop()

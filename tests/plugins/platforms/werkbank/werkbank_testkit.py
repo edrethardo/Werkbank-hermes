@@ -125,10 +125,15 @@ class FakeHost:
         """(the prompt the last turn sent, the live agent or None)."""
         return self.system_prompt, self.agent
 
-    def context_write(self, session_key, session_id, messages):
-        """(ok, grund): the transcript replaced by *messages*."""
+    def context_write(self, session_key, session_id, messages, expected=None):
+        """(ok, grund): the transcript replaced by *messages*; like the real host it re-reads first
+        and answers ``kontext.WRITE_STALE`` when the transcript no longer has fingerprint *expected*."""
         if not self.context_write_ok:
             return False, self.context_write_grund or "Die Datenbank hat die Änderung abgelehnt."
+        if expected is not None:
+            from plugins.platforms.werkbank import kontext
+            if kontext.fingerprint(self.context_messages(session_key, session_id)) != expected:
+                return False, kontext.WRITE_STALE
         self.context_writes.append([dict(m) for m in messages])
         self.conversation = [dict(m) for m in messages]
         return True, ""

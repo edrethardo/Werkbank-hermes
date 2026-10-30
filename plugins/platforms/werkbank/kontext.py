@@ -20,7 +20,12 @@ Rules of this module (they are the ticket's "Fertig, wenn" in code):
   only while that process runs a turn).
 * **Edit only what was seen whole.** A user/assistant text is editable only when the board's copy
   IS the stored text (not capped, nothing redacted, a plain string); else it can only be removed.
-  ``edit`` carries ``base`` = sha256 of the whole stored text, a mismatch is ``409 stale``.
+  ``edit`` carries ``base`` = sha256 of the whole stored text, a mismatch is ``409 stale``. A
+  compression summary (``_compressed_summary``) is never editable, only removable.
+* **No lost update.** edit/remove/shorten, undo and a real compression hold one lock per
+  ``session_key`` over read → check → write; ``context_write`` gets the fingerprint of what was
+  read and re-reads right before ``replace_messages`` (the core has no compare-and-swap) — a
+  transcript that moved meanwhile is ``409 stale``, never silently overwritten.
 * **Never a text with a secret.** Every string that leaves this module ran through the gateway's
   own egress redaction (``gateway.session_events._redact``).
 
@@ -34,6 +39,8 @@ import json
 import logging
 import os
 import re
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,6 +55,47 @@ SNAPSHOT_KEEP = 5
 UNDO_HINT = ("Die Änderung bricht den Prompt-Cache: der nächste Zug schickt den geänderten Verlauf "
              "neu und ist deshalb teurer.")
 ROLES = ("user", "assistant", "tool")
+
+LOCK_WAIT_S = 10.0            # an edit waits this long for another change of the same session
+WRITE_STALE = "stale"         # context_write's grund when the re-read no longer matches the base
+
+# one lock per session_key: read → check → write of edit/remove/shorten, undo and compression is
+# one step, so two requests of the same session can never both read the old state (lost update)
+_LOCKS: Dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _session_lock(session_key: str) -> threading.Lock:
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(session_key)
+        if lock is None:
+            lock = _LOCKS[session_key] = threading.Lock()
+        return lock
+
+
+@contextmanager
+def _held(session_key: str, wait: Optional[float] = None):
+    lock = _session_lock(session_key)
+    if not lock.acquire(timeout=LOCK_WAIT_S if wait is None else wait):
+        raise KontextFehler(409, "busy", "Eine andere Änderung dieses Kontexts läuft gerade — "
+                                         "bitte gleich noch einmal.")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _write(host: Any, session_key: str, session_id: Optional[str],
+           messages: List[Dict[str, Any]], expected: str) -> None:
+    """``context_write`` with the fingerprint of what was read; a moved transcript is ``409 stale``."""
+    ok, grund = host.context_write(session_key, session_id, messages, expected=expected)
+    if ok:
+        return
+    if grund == WRITE_STALE:
+        raise KontextFehler(409, "stale", "Der Verlauf hat sich seit dem Lesen geändert — "
+                                          "bitte neu laden.")
+    raise KontextFehler(409, "write refused", grund or "Die Datenbank hat die Änderung abgelehnt.")
+
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060]")
 
@@ -412,6 +460,9 @@ def _one_op(messages: List[Dict[str, Any]], op: Dict[str, Any]) -> Tuple[str, in
         if role not in ("user", "assistant"):
             raise KontextFehler(409, "tool output",
                                 "Werkzeug-Ausgaben lassen sich nur kürzen oder entfernen.")
+        if msg.get("_compressed_summary"):
+            raise KontextFehler(409, "not editable",
+                                "Die Zusammenfassung einer Kompression lässt sich nur entfernen.")
         block = edit_block(msg.get("content"))
         if block:
             raise KontextFehler(409, "not editable", block)
@@ -449,6 +500,12 @@ def edit(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str,
          ops: Any) -> Dict[str, Any]:
     if snap_root is None:
         raise KontextFehler(501, "not set up", "Der Kontext-Editor hat in diesem Profil keinen Ablageort.")
+    with _held(session_key):
+        return _edit(host, buffers, snap_root, session_key, ops)
+
+
+def _edit(host: Any, buffers: Any, snap_root: Path, session_key: str,
+          ops: Any) -> Dict[str, Any]:
     position = buffers.position(session_key)
     if position is None:
         raise KontextFehler(404, "unknown session", "Diese Sitzung ist nicht (mehr) aufgelöst.")
@@ -458,6 +515,7 @@ def edit(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str,
     session_id = position.get("session_id")
     messages = [copy.deepcopy(m) for m in (host.context_messages(session_key, session_id) or [])
                 if isinstance(m, dict)]
+    read_fp = fingerprint(messages)
     broken = incomplete_pairs(messages)
     if broken:
         raise KontextFehler(409, "tool pair",
@@ -479,10 +537,11 @@ def edit(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str,
                             "geht nur zusammen.")
     snapshot = _write_snapshot(snap_root, session_id, "edit", host, session_key,
                                expected_after=fingerprint(messages))
-    ok, grund = host.context_write(session_key, session_id, messages)
-    if not ok:
+    try:
+        _write(host, session_key, session_id, messages, read_fp)
+    except KontextFehler:
         _discard(snapshot)
-        raise KontextFehler(409, "write refused", grund or "Die Datenbank hat die Änderung abgelehnt.")
+        raise
     logger.info("werkbank: context edited (removed=%d, changed=%d)", removed, changed)
     return {"ok": True, "removed": removed, "changed": changed, "snapshot": str(snapshot),
             "hinweis": UNDO_HINT, "undo": counts(snap_root, session_id)}
@@ -491,6 +550,11 @@ def edit(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str,
 def undo(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str) -> Dict[str, Any]:
     if snap_root is None:
         raise KontextFehler(501, "not set up", "Der Kontext-Editor hat in diesem Profil keinen Ablageort.")
+    with _held(session_key):
+        return _undo(host, buffers, snap_root, session_key)
+
+
+def _undo(host: Any, buffers: Any, snap_root: Path, session_key: str) -> Dict[str, Any]:
     position = buffers.position(session_key)
     if position is None:
         raise KontextFehler(404, "unknown session", "Diese Sitzung ist nicht (mehr) aufgelöst.")
@@ -511,15 +575,14 @@ def undo(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str) -
         raise KontextFehler(500, "snapshot unreadable", "Der Schnappschuss enthält keinen Verlauf.")
     expected = data.get("expected_after")
     current = host.context_messages(session_key, session_id) or []
-    if not isinstance(expected, str) or fingerprint(current) != expected:
+    current_fp = fingerprint(current)
+    if not isinstance(expected, str) or current_fp != expected:
         # a turn (or another edit) came after: restoring would drop it without the owner seeing it
         raise KontextFehler(409, "moved on",
                             "Seit dieser Änderung ist der Verlauf weitergegangen — „Rückgängig“ "
                             "würde die neueren Nachrichten verwerfen. Bitte von Hand bearbeiten.")
-    ok, grund = host.context_write(session_key, session_id, [dict(m) for m in messages
-                                                             if isinstance(m, dict)])
-    if not ok:
-        raise KontextFehler(409, "write refused", grund or "Die Datenbank hat die Änderung abgelehnt.")
+    _write(host, session_key, session_id, [dict(m) for m in messages if isinstance(m, dict)],
+           current_fp)
     try:
         newest.unlink()
     except OSError:
@@ -558,6 +621,16 @@ def compress(host: Any, buffers: Any, session_key: str, body: Dict[str, Any]) ->
     focus = instruction(body.get("instruction"))
     keep = kept_turns(body.get("keep"))
     preview = bool(body.get("preview"))
+    if preview:
+        return _compress(host, buffers, session_key, focus, keep, preview)
+    # a real compression rewrites the transcript: the same per-session lock as the editor, so an
+    # edit can neither be overwritten by it nor overwrite it
+    with _held(session_key):
+        return _compress(host, buffers, session_key, focus, keep, preview)
+
+
+def _compress(host: Any, buffers: Any, session_key: str, focus: str, keep: Optional[int],
+              preview: bool) -> Dict[str, Any]:
     if not preview:
         gate_ok, gate_grund = host.write_gate(session_key)
         if not gate_ok:
