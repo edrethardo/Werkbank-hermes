@@ -320,6 +320,25 @@ class Buffers:
             except ValueError:
                 pass
 
+    def set_context(self, session_key: str, numbers: Dict[str, Any], *, source: str = "") -> None:
+        """WB-1319: context numbers the plugin learned outside a turn end — a compression it ran.
+
+        Only the given fields change (the window and the threshold still describe the same model);
+        ``context_source`` names where they came from (``kompression``), so the board can say so. A
+        later turn end replaces the whole set, source included: it is the exact number again."""
+        with self.cond:
+            buf = self._sessions.get(session_key)
+            if buf is None:
+                return
+            fresh = dict(buf.context)
+            for name in _CONTEXT_FIELDS:
+                value = (numbers or {}).get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    fresh[name] = value
+            if source:
+                fresh["context_source"] = source
+            buf.context = fresh
+
     # -- the hook -----------------------------------------------------------------------------
     def on_event(self, event: Any) -> None:
         """``on_gateway_session_event`` subscriber. Never raises, never logs a text."""

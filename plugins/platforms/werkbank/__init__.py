@@ -75,6 +75,11 @@ def plugin_home(ctx: Any) -> Path:
     return Path(get_hermes_home())
 
 
+def _snapshot_root(home: Path) -> Path:
+    """WB-1319: where the context editor keeps its snapshots (0600 files, 0700 directories)."""
+    return Path(home) / "plugin-data" / "werkbank" / "kontext"
+
+
 def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[int] = None) -> Optional[Instance]:
     """Key file, buffers, server. ``None`` (logged, no text) when the key or the port is not usable."""
     from . import buffer, keyfile, medien, outbox, server, uploads
@@ -94,7 +99,8 @@ def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[
                                     mirror_enabled=lambda: mirror,
                                     mirror_name=getattr(settings, "mirror_name", ""),
                                     uploads=uploads.Uploads(home),            # WB-1174
-                                    outbox=outbox.Outbox(home, werkstatt=medien.Werkstatt())).start()  # WB-1321
+                                    outbox=outbox.Outbox(home, werkstatt=medien.Werkstatt()),  # WB-1321
+                                    snapshots=_snapshot_root(home)).start()   # WB-1319
     except OSError as exc:
         logger.warning("werkbank: cannot listen on 127.0.0.1:%s (%s)", settings.port, type(exc).__name__)
         return None

@@ -22,7 +22,7 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
-from . import approvals, snapshot
+from . import approvals, kontext, snapshot
 from . import commands as commands_mod
 from . import mirror as mirror_mod
 from . import outbox as outbox_mod
@@ -138,7 +138,8 @@ class WerkbankServer:
                  mirror_enabled: Callable[[], bool] = lambda: True, mirror_name: str = "",
                  max_streams: int = MAX_STREAMS,
                  max_connections: int = MAX_CONNECTIONS, max_authenticated: int = MAX_AUTHENTICATED,
-                 header_deadline: float = HEADER_DEADLINE_S, uploads: Any = None, outbox: Any = None) -> None:
+                 header_deadline: float = HEADER_DEADLINE_S, uploads: Any = None, outbox: Any = None,
+                 snapshots: Any = None) -> None:
         if not key or any(c.isspace() for c in key):
             raise ValueError("unusable key")
         self._wanted = ("Bearer " + key).encode("utf-8")
@@ -156,6 +157,7 @@ class WerkbankServer:
         self.outbox = outbox                # WB-1321: outbox.Outbox, None = Hermes' files off
         if outbox is not None and getattr(buffers, "outbox", None) is None:
             buffers.outbox = outbox
+        self.snapshots = snapshots          # WB-1319: the context editor's snapshot folder, None = off
         self.open_streams = 0
         self._streams_lock = threading.Lock()
         # WB-1321 Härtung: byte transfers of outbox files (originals, versions, HLS) have their own
@@ -384,6 +386,11 @@ def _handler(app: WerkbankServer):
                     return self._outbox_file(key, what[1], what[2] if len(what) == 3 else None)
                 if len(what) == 4 and what[0] == "files" and what[2] == "hls":      # WB-1321: HLS
                     return self._outbox_file(key, what[1], "hls", hls_name=what[3])
+                # WB-1319: the context editor
+                if what == ["context"]:
+                    return self._context(key)
+                if len(what) == 3 and what[:2] == ["context", "text"]:
+                    return self._context_text(key, what[2])
             self._refuse(404, "not found", "Unbekannter Pfad.")
 
         def _outbox_file(self, key: str, fid: str, variant: Optional[str], hls_name: Optional[str] = None):
@@ -507,6 +514,47 @@ def _handler(app: WerkbankServer):
                 return self._refuse(404, "unknown tool call", "Diese Ausgabe kennt Hermes nicht (mehr).")
             self._json(200, {"tool_call_id": call_id, "output": output})
 
+        # -- WB-1319: the context editor ----------------------------------------------------
+        def _context(self, key: str):
+            try:
+                body = kontext.inspect(app.host, app.buffers, app.snapshots, key)
+            except kontext.KontextFehler as e:
+                return self._refuse(e.status, e.error, e.grund)
+            self._json(200, body)
+
+        def _context_text(self, key: str, raw_index: str):
+            try:
+                index = int(urllib.parse.unquote(raw_index))
+            except (TypeError, ValueError):
+                return self._refuse(400, "bad index", "Der Eintrag muss eine Zahl sein.")
+            try:
+                self._json(200, kontext.item_text(app.host, app.buffers, key, index))
+            except kontext.KontextFehler as e:
+                self._refuse(e.status, e.error, e.grund)
+
+        def _context_edit(self, key: str, body: Dict[str, Any]):
+            try:
+                out = kontext.edit(app.host, app.buffers, app.snapshots, key, body.get("ops"))
+            except kontext.KontextFehler as e:
+                return self._refuse(e.status, e.error, e.grund, ok=False)
+            self._json(200, out)
+
+        def _context_undo(self, key: str):
+            try:
+                out = kontext.undo(app.host, app.buffers, app.snapshots, key)
+            except kontext.KontextFehler as e:
+                return self._refuse(e.status, e.error, e.grund, ok=False)
+            self._json(200, out)
+
+        def _context_compress(self, key: str, body: Dict[str, Any]):
+            # the core's compression runs a summariser: the answer may take minutes, not seconds
+            self.connection.settimeout(kontext.COMPRESS_TIMEOUT_S)
+            try:
+                out = kontext.compress(app.host, app.buffers, key, body)
+            except kontext.KontextFehler as e:
+                return self._refuse(e.status, e.error, e.grund, ok=False)
+            self._json(200, out)
+
         def _events(self, key: str, query):
             try:
                 epoch = int((query.get("epoch") or ["0"])[0])
@@ -629,6 +677,14 @@ def _handler(app: WerkbankServer):
                 return self._upload(key, body)
             if what == ["stop"]:
                 return self._stop(key)
+            # WB-1319: the context editor (writes: owner + idle, checked by the plugin)
+            if len(what) == 2 and what[0] == "context":
+                if what[1] == "edit":
+                    return self._context_edit(key, body)
+                if what[1] == "undo":
+                    return self._context_undo(key)
+                if what[1] == "compress":
+                    return self._context_compress(key, body)
             if len(what) == 2 and what[0] in ("approvals", "clarify"):
                 return self._answer(key, what[0], urllib.parse.unquote(what[1]), body)
             if len(what) == 2 and what[0] == "choices":    # WB-1256: a card a command opened

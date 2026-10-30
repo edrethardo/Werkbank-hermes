@@ -36,6 +36,7 @@ logger = logging.getLogger("plugins.platforms.werkbank")
 TOOL_OUTPUT_MAX = 1024 * 1024        # GET tools/{id}/output: the full text, up to 1 MB
 _TOOL_SCAN = 500                     # newest messages searched for a tool call id
 MIRROR_WAIT_S = 5.0                  # the board's POST waits this long for the mirror's message id
+COMPRESS_WAIT_S = 300.0              # WB-1319: the board's compress waits this long for the core
 _ANCHOR_RE = re.compile(r"[0-9]{1,20}")   # = the core's reply_to_message_id check (plugins_injection.py)
 NEW_SESSION_WAIT_S = 15.0            # WB-1342: thread + session creation on the gateway loop
 
@@ -400,6 +401,127 @@ class GatewayHost:
             return []
         entry = get_pending_for_session(session_key, include_choice_prompts=True)
         return [] if entry is None else [clarify_payload(entry)]
+
+    # -- WB-1319: the context editor ----------------------------------------------------------
+    def _agent(self, session_key: str) -> Any:
+        """The cached agent of the session (its ``/compress``, cache tier). Never the pending sentinel."""
+        fn = getattr(self.owner(), "_cached_agent_for", None)
+        agent = None
+        if callable(fn):
+            try:
+                agent = fn(session_key, lockless_fallback=True)
+            except Exception:
+                agent = None
+        try:
+            from gateway.run import _AGENT_PENDING_SENTINEL
+            if agent is _AGENT_PENDING_SENTINEL:
+                return None
+        except Exception:
+            pass
+        return agent
+
+    def context_messages(self, session_key: str, session_id: Optional[str]) -> List[Dict[str, Any]]:
+        """The active transcript in the shape the next turn loads it — the SAME read ``/compress`` and
+        the gateway's live replay use (``get_messages_as_conversation``), never a raw table read.
+
+        ``include_row_ids`` gives every message the row id the editor's operations name; it is also
+        the loader shape a rewrite wants (no CAS digest, so a re-insert never nulls a column the
+        projection does not decode)."""
+        db = self._db(session_key)
+        read = getattr(db, "get_messages_as_conversation", None)
+        if not session_id or not callable(read):
+            return []
+        try:
+            return list(read(session_id, repair_alternation=True, include_row_ids=True))
+        except Exception:
+            logger.info("werkbank: context not readable")
+            return []
+
+    def context_system(self, session_key: str, session_id: Optional[str]) -> Tuple[str, Any]:
+        """(the prompt the last turn sent, the live agent) — the session row's saved prompt, which is
+        what the model saw; the agent only names its cache tiers."""
+        prompt = ""
+        db = self._db(session_key)
+        get_session = getattr(db, "get_session", None)
+        if session_id and callable(get_session):
+            try:
+                row = get_session(session_id)
+            except Exception:
+                row = None
+            if isinstance(row, dict) and isinstance(row.get("system_prompt"), str):
+                prompt = row["system_prompt"]
+        agent = self._agent(session_key)
+        if not prompt and agent is not None:
+            cached = getattr(agent, "_cached_system_prompt", "")
+            prompt = cached if isinstance(cached, str) else ""
+        return prompt, agent
+
+    def context_write(self, session_key: str, session_id: Optional[str],
+                      messages: List[Dict[str, Any]]) -> Tuple[bool, str]:
+        """Replace the active transcript, rewind-style (the rows stay on disk as ``active = 0``), with
+        the database's own turn-lease fence; then evict the cached agent so the next turn rebuilds
+        its prompt from what is written."""
+        db = self._db(session_key)
+        write = getattr(db, "replace_messages", None)
+        if not session_id or not callable(write):
+            return False, "Diese Sitzung hat keinen schreibbaren Verlauf."
+        try:
+            write(session_id, messages, archive_dropped=True, reject_active_turn_lease=True)
+        except Exception as exc:
+            from hermes_state_errors import SessionTurnLeaseLostError
+            if isinstance(exc, SessionTurnLeaseLostError):
+                return False, "Ein Zug hält gerade den Verlauf — der Kontext ist schreibgeschützt."
+            logger.info("werkbank: context write refused (%s)", type(exc).__name__)
+            return False, "Die Datenbank hat die Änderung abgelehnt."
+        evict = getattr(self.owner(), "_evict_cached_agent", None)
+        if callable(evict):
+            try:
+                evict(session_key)
+            except Exception:
+                logger.info("werkbank: cached agent not evicted after a context edit")
+        return True, ""
+
+    def foreign_writer(self, session_key: str) -> str:
+        """A writer that is not this gateway, if the core reports one (else ""). The plugin itself
+        never writes a turn; a live TUI/stdio owner of the same durable id would."""
+        hook = getattr(self.owner(), "_foreign_writer", None)      # core hook, may be absent
+        if not callable(hook):
+            return ""
+        try:
+            found = hook(session_key)
+        except Exception:
+            return ""
+        return found if isinstance(found, str) else ""
+
+    def write_gate(self, session_key: str) -> Tuple[bool, str]:
+        """(may this request change the context?, reason). Owner and idle, checked server side:
+        the gateway is up, no turn of this session runs, no foreign writer holds it."""
+        if self.owner() is None:
+            return False, "Hermes-Gateway läuft nicht — der Kontext ist schreibgeschützt."
+        if self.is_running(session_key):
+            return False, "Ein Zug läuft gerade — der Kontext ist schreibgeschützt."
+        foreign = self.foreign_writer(session_key)
+        if foreign:
+            return False, foreign
+        return True, ""
+
+    def compress(self, session_key: str, focus_topic: str, keep_last: Optional[int],
+                 preview: bool) -> Optional[Dict[str, Any]]:
+        """The core's manual compression for this session (``_compress_from_plugin``), on the gateway
+        loop. ``None``: this core has no such hook, or the session has no chat to compress."""
+        hook = getattr(self.owner(), "_compress_from_plugin", None)
+        loop = getattr(self.owner(), "_gateway_loop", None)
+        chat = self._chat(session_key)
+        if not callable(hook) or loop is None or getattr(loop, "is_closed", lambda: False)() or chat is None:
+            return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                hook(source=chat[1], focus_topic=focus_topic, keep_last=keep_last,
+                     preview=preview), loop)
+            return future.result(timeout=COMPRESS_WAIT_S)
+        except Exception:
+            logger.info("werkbank: compression failed (%s)", "timeout or error")
+            return None
 
 
 def _message_id(result: Any) -> Optional[str]:

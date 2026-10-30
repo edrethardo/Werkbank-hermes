@@ -48,6 +48,16 @@ class FakeHost:
         self.supports_media = True          # WB-1174: inject_message(media_urls=…) known to the core
         self.media: list = []               # attachments handed to each inject (WB-1174)
         self.photos: list = []              # (session_key, paths, anchor) of mirror_photos (WB-1174)
+        # WB-1319: the context editor
+        self.conversation: list = []        # the active transcript (get_messages_as_conversation shape)
+        self.system_prompt = ""             # the prompt the last turn sent (session row)
+        self.agent = None                   # the live agent (its tiers name the prompt's sections)
+        self.context_writes: list = []      # message lists handed to context_write
+        self.context_write_ok = True
+        self.context_write_grund = ""
+        self.foreign = ""                   # non-empty: another writer holds the session
+        self.compress_calls: list = []       # (focus_topic, keep_last, preview)
+        self.compress_result = None         # None: this core has no plugin compress hook
 
     def posted(self, session_key, message_id):
         """A mirror the host posted (``host.PostedMirror`` shape): its id, and ``take_back``."""
@@ -106,6 +116,36 @@ class FakeHost:
     def tool_output(self, session_key, session_id, tool_call_id):
         return self.outputs.get(tool_call_id)
 
+    # -- WB-1319: the context editor -----------------------------------------------------------
+    def context_messages(self, session_key, session_id):
+        """The active transcript as the next turn would load it (``get_messages_as_conversation``)."""
+        return [dict(m) for m in self.conversation]
+
+    def context_system(self, session_key, session_id):
+        """(the prompt the last turn sent, the live agent or None)."""
+        return self.system_prompt, self.agent
+
+    def context_write(self, session_key, session_id, messages):
+        """(ok, grund): the transcript replaced by *messages*."""
+        if not self.context_write_ok:
+            return False, self.context_write_grund or "Die Datenbank hat die Änderung abgelehnt."
+        self.context_writes.append([dict(m) for m in messages])
+        self.conversation = [dict(m) for m in messages]
+        return True, ""
+
+    def write_gate(self, session_key):
+        """(ok, grund): may this request change the context? Owner and idle, server side."""
+        if self.running:
+            return False, "Ein Zug läuft gerade — der Kontext ist schreibgeschützt."
+        if self.foreign:
+            return False, self.foreign
+        return True, ""
+
+    def compress(self, session_key, focus_topic, keep_last, preview):
+        """The core's manual compression (``GatewaySessionCommandsMixin._compress_from_plugin``)."""
+        self.compress_calls.append((focus_topic, keep_last, preview))
+        return self.compress_result
+
 
 def running_server(tmp_path, fake_host, *, ring=5000, mirror=True, uploads=True, outbox=None):
     """(server, key, buffers, host, uploads) — a running plugin server on a free port. Uploads (WB-1174)
@@ -117,7 +157,8 @@ def running_server(tmp_path, fake_host, *, ring=5000, mirror=True, uploads=True,
     buffers = buffer.Buffers(plugin_id="platforms/werkbank", ring=ring, watermark=fake_host.row_watermark)
     store = uploads_mod.Uploads(tmp_path) if uploads else None
     srv = server.WerkbankServer(key, buffers, fake_host, port=0, heartbeat=0.1,
-                                mirror_enabled=lambda: mirror, uploads=store, outbox=outbox).start()
+                                mirror_enabled=lambda: mirror, uploads=store, outbox=outbox,
+                                snapshots=tmp_path / "plugin-data" / "werkbank" / "kontext").start()
     return SimpleNamespace(server=srv, key=key, buffers=buffers, host=fake_host, port=srv.port, uploads=store,
                            outbox=outbox)
 

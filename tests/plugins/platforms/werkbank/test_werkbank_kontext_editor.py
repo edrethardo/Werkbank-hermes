@@ -1,0 +1,476 @@
+"""WB-1319: the context editor of a chat session — inspect, edit (with a snapshot and undo) and
+compress with an instruction, over the protocol of ``PROTOCOL.md``.
+
+The gateway itself is faked (``FakeHost``); the editor's own logic (order, tokens, tool pairs,
+snapshot, undo, gates) is the code under test. ``HostGlue`` below proves the other half: that the
+production host hands the right things to the SessionDB and to the core's compression.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
+
+import pytest
+
+from werkbank_testkit import KEY_SESSION, SID, FakeHost, call, core_event, running_server, session_path
+
+SECRET = "sk-ant-api03-" + "A" * 30          # a provider key the display must never show
+
+
+def _row(rid: int, role: str, content: Any, **extra) -> Dict[str, Any]:
+    """One transcript row as ``get_messages_as_conversation(include_row_ids=True)`` hands it over."""
+    row = {"role": role, "content": content, "_row_id": rid, "_db_persisted": True,
+           "timestamp": 1_790_000_000 + rid}
+    row.update(extra)
+    return row
+
+
+def _call(call_id: str, name: str = "shell") -> Dict[str, Any]:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+def _transcript() -> List[Dict[str, Any]]:
+    """user, assistant+tool call, its result, the answer — with one tool pair."""
+    return [
+        _row(1, "user", "erste Frage"),
+        _row(2, "assistant", "", tool_calls=[_call("call_a")]),
+        _row(3, "tool", "ausgabe A", tool_call_id="call_a", tool_name="shell"),
+        _row(4, "assistant", "Antwort eins"),
+        _row(5, "user", "zweite Frage"),
+        _row(6, "assistant", "Antwort zwei"),
+    ]
+
+
+def _server(tmp_path, conversation=None, **kw):
+    host = FakeHost()
+    host.conversation = _transcript() if conversation is None else conversation
+    host.system_prompt = "Du bist Hermes.\n\nProjekt: agent_ticket"
+    srv = running_server(tmp_path, host, **kw)
+    srv.buffers.watch(KEY_SESSION, SID, "telegram")
+    return srv
+
+
+def _numbers(srv, tokens=84_000, length=200_000):
+    """What a turn end tells the status line (WB-1309)."""
+    srv.buffers.on_event(core_event(1, "turn.done", {"final_response": "ok", "model": "m",
+                                                     "context_tokens": tokens,
+                                                     "context_length": length,
+                                                     "compression_threshold": 160_000}, id_="t1"))
+
+
+def _inspect(srv, path="context"):
+    status, answer = call(srv.port, "GET", session_path(path), srv.key)
+    assert status == 200, answer
+    return answer
+
+
+def _post(srv, path, body):
+    return call(srv.port, "POST", session_path("context", path), srv.key, body)
+
+
+# ── 1. Inspizieren: Reihenfolge, Tokens wie die Statuszeile, geschwärzt ─────────────────────
+
+def test_list_is_in_order_and_carries_the_status_line_numbers(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        _numbers(srv)
+        out = _inspect(srv)
+        assert [i["role"] for i in out["items"]] == ["user", "assistant", "tool", "assistant",
+                                                     "user", "assistant"]
+        assert [i["preview"] for i in out["items"]][:2] == ["erste Frage", "shell"]
+        # the numbers ARE the status line's: same buffer, same fields
+        _, snap = call(srv.port, "GET", session_path("snapshot"), srv.key)
+        assert out["context"]["tokens"] == snap["session"]["context_tokens"] == 84_000
+        assert out["context"]["length"] == 200_000
+        assert out["context"]["percent"] == 42
+        assert out["context"]["threshold"] == 160_000
+        # per item: an estimate of the same counting, with its share of the window
+        assert all(i["tokens"] > 0 for i in out["items"])
+        assert out["estimate"]["items"] == sum(i["tokens"] for i in out["items"])
+        assert out["items"][0]["share"] == pytest.approx(out["items"][0]["tokens"] / 200_000, abs=1e-4)
+        assert out["state"] == "wartet" and out["editable"] is True and out["grund"] == ""
+    finally:
+        srv.server.stop()
+
+
+def test_system_prompt_is_shown_as_sections_and_never_editable(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        out = _inspect(srv)
+        assert out["system"]["bekannt"] is True
+        assert "Du bist Hermes." in out["system"]["sections"][0]["text"]
+        assert out["system"]["editable"] is False
+        assert out["items"][0]["editable"] == "text"           # user text
+        assert out["items"][1]["editable"] == "text"           # assistant text
+        assert out["items"][2]["editable"] == "shorten"        # a tool output: shorten or remove
+        assert out["items"][1]["pair"] == out["items"][2]["pair"] == "call_a"
+    finally:
+        srv.server.stop()
+
+
+def test_long_texts_are_cut_in_the_list_and_whole_behind_the_text_route(tmp_path):
+    long_text = SECRET + " " + "x" * 30_000
+    masked = "sk-ant...AAAA"          # the gateway's own display mask for a provider key
+    srv = _server(tmp_path, conversation=[_row(1, "user", long_text)])
+    try:
+        out = _inspect(srv)
+        item = out["items"][0]
+        assert item["truncated"] is True and len(item["text"]) <= 9000
+        assert SECRET not in item["text"] and masked in item["text"]
+        status, full = call(srv.port, "GET", session_path("context", "text", "0"), srv.key)
+        assert status == 200 and len(full["text"]) > 20_000
+        assert SECRET not in full["text"] and masked in full["text"]
+        status, bad = call(srv.port, "GET", session_path("context", "text", "99"), srv.key)
+        assert status == 404 and bad["error"]
+    finally:
+        srv.server.stop()
+
+
+# ── 2. Bearbeiten: die Historie des nächsten Zugs ändert sich ───────────────────────────────
+
+def test_editing_a_message_changes_the_history_the_next_turn_sees(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": "bessere Frage"}]})
+        assert status == 200, out
+        assert out["ok"] is True and out["changed"] == 1 and out["snapshot"]
+        assert srv.host.conversation[0]["content"] == "bessere Frage"
+        # nothing else moved, and the tool pair is untouched
+        assert [m["role"] for m in srv.host.conversation] == ["user", "assistant", "tool",
+                                                              "assistant", "user", "assistant"]
+        assert srv.host.conversation[1]["tool_calls"][0]["id"] == "call_a"
+        assert "Prompt-Cache" in out["hinweis"] or "prompt-cache" in out["hinweis"].lower()
+        after = _inspect(srv)
+        assert after["items"][0]["preview"] == "bessere Frage"
+        assert after["undo"] == 1                                    # one snapshot to undo
+    finally:
+        srv.server.stop()
+
+
+def test_removing_a_tool_result_takes_its_call_with_it(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 3}]})
+        assert status == 200, out
+        rows = srv.host.conversation
+        assert [m["role"] for m in rows] == ["user", "assistant", "user", "assistant"]
+        assert all(m.get("tool_call_id") != "call_a" for m in rows)
+        assert all(m.get("tool_calls") in (None, []) for m in rows)
+        assert out["removed"] == 2                                   # the pair, never half
+    finally:
+        srv.server.stop()
+
+
+def test_removing_an_assistant_call_takes_its_result_with_it(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 2}]})
+        assert status == 200, out
+        assert [m["role"] for m in srv.host.conversation] == ["user", "assistant", "user", "assistant"]
+        assert all(m.get("tool_call_id") != "call_a" for m in srv.host.conversation)
+        assert out["removed"] == 2
+    finally:
+        srv.server.stop()
+
+
+def test_a_call_beside_another_one_keeps_the_row(tmp_path):
+    conversation = [
+        _row(1, "user", "frage"),
+        _row(2, "assistant", "ich prüfe", tool_calls=[_call("call_a"), _call("call_b", "read")]),
+        _row(3, "tool", "ausgabe A", tool_call_id="call_a", tool_name="shell"),
+        _row(4, "tool", "ausgabe B", tool_call_id="call_b", tool_name="read"),
+        _row(5, "assistant", "fertig"),
+    ]
+    srv = _server(tmp_path, conversation=conversation)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 3}]})
+        assert status == 200, out
+        rows = srv.host.conversation
+        assert [m["role"] for m in rows] == ["user", "assistant", "tool", "assistant"]
+        assert [c["id"] for c in rows[1]["tool_calls"]] == ["call_b"]
+        assert rows[1]["content"] == "ich prüfe"                     # text stays
+        assert rows[2]["tool_call_id"] == "call_b"
+    finally:
+        srv.server.stop()
+
+
+def test_tool_output_is_only_shortened_never_rewritten(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        status, answer = _post(srv, "edit", {"ops": [{"op": "edit", "id": 3, "text": "frei erfunden"}]})
+        assert status == 409 and "kurz" in answer["grund"].lower() or "kürz" in answer["grund"].lower()
+        assert srv.host.context_writes == []
+        status, out = _post(srv, "edit", {"ops": [{"op": "shorten", "id": 3, "max_chars": 4}]})
+        assert status == 200, out
+        assert srv.host.conversation[2]["content"].startswith("ausg")
+        assert len(srv.host.conversation[2]["content"]) < 40
+    finally:
+        srv.server.stop()
+
+
+def test_an_orphaned_tool_result_is_refused_and_nothing_is_written(tmp_path):
+    conversation = [_row(1, "user", "frage"), _row(2, "tool", "ohne Aufruf", tool_call_id="weg")]
+    srv = _server(tmp_path, conversation=conversation)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
+        assert status == 409 and out["error"] == "tool pair"
+        assert "zusammen" in out["grund"] or "Paar" in out["grund"]
+        assert srv.host.context_writes == []
+    finally:
+        srv.server.stop()
+
+
+# ── 3. Schnappschuss und Rückgängig ────────────────────────────────────────────────────────
+
+def test_snapshot_is_written_before_the_change_and_undo_restores_it_exactly(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        before = json.loads(json.dumps(srv.host.conversation))
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 3},
+                                                  {"op": "edit", "id": 5, "text": "anders"}]})
+        assert status == 200, out
+        snap = Path(out["snapshot"])
+        assert snap.is_file()
+        assert stat.S_IMODE(snap.stat().st_mode) == 0o600
+        assert oct(stat.S_IMODE(snap.parent.stat().st_mode)) == "0o700"
+        assert snap.parent.parent.name == "kontext"                  # <home>/plugin-data/werkbank/kontext
+        kept = json.loads(snap.read_text(encoding="utf-8"))
+        assert kept["session_id"] == SID and kept["grund"] == "edit"
+        assert kept["messages"][0]["content"] == "erste Frage"
+
+        status, undone = _post(srv, "undo", {})
+        assert status == 200, undone
+        assert undone["ok"] is True and undone["restored"] == len(before)
+        assert srv.host.conversation == before                        # exactly the old state
+        assert not snap.exists()                                     # the snapshot is used up
+        assert _inspect(srv)["undo"] == 0
+        status, again = _post(srv, "undo", {})
+        assert status == 409 and again["error"] == "no snapshot"
+    finally:
+        srv.server.stop()
+
+
+def test_undo_of_a_compression_snapshot_restores_it_too(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        before = json.loads(json.dumps(srv.host.conversation))
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
+        assert status == 200, out
+        status, undone = _post(srv, "undo", {})
+        assert status == 200 and srv.host.conversation == before
+    finally:
+        srv.server.stop()
+
+
+# ── 4. Schreibschutz: laufender Zug, fremder Schreiber, Rechte ─────────────────────────────
+
+def test_while_a_turn_runs_the_editor_is_read_only(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        srv.host.running = True
+        out = _inspect(srv)
+        assert out["state"] == "arbeitet" and out["editable"] is False and out["grund"]
+        status, answer = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
+        assert status == 409 and answer["error"] == "locked"
+        assert "Zug" in answer["grund"] and srv.host.context_writes == []
+    finally:
+        srv.server.stop()
+
+
+def test_another_writer_of_the_session_is_refused(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        srv.host.foreign = "Diese Sitzung schreibt gerade ein anderes Hermes-Fenster."
+        out = _inspect(srv)
+        assert out["editable"] is False
+        status, answer = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
+        assert status == 409 and answer["error"] == "locked"
+        assert srv.host.context_writes == []
+    finally:
+        srv.server.stop()
+
+
+@pytest.mark.parametrize("path", ["edit", "undo", "compress"])
+def test_an_unresolved_session_and_a_missing_key_are_refused(tmp_path, path):
+    srv = _server(tmp_path)
+    try:
+        # no key at all: 401 before anything is looked at
+        status, answer = call(srv.port, "POST", session_path(path), None, {})
+        assert status == 401
+        # a session the plugin never resolved: 404
+        status, answer = call(srv.port, "POST",
+                              session_path(path, key="agent:main:telegram:dm:9999:1"), srv.key, {})
+        assert status == 404 and answer["error"]
+        assert srv.host.context_writes == [] and srv.host.compress_calls == []
+    finally:
+        srv.server.stop()
+
+
+# ── 5. Komprimieren mit Anweisung ─────────────────────────────────────────────────────────
+
+def test_compression_hands_the_instruction_and_the_kept_turns_to_the_core(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        srv.host.compress_result = {"status": "compressed", "before_tokens": 84_000,
+                                    "after_tokens": 21_000, "removed": 12, "kept": 4,
+                                    "lines": ["Compressed: 16 → 4 messages"]}
+        status, out = _post(srv, "compress", {"instruction": "nur die Entscheidungen", "keep": 3,
+                                              "preview": False})
+        assert status == 200, out
+        assert srv.host.compress_calls == [("nur die Entscheidungen", 3, False)]
+        assert out["before"] == 84_000 and out["after"] == 21_000 and out["removed"] == 12
+        # the status line takes the new length from the compressor's own report
+        _, snap = call(srv.port, "GET", session_path("snapshot"), srv.key)
+        assert snap["session"]["context_tokens"] == 21_000
+        assert snap["session"]["context_source"] == "kompression"
+    finally:
+        srv.server.stop()
+
+
+def test_preview_asks_the_core_and_changes_nothing(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        srv.host.compress_result = {"status": "preview", "before_tokens": 84_000,
+                                    "after_tokens": 30_000, "removed": 10, "kept": 6,
+                                    "lines": ["Preview — no changes made."]}
+        before = json.loads(json.dumps(srv.host.conversation))
+        status, out = _post(srv, "compress", {"instruction": "Thema", "keep": 0, "preview": True})
+        assert status == 200, out
+        assert out["preview"] is True and out["before"] > out["after"]
+        assert srv.host.compress_calls == [("Thema", None, True)]        # 0 = alles komprimieren
+        assert srv.host.conversation == before and srv.host.context_writes == []
+    finally:
+        srv.server.stop()
+
+
+def test_without_a_compress_hook_in_the_core_the_plugin_says_so(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        status, out = _post(srv, "compress", {"instruction": "", "keep": 2, "preview": True})
+
+        assert status == 501 and "Kompress" in out["grund"]
+    finally:
+        srv.server.stop()
+
+
+def test_instruction_is_folded_to_one_line_and_capped(tmp_path):
+    srv = _server(tmp_path)
+    try:
+        srv.host.compress_result = {"status": "preview", "before_tokens": 10, "after_tokens": 5,
+                                    "removed": 1, "kept": 1, "lines": []}
+        long = "Thema\nmit\tZeilen\x00und Steuerzeichen " + "z" * 5_000
+        status, out = _post(srv, "compress", {"instruction": long, "keep": 2, "preview": True})
+
+        assert status == 200, out
+        focus, keep, preview = srv.host.compress_calls[0]
+        assert "\n" not in focus and "\x00" not in focus and len(focus) <= 1000
+    finally:
+        srv.server.stop()
+
+
+# ── 6. Die Produktionsseite (host.py) gegen einen gefälschten Runner ───────────────────────
+
+class _FakeDB:
+    def __init__(self):
+        self.rows = _transcript()
+        self.calls = []
+
+    def get_messages_as_conversation(self, session_id, **kw):
+        self.calls.append(("read", session_id, kw))
+        return [dict(r) for r in self.rows]
+
+    def get_session(self, session_id):
+        return {"session_id": session_id, "system_prompt": "Du bist Hermes."}
+
+    def replace_messages(self, session_id, messages, **kw):
+        self.calls.append(("write", session_id, kw, messages))
+        self.rows = [dict(m) for m in messages]
+
+
+class _FakeRunner:
+    def __init__(self, *, hook=True):
+        self._running = True
+        self.session_store = SimpleNamespace(lookup_by_session_key=lambda k: None,
+                                             lookup_by_session_id=lambda i: None,
+                                             peek_session_id=lambda k: None)
+        self._db = _FakeDB()
+        self._session_db = self._db
+        self._running_agents = {}
+        self._evicted = []
+        self._compress_kwargs = None
+        if hook:
+            self._compress_from_plugin = self._hook
+        self._gateway_loop = None
+
+    def _hook(self, **kwargs):
+        self._compress_kwargs = kwargs
+        return {"status": "preview", "before_tokens": 1, "after_tokens": 1, "removed": 0, "kept": 0,
+                "lines": []}
+
+    def _evict_cached_agent(self, session_key):
+        self._evicted.append(session_key)
+
+    def _cached_agent_for(self, session_key, lockless_fallback=False):
+        return None
+
+
+def _host(runner):
+    from plugins.platforms.werkbank.host import GatewayHost
+    host = GatewayHost(SimpleNamespace(_manager=SimpleNamespace(
+        _gateway_message_injector=(runner, lambda *a, **k: True))), Path("/tmp")
+    )
+    return host
+
+
+def test_host_reads_the_conversation_the_next_turn_would_load():
+    runner = _FakeRunner()
+    host = _host(runner)
+    rows = host.context_messages(KEY_SESSION, SID)
+    assert [r["role"] for r in rows] == ["user", "assistant", "tool", "assistant", "user", "assistant"]
+    assert runner._db.calls[0][0] == "read" and runner._db.calls[0][1] == SID
+    assert runner._db.calls[0][2]["include_row_ids"] is True
+    assert runner._db.calls[0][2]["repair_alternation"] is True
+
+
+def test_host_writes_rewind_style_and_evicts_the_cached_agent():
+    runner = _FakeRunner()
+    host = _host(runner)
+    ok, grund = host.context_write(KEY_SESSION, SID, _transcript()[:2])
+    assert ok is True and grund == ""
+    write = [c for c in runner._db.calls if c[0] == "write"][0]
+    assert write[2] == {"archive_dropped": True, "reject_active_turn_lease": True,
+                        "active_only": False} or (write[2].get("archive_dropped") is True
+                                                  and write[2].get("reject_active_turn_lease") is True)
+    assert runner._evicted == [KEY_SESSION]
+
+
+def test_host_gate_refuses_while_a_turn_runs_and_names_a_foreign_writer():
+    runner = _FakeRunner()
+    host = _host(runner)
+    # no running turn, no foreign writer
+    assert host.write_gate(KEY_SESSION) == (True, "")
+    runner._running_agents = {KEY_SESSION: object()}
+    ok, grund = host.write_gate(KEY_SESSION)
+    assert ok is False and "Zug" in grund
+    runner._running_agents = {}
+    runner._foreign_writer = lambda key: "Ein anderes Hermes-Fenster schreibt diese Sitzung."
+    ok, grund = host.write_gate(KEY_SESSION)
+    assert ok is False and "Fenster" in grund
+
+
+def test_host_compression_without_the_core_hook_returns_none():
+    runner = _FakeRunner(hook=False)
+    host = _host(runner)
+    assert host.compress(KEY_SESSION, "Thema", 2, True) is None
+
+
+def test_host_reads_the_system_prompt_of_the_session_row():
+    runner = _FakeRunner()
+    host = _host(runner)
+    prompt, agent = host.context_system(KEY_SESSION, SID)
+    assert prompt == "Du bist Hermes." and agent is None
