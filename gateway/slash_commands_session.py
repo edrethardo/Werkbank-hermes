@@ -638,7 +638,7 @@ class GatewaySessionCommandsMixin:
 
     # ------------------------------------------------------------------ WB-1319: plugin compress
 
-    async def _compress_from_plugin(self, *, source,  # fork: werkbank-chat focus_topic: str = "",
+    async def _compress_from_plugin(self, *, source, focus_topic: str = "",  # fork: werkbank-chat
                                     keep_last: Optional[int] = None, preview: bool = False) -> dict:
         """Manual compression for a PLUGIN surface — the Werkbank chat's context editor (WB-1319).
 

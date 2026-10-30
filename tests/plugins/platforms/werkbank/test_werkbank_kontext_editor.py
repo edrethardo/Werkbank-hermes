@@ -203,7 +203,7 @@ def test_tool_output_is_only_shortened_never_rewritten(tmp_path):
     srv = _server(tmp_path)
     try:
         status, answer = _post(srv, "edit", {"ops": [{"op": "edit", "id": 3, "text": "frei erfunden"}]})
-        assert status == 409 and "kurz" in answer["grund"].lower() or "kürz" in answer["grund"].lower()
+        assert status == 409 and ("kurz" in answer["grund"].lower() or "kürz" in answer["grund"].lower())
         assert srv.host.context_writes == []
         status, out = _post(srv, "edit", {"ops": [{"op": "shorten", "id": 3, "max_chars": 4}]})
         assert status == 200, out
@@ -219,7 +219,42 @@ def test_an_orphaned_tool_result_is_refused_and_nothing_is_written(tmp_path):
     try:
         status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
         assert status == 409 and out["error"] == "tool pair"
-        assert "zusammen" in out["grund"] or "Paar" in out["grund"]
+        # the PRE-check names the broken pair before anything is touched (not the post-check)
+        assert "weg" in out["grund"] and "reparieren" in out["grund"]
+        assert srv.host.context_writes == []
+        assert _inspect(srv)["editable"] is False
+    finally:
+        srv.server.stop()
+
+
+def test_an_operation_that_would_leave_half_a_pair_is_refused_by_the_last_check(tmp_path, monkeypatch):
+    """Second layer: whatever an operation did, a result without its call is never written."""
+    from plugins.platforms.werkbank import kontext
+
+    def _buggy_drop(messages, index):          # forgets the partner (a future bug in _drop)
+        messages.pop(index)
+        return 1
+
+    monkeypatch.setattr(kontext, "_drop", _buggy_drop)
+    srv = _server(tmp_path)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 2}]})   # the call, not its result
+        assert status == 409 and out["error"] == "tool pair"
+        assert "ohne ihren Aufruf" in out["grund"]
+        assert srv.host.context_writes == []
+        assert kontext.counts(tmp_path / "plugin-data" / "werkbank" / "kontext", SID) == 0
+    finally:
+        srv.server.stop()
+
+
+def test_a_system_line_in_the_transcript_is_read_only(tmp_path):
+    conversation = _transcript() + [_row(7, "system", "Hinweis eines Plugins")]
+    srv = _server(tmp_path, conversation=conversation)
+    try:
+        items = _inspect(srv)["items"]
+        assert items[-1]["role"] == "system" and items[-1]["editable"] == "none"
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 7}]})
+        assert status == 409 and out["error"] == "read only"
         assert srv.host.context_writes == []
     finally:
         srv.server.stop()
