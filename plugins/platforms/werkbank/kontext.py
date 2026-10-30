@@ -13,8 +13,14 @@ Rules of this module (they are the ticket's "Fertig, wenn" in code):
 * **The system prompt is read-only.**
 * **Snapshot before every change**, under ``<snapshots>/<session_id>/<n>.json`` (0600, directory
   0700, the newest five kept). ``undo`` restores the newest one and uses it up.
-* **Owner and idle, server side.** ``host.write_gate`` answers for the running turn and for a
-  foreign writer; the database's turn lease is the second, atomic fence.
+* **Owner and idle, server side.** ``host.write_gate`` answers for the gateway and its running
+  turn. A writer in ANOTHER process (TUI, CLI on the same session) is not visible to it — this
+  core has no ``_foreign_writer`` hook, so that check answers "" — the database's turn lease in
+  ``replace_messages(reject_active_turn_lease=True)`` is the fence that holds there (atomic, but
+  only while that process runs a turn).
+* **Edit only what was seen whole.** A user/assistant text is editable only when the board's copy
+  IS the stored text (not capped, nothing redacted, a plain string); else it can only be removed.
+  ``edit`` carries ``base`` = sha256 of the whole stored text, a mismatch is ``409 stale``.
 * **Never a text with a secret.** Every string that leaves this module ran through the gateway's
   own egress redaction (``gateway.session_events._redact``).
 
@@ -165,6 +171,27 @@ def incomplete_pairs(messages: List[Dict[str, Any]]) -> List[str]:
 
 # ── inspection ────────────────────────────────────────────────────────────────────────────────
 
+def base_of(text: str) -> str:
+    """The ``base`` of an edit: the sha256 of the entry's WHOLE stored text, unredacted. The board
+    gets it with the whole text and sends it back; any other value means it edited something else."""
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def edit_block(content: Any) -> str:
+    """Why this content may NOT be rewritten from the board's view ("" = it may). The board only
+    ever sees a capped, redacted copy: saving that back would cut the message or write the mask
+    over the real value, so such entries can only be removed (WB-1319 review)."""
+    if not isinstance(content, str):
+        return "Die Nachricht besteht aus mehreren Teilen (z. B. Bildern) — nur Entfernen geht."
+    _shown, cut = capped(content)
+    if cut:
+        return "Die Nachricht ist länger als die Anzeige — Bearbeiten würde sie kürzen, nur Entfernen geht."
+    if redact(content) != content:
+        return "Die Nachricht enthält ein geschwärztes Geheimnis — Bearbeiten würde es überschreiben, nur Entfernen geht."
+    return ""
+
+
 def _item(index: int, msg: Dict[str, Any], length: Optional[int],
           owner_of_call: Dict[str, int]) -> Dict[str, Any]:
     role = str(msg.get("role") or "")
@@ -192,6 +219,11 @@ def _item(index: int, msg: Dict[str, Any], length: Optional[int],
         tokens += estimate(json.dumps([{k: c.get(k) for k in ("id", "function")} for c in calls],
                                       ensure_ascii=False, default=str))
     editable = "text" if role in ("user", "assistant") else ("shorten" if role == "tool" else "none")
+    edit_grund = ""
+    if editable == "text":
+        edit_grund = edit_block(msg.get("content"))
+        if edit_grund:
+            editable = "remove"             # capped or redacted view: never saved back
     return {
         "i": index, "id": _row_id(msg), "role": role, "ts": msg.get("timestamp"),
         "tokens": max(1, tokens), "share": (max(1, tokens) / length) if length else None,
@@ -199,7 +231,7 @@ def _item(index: int, msg: Dict[str, Any], length: Optional[int],
         "text": shown, "truncated": bool(truncated),
         "tool_call_id": msg.get("tool_call_id") if role == "tool" else None,
         "tool_name": msg.get("tool_name") if role == "tool" else None,
-        "pair": pair, "editable": editable,
+        "pair": pair, "editable": editable, "edit_grund": edit_grund,
     }
 
 
@@ -306,8 +338,14 @@ def item_text(host: Any, buffers: Any, session_key: str, index: int) -> Dict[str
     msg = messages[index]
     raw = text_of(msg.get("content"))
     whole, truncated = capped(raw, 1_000_000)
-    return {"i": index, "role": str(msg.get("role") or ""), "text": whole,
-            "truncated": bool(truncated), "tokens": estimate(raw)}
+    role = str(msg.get("role") or "")
+    grund = edit_block(msg.get("content")) if role in ("user", "assistant") else "nur Entfernen/Kürzen"
+    editable = role in ("user", "assistant") and not msg.get("_compressed_summary") and not grund
+    return {"i": index, "role": role, "text": whole,
+            "truncated": bool(truncated), "tokens": estimate(raw),
+            # the base only for an editable entry: there the shown text IS the stored text
+            "editable": editable, "base": base_of(raw) if editable else None,
+            "edit_grund": "" if editable else grund}
 
 
 # ── editing ──────────────────────────────────────────────────────────────────────────────────
@@ -374,6 +412,13 @@ def _one_op(messages: List[Dict[str, Any]], op: Dict[str, Any]) -> Tuple[str, in
         if role not in ("user", "assistant"):
             raise KontextFehler(409, "tool output",
                                 "Werkzeug-Ausgaben lassen sich nur kürzen oder entfernen.")
+        block = edit_block(msg.get("content"))
+        if block:
+            raise KontextFehler(409, "not editable", block)
+        base = op.get("base")
+        if not isinstance(base, str) or base != base_of(text_of(msg.get("content"))):
+            raise KontextFehler(409, "stale", "Der bearbeitete Text ist nicht (mehr) der gespeicherte "
+                                              "— bitte neu laden und den ganzen Text bearbeiten.")
         text = op.get("text")
         if not isinstance(text, str) or not text.strip():
             raise KontextFehler(400, "bad text", "Der neue Text fehlt.")
@@ -395,6 +440,7 @@ def _one_op(messages: List[Dict[str, Any]], op: Dict[str, Any]) -> Tuple[str, in
         if len(raw) <= keep:
             raise KontextFehler(409, "nothing to shorten", "Diese Ausgabe ist schon so kurz.")
         msg["content"] = raw[:keep].rstrip() + "\n… [von der Werkbank gekürzt]"
+        msg.pop("api_content", None)               # the old wire bytes must not survive a cut
         return "changed", 1
     raise KontextFehler(400, "bad op", "Unbekannte Änderung (remove, edit, shorten).")
 

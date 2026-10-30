@@ -482,8 +482,11 @@ class GatewayHost:
         return True, ""
 
     def foreign_writer(self, session_key: str) -> str:
-        """A writer that is not this gateway, if the core reports one (else ""). The plugin itself
-        never writes a turn; a live TUI/stdio owner of the same durable id would."""
+        """A writer that is not this gateway, if the core reports one (else ""). The core named here
+        (``_foreign_writer``) does NOT exist in this fork today, so this answers "" — a TUI/CLI
+        process writing the same session is NOT seen by the gate. What holds that boundary is the
+        SessionDB turn lease: ``context_write`` writes with ``reject_active_turn_lease=True`` and is
+        refused while any process holds the lease (i.e. runs a turn of that session)."""
         hook = getattr(self.owner(), "_foreign_writer", None)      # core hook, may be absent
         if not callable(hook):
             return ""
@@ -494,8 +497,9 @@ class GatewayHost:
         return found if isinstance(found, str) else ""
 
     def write_gate(self, session_key: str) -> Tuple[bool, str]:
-        """(may this request change the context?, reason). Owner and idle, checked server side:
-        the gateway is up, no turn of this session runs, no foreign writer holds it."""
+        """(may this request change the context?, reason). Checked server side: the gateway is up
+        and no turn of this session runs IN THIS GATEWAY (``foreign_writer`` is a core hook that this
+        fork lacks). Another process is fenced only by the DB turn lease in ``context_write``."""
         if self.owner() is None:
             return False, "Hermes-Gateway läuft nicht — der Kontext ist schreibgeschützt."
         if self.is_running(session_key):

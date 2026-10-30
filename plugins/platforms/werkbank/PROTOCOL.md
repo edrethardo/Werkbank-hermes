@@ -68,6 +68,10 @@ context editor): `context_tokens` (the compressor's estimate, what the `/compres
 `context_length`, `compression_threshold`, `provider` when known, `context_source: "kompression"`.
 The plugin keeps it in the snapshot's `session` at once (fields it does not name stay); the next
 turn end replaces the whole set with the measured numbers again (`context_source` goes).
+This is a core change (`gateway/slash_commands_session.py` `_run_manual_compression`, marked
+`# fork: werkbank-chat`): EVERY committed `/compress` — typed in Telegram or any other platform,
+not only the board's — now emits this new `session.state` event to the session's listeners;
+listeners that do not know the type ignore it.
 
 ## Endpoints
 
@@ -196,13 +200,20 @@ redaction (`_capped`), at most 8 KB per entry in the list.
 * `GET /v1/s/{key}/context` → `{session_id, state, editable, grund, context: {tokens, length, percent,
   threshold, source}, system: {bekannt, editable: false, tokens, sections: [{title, text, truncated,
   tokens}]}, items: [{i, id, role (user|assistant|tool|summary|system), ts, tokens, share, preview,
-  text, truncated, tool_call_id, tool_name, pair, editable (text|shorten|none)}], estimate, undo,
-  hinweis}`. `context` = the snapshot's numbers (the status line), `tokens` per entry = the core's
-  rough estimate.
-* `GET /v1/s/{key}/context/text/{i}` → the whole text of entry `i` (≤ 1 MB, redacted).
-* `POST /v1/s/{key}/context/edit {ops: [{op: remove|edit|shorten, id, text?, max_chars?}]}` (≤ 100) →
+  text, truncated, tool_call_id, tool_name, pair, editable (text|remove|shorten|none), edit_grund}],
+  estimate, undo, hinweis}`. `context` = the snapshot's numbers (the status line), `tokens` per entry
+  = the core's rough estimate. A user/assistant entry is `editable: "text"` only when the list's copy
+  IS the stored text (a plain string, not capped at 8 KiB, the redaction changed nothing); otherwise
+  `"remove"` with `edit_grund` — the board never saves a capped or masked view back.
+* `GET /v1/s/{key}/context/text/{i}` → `{i, role, text, truncated, tokens, editable, base, edit_grund}`:
+  the whole text of entry `i` (≤ 1 MB, redacted); `base` = sha256 of the whole stored text, only
+  when `editable` (else `null`).
+* `POST /v1/s/{key}/context/edit {ops: [{op: remove|edit|shorten, id, text?, base?, max_chars?}]}` (≤ 100) →
   `{ok, removed, changed, snapshot, undo, hinweis}`. Removing a tool call or its result removes both
-  (a call beside others keeps its row); `edit` only on user/assistant rows, `shorten` only on tool
+  (a call beside others keeps its row); `edit` only on user/assistant rows and only with `base` from
+  the text route: `409 not editable` for a capped/redacted/multi-part entry, `409 stale` when `base`
+  is missing or no longer the stored text's hash; `edit` and `shorten` drop the row's
+  `api_content` (the old wire bytes); `shorten` only on tool
   output; a transcript with a result whose call is missing is refused (`409 tool pair`). Before the
   write the whole transcript goes to `<home>/plugin-data/werkbank/kontext/<session_id>/<n>.json`
   (0600 in 0700, the newest five kept). Written rewind-style (`replace_messages(archive_dropped=True,
@@ -219,7 +230,11 @@ redaction (`_capped`), at most 8 KB per entry in the list.
   prompt). A compression is NOT undone by `undo` (it rotates the session id; the old transcript
   stays in the previous session).
 * Writes (`edit`, `undo`, a non-preview `compress`) need an idle session: `409 locked` while a turn
-  of it runs or a foreign writer holds it; the SessionDB turn lease is the second, atomic fence.
+  of it runs in THIS gateway. Another process (TUI/CLI on the same session) is not seen by that
+  check — the core has no foreign-writer hook (`host.foreign_writer` answers ""); the boundary that
+  holds is the SessionDB turn lease in `replace_messages(reject_active_turn_lease=True)`: refused
+  (`409 write refused`, nothing written, no snapshot kept) while any process runs a turn of it.
+  Between that process's turns there is no fence.
   `501` without a snapshot folder or without the core hook. The board allows them only to the
   owner with a real click in the board page (`quelle: board`).
 

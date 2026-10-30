@@ -30,6 +30,12 @@ def _row(rid: int, role: str, content: Any, **extra) -> Dict[str, Any]:
     return row
 
 
+def _base(text: str) -> str:
+    """What the board sends as ``base``: the sha256 of the WHOLE text it edited."""
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _call(call_id: str, name: str = "shell") -> Dict[str, Any]:
     return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
 
@@ -136,7 +142,10 @@ def test_long_texts_are_cut_in_the_list_and_whole_behind_the_text_route(tmp_path
 def test_editing_a_message_changes_the_history_the_next_turn_sees(tmp_path):
     srv = _server(tmp_path)
     try:
-        status, out = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": "bessere Frage"}]})
+        status, full = call(srv.port, "GET", session_path("context", "text", "0"), srv.key)
+        assert status == 200 and full["editable"] is True and full["base"] == _base("erste Frage")
+        status, out = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": "bessere Frage",
+                                                   "base": full["base"]}]})
         assert status == 200, out
         assert out["ok"] is True and out["changed"] == 1 and out["snapshot"]
         assert srv.host.conversation[0]["content"] == "bessere Frage"
@@ -213,6 +222,71 @@ def test_tool_output_is_only_shortened_never_rewritten(tmp_path):
         srv.server.stop()
 
 
+def test_shortening_drops_the_old_wire_bytes(tmp_path):
+    conversation = _transcript()
+    conversation[2]["api_content"] = "ausgabe A in voller Länge, so wie sie zum Anbieter ging"
+    srv = _server(tmp_path, conversation=conversation)
+    try:
+        status, out = _post(srv, "edit", {"ops": [{"op": "shorten", "id": 3, "max_chars": 4}]})
+        assert status == 200, out
+        assert "api_content" not in srv.host.conversation[2]
+    finally:
+        srv.server.stop()
+
+
+# ── 2b. Bearbeiten nie aus einer gekürzten oder geschwärzten Vorschau ───────────────────────
+
+def test_a_message_longer_than_the_list_cap_is_only_removable(tmp_path):
+    long_text = "y" * 9000                               # > 8 KB: the list shows only the head
+    srv = _server(tmp_path, conversation=[_row(1, "user", long_text), _row(2, "assistant", "ok")])
+    try:
+        item = _inspect(srv)["items"][0]
+        assert item["truncated"] is True and item["editable"] == "remove" and item["edit_grund"]
+        status, full = call(srv.port, "GET", session_path("context", "text", "0"), srv.key)
+        assert status == 200 and full["editable"] is False and full["base"] is None
+        # even with the right hash of the whole text the server refuses: nothing is written
+        status, answer = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": "kurz",
+                                                      "base": _base(long_text)}]})
+        assert status == 409 and answer["error"] == "not editable"
+        assert srv.host.context_writes == [] and srv.host.conversation[0]["content"] == long_text
+        status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 1}]})
+        assert status == 200, out                        # removing stays possible
+    finally:
+        srv.server.stop()
+
+
+def test_a_message_carrying_a_secret_is_only_removable(tmp_path):
+    text = "mein Schlüssel " + SECRET
+    srv = _server(tmp_path, conversation=[_row(1, "user", text), _row(2, "assistant", "ok")])
+    try:
+        item = _inspect(srv)["items"][0]
+        assert item["truncated"] is False and item["editable"] == "remove"
+        assert SECRET not in item["text"]
+        status, full = call(srv.port, "GET", session_path("context", "text", "0"), srv.key)
+        assert full["editable"] is False and full["base"] is None and SECRET not in full["text"]
+        # saving the masked view back would write the mask over the key: refused
+        status, answer = _post(srv, "edit", {"ops": [{"op": "edit", "id": 1, "text": full["text"],
+                                                      "base": _base(text)}]})
+        assert status == 409 and answer["error"] == "not editable"
+        assert srv.host.context_writes == [] and srv.host.conversation[0]["content"] == text
+    finally:
+        srv.server.stop()
+
+
+@pytest.mark.parametrize("base", [None, "", "0" * 64, "nicht-hex"])
+def test_an_edit_without_the_base_of_the_whole_text_is_refused(tmp_path, base):
+    srv = _server(tmp_path)
+    try:
+        op = {"op": "edit", "id": 1, "text": "bessere Frage"}
+        if base is not None:
+            op["base"] = base
+        status, answer = _post(srv, "edit", {"ops": [op]})
+        assert status == 409 and answer["error"] == "stale"
+        assert srv.host.context_writes == [] and srv.host.conversation[0]["content"] == "erste Frage"
+    finally:
+        srv.server.stop()
+
+
 def test_an_orphaned_tool_result_is_refused_and_nothing_is_written(tmp_path):
     conversation = [_row(1, "user", "frage"), _row(2, "tool", "ohne Aufruf", tool_call_id="weg")]
     srv = _server(tmp_path, conversation=conversation)
@@ -267,7 +341,8 @@ def test_snapshot_is_written_before_the_change_and_undo_restores_it_exactly(tmp_
     try:
         before = json.loads(json.dumps(srv.host.conversation))
         status, out = _post(srv, "edit", {"ops": [{"op": "remove", "id": 3},
-                                                  {"op": "edit", "id": 5, "text": "anders"}]})
+                                                  {"op": "edit", "id": 5, "text": "anders",
+                                                   "base": _base("zweite Frage")}]})
         assert status == 200, out
         snap = Path(out["snapshot"])
         assert snap.is_file()
@@ -572,9 +647,22 @@ def test_real_db_editing_a_message_is_what_the_next_turn_sees(tmp_path):
     db, _runner, host, buffers, snaps = _real_env(tmp_path)
     first = host.context_messages(KEY_SESSION, SID)[0]
     kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "edit", "id": first["_row_id"],
-                                                      "text": "erste Frage, ohne Geheimnis"}])
+                                                      "text": "erste Frage, ohne Geheimnis",
+                                                      "base": _base("erste Frage")}])
     assert _view(db)[0] == {"role": "user", "content": "erste Frage, ohne Geheimnis"}
     assert len(_view(db)) == 6
+
+
+def test_real_db_a_foreign_lease_is_the_fence_the_gate_cannot_see(tmp_path):
+    """The core has no ``_foreign_writer`` hook: the gate answers „frei“ while another process
+    holds the session's turn lease — the DB lease in ``replace_messages`` is what refuses."""
+    db, runner, host, _buffers, _snaps = _real_env(tmp_path)
+    before = _view(db)
+    assert db.try_acquire_session_turn_lease(SID, "anderes-fenster:7", ttl_seconds=60)
+    assert host.write_gate(KEY_SESSION) == (True, "")           # honest: the gate does not see it
+    ok, grund = host.context_write(KEY_SESSION, SID, _transcript()[:2])
+    assert ok is False and "Zug" in grund
+    assert _view(db) == before and runner._evicted == []
 
 
 def test_real_db_a_held_turn_lease_refuses_the_write_and_keeps_the_history(tmp_path):
@@ -597,7 +685,8 @@ def test_real_db_undo_after_the_history_moved_on_is_refused(tmp_path):
 
     db, _runner, host, buffers, snaps = _real_env(tmp_path)
     first = host.context_messages(KEY_SESSION, SID)[0]
-    kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "edit", "id": first["_row_id"], "text": "neu"}])
+    kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "edit", "id": first["_row_id"], "text": "neu",
+                                                      "base": _base("erste Frage")}])
     db.append_message(SID, "user", "dritte Frage")
     db.append_message(SID, "assistant", "Antwort drei")
     moved = _view(db)

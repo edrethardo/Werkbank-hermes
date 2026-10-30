@@ -573,8 +573,9 @@ class GatewaySessionCommandsMixin:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _run_manual_compression(self, source, session_entry, history: list, request,
-                                      report: Optional[dict] = None) -> str:
+    # fork: werkbank-chat — WB-1319: `report` parameter, docstring, session.state after commit
+    async def _run_manual_compression(self, source, session_entry, history: list, request,  # fork: werkbank-chat
+                                      report: Optional[dict] = None) -> str:  # fork: werkbank-chat
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome.
 
         WB-1319: a committed compression emits ``session.state`` with the new context estimate
@@ -614,19 +615,19 @@ class GatewaySessionCommandsMixin:
             result = await self._run_in_executor_with_context(
                 lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
                                      task_id=session_entry.session_id or "default"))
-            if report is not None:
-                report["status"] = result.status
+            if report is not None:  # fork: werkbank-chat
+                report["status"] = result.status  # fork: werkbank-chat
             if result.status == "nothing_to_do":
                 return t("gateway.compress.nothing_to_do")
             if result.status != "compressed":
                 return "\n".join(render_compress_result(result))
             await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
             finalize_context_engine_compression_notification(tmp_agent, committed=True)
-            _emit_compression_context(session_key, session_entry.session_id, source, tmp_agent,
-                                      result.after_tokens)
-            if report is not None:
-                report.update(before_tokens=int(result.before_tokens or 0),
-                              after_tokens=int(result.after_tokens or 0), removed=int(result.removed))
+            _emit_compression_context(session_key, session_entry.session_id, source, tmp_agent,  # fork: werkbank-chat
+                                      result.after_tokens)  # fork: werkbank-chat
+            if report is not None:  # fork: werkbank-chat
+                report.update(before_tokens=int(result.before_tokens or 0),  # fork: werkbank-chat
+                              after_tokens=int(result.after_tokens or 0), removed=int(result.removed))  # fork: werkbank-chat
             compressor = tmp_agent.context_compressor
             summary = result.summary
         finally:
