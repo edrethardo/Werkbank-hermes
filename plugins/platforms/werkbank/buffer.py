@@ -469,6 +469,21 @@ class Buffers:
                 numbers["provider"] = payload["provider"]
             if numbers:
                 buf.context = numbers
+        elif type_ == "session.state":
+            # WB-1319: a committed manual compression (gateway/slash_commands_session.py
+            # ``_emit_compression_context``) — its estimate replaces the tokens at once; a window or
+            # provider it does not name stays (same model). The next turn end replaces the whole set.
+            fresh = dict(buf.context)
+            for k in _CONTEXT_FIELDS:
+                value = payload.get(k)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    fresh[k] = value
+            if isinstance(payload.get("provider"), str) and payload["provider"]:
+                fresh["provider"] = payload["provider"]
+            source = payload.get("context_source")
+            if isinstance(source, str) and source:
+                fresh["context_source"] = source[:40]
+            buf.context = fresh
         if type_ == "turn.start":
             buf.open_turn = None if id_ is None else str(id_)
         elif type_ in ("turn.done", "turn.stopped") or (type_ == "error" and id_ == buf.open_turn):

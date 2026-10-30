@@ -474,3 +474,100 @@ def test_host_reads_the_system_prompt_of_the_session_row():
     host = _host(runner)
     prompt, agent = host.context_system(KEY_SESSION, SID)
     assert prompt == "Du bist Hermes." and agent is None
+
+
+# ── 7. Gegen eine ECHTE SessionDB (tmp_path, nie die echte state.db) ──────────────────────────
+
+def _real_db(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(SID, "telegram")
+    db.append_message(SID, "user", "erste Frage")
+    db.append_message(SID, "assistant", "", tool_calls=[_call("call_a")])
+    db.append_message(SID, "tool", "ausgabe A", tool_call_id="call_a", tool_name="shell")
+    db.append_message(SID, "assistant", "Antwort eins")
+    db.append_message(SID, "user", "zweite Frage")
+    db.append_message(SID, "assistant", "Antwort zwei")
+    return db
+
+
+def _view(db):
+    """What the next turn loads (the gateway's own read), without the bookkeeping keys."""
+    keep = ("role", "content", "tool_calls", "tool_call_id")
+    return [{k: m.get(k) for k in keep if m.get(k) not in (None, "")}
+            for m in db.get_messages_as_conversation(SID)]
+
+
+def _real_env(tmp_path):
+    from plugins.platforms.werkbank import buffer
+
+    db = _real_db(tmp_path)
+    runner = _FakeRunner()
+    runner._db = runner._session_db = db
+    host = _host(runner)
+    buffers = buffer.Buffers(plugin_id="platforms/werkbank", watermark=lambda *a, **k: None)
+    buffers.watch(KEY_SESSION, SID, "telegram")
+    return db, runner, host, buffers, tmp_path / "kontext"
+
+
+def test_real_db_removing_a_tool_result_changes_what_the_next_turn_loads(tmp_path):
+    from plugins.platforms.werkbank import kontext
+
+    db, runner, host, buffers, snaps = _real_env(tmp_path)
+    before = _view(db)
+    tool_row = [m for m in host.context_messages(KEY_SESSION, SID) if m.get("role") == "tool"][0]
+    out = kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "remove", "id": tool_row["_row_id"]}])
+    after = _view(db)
+    assert out["removed"] == 2                              # the result AND its call went
+    assert [m["role"] for m in after] == ["user", "assistant", "user", "assistant"]
+    assert not any(m.get("tool_calls") or m.get("tool_call_id") for m in after)
+    assert runner._evicted == [KEY_SESSION]                 # the next turn rebuilds from disk
+    # the old rows stay on disk (archived, rewind-style), nothing is destroyed
+    assert len(db.get_messages_as_conversation(SID, include_inactive=True)) >= len(before)
+
+    restored = kontext.undo(host, buffers, snaps, KEY_SESSION)
+    assert restored["ok"] is True
+    assert _view(db) == before                              # exactly the old state again
+
+
+def test_real_db_editing_a_message_is_what_the_next_turn_sees(tmp_path):
+    from plugins.platforms.werkbank import kontext
+
+    db, _runner, host, buffers, snaps = _real_env(tmp_path)
+    first = host.context_messages(KEY_SESSION, SID)[0]
+    kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "edit", "id": first["_row_id"],
+                                                      "text": "erste Frage, ohne Geheimnis"}])
+    assert _view(db)[0] == {"role": "user", "content": "erste Frage, ohne Geheimnis"}
+    assert len(_view(db)) == 6
+
+
+def test_real_db_a_held_turn_lease_refuses_the_write_and_keeps_the_history(tmp_path):
+    from plugins.platforms.werkbank import kontext
+
+    db, _runner, host, buffers, snaps = _real_env(tmp_path)
+    before = _view(db)
+    assert db.try_acquire_session_turn_lease(SID, "anderer-zug:1", ttl_seconds=60)
+    first = host.context_messages(KEY_SESSION, SID)[0]
+    with pytest.raises(kontext.KontextFehler) as err:
+        kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "remove", "id": first["_row_id"]}])
+    assert err.value.status == 409 and "Zug" in err.value.grund
+    assert _view(db) == before
+    assert kontext.counts(snaps, SID) == 0                  # the refused change leaves no snapshot
+
+
+def test_real_db_undo_after_the_history_moved_on_is_refused(tmp_path):
+    """A turn after the edit: „Rückgängig“ would silently drop it — refused, nothing written."""
+    from plugins.platforms.werkbank import kontext
+
+    db, _runner, host, buffers, snaps = _real_env(tmp_path)
+    first = host.context_messages(KEY_SESSION, SID)[0]
+    kontext.edit(host, buffers, snaps, KEY_SESSION, [{"op": "edit", "id": first["_row_id"], "text": "neu"}])
+    db.append_message(SID, "user", "dritte Frage")
+    db.append_message(SID, "assistant", "Antwort drei")
+    moved = _view(db)
+    with pytest.raises(kontext.KontextFehler) as err:
+        kontext.undo(host, buffers, snaps, KEY_SESSION)
+    assert err.value.status == 409 and err.value.error == "moved on"
+    assert _view(db) == moved
+    assert kontext.counts(snaps, SID) == 1                  # the snapshot stays for the owner to see

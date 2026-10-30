@@ -129,6 +129,22 @@ def _call_id(call: Dict[str, Any]) -> Optional[str]:
     return ident if isinstance(ident, str) and ident else None
 
 
+def fingerprint(messages: List[Dict[str, Any]]) -> str:
+    """What the model sees of a transcript (role, text, tool identity) as one hash — bookkeeping
+    keys (row ids, timestamps, markers) left out, so a re-read compares equal to what was written."""
+    import hashlib
+
+    parts = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        calls = sorted(cid for cid in (_call_id(c) for c in _calls(msg)) if cid)
+        parts.append([str(msg.get("role") or ""), text_of(msg.get("content")), calls,
+                      str(msg.get("tool_call_id") or "")])
+    raw = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def incomplete_pairs(messages: List[Dict[str, Any]]) -> List[str]:
     """``tool_call_id`` values whose result has no call before it (a broken step).
 
@@ -415,7 +431,8 @@ def edit(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str,
         raise KontextFehler(409, "tool pair",
                             "So bliebe eine Werkzeug-Ausgabe ohne ihren Aufruf zurück — das Paar "
                             "geht nur zusammen.")
-    snapshot = _write_snapshot(snap_root, session_id, "edit", host, session_key)
+    snapshot = _write_snapshot(snap_root, session_id, "edit", host, session_key,
+                               expected_after=fingerprint(messages))
     ok, grund = host.context_write(session_key, session_id, messages)
     if not ok:
         _discard(snapshot)
@@ -446,6 +463,13 @@ def undo(host: Any, buffers: Any, snap_root: Optional[Path], session_key: str) -
     messages = data.get("messages") if isinstance(data, dict) else None
     if not isinstance(messages, list) or not messages:
         raise KontextFehler(500, "snapshot unreadable", "Der Schnappschuss enthält keinen Verlauf.")
+    expected = data.get("expected_after")
+    current = host.context_messages(session_key, session_id) or []
+    if not isinstance(expected, str) or fingerprint(current) != expected:
+        # a turn (or another edit) came after: restoring would drop it without the owner seeing it
+        raise KontextFehler(409, "moved on",
+                            "Seit dieser Änderung ist der Verlauf weitergegangen — „Rückgängig“ "
+                            "würde die neueren Nachrichten verwerfen. Bitte von Hand bearbeiten.")
     ok, grund = host.context_write(session_key, session_id, [dict(m) for m in messages
                                                              if isinstance(m, dict)])
     if not ok:
@@ -535,7 +559,7 @@ def _newest_snapshot(snap_root: Optional[Path], session_id: Optional[str]) -> Op
 
 
 def _write_snapshot(snap_root: Path, session_id: Optional[str], grund: str, host: Any,
-                    session_key: str) -> Path:
+                    session_key: str, expected_after: str = "") -> Path:
     """Store the state BEFORE the change: the whole active transcript, 0600, newest five kept."""
     folder = _session_dir(snap_root, session_id)
     if folder is None:
@@ -544,6 +568,8 @@ def _write_snapshot(snap_root: Path, session_id: Optional[str], grund: str, host
     os.chmod(folder, 0o700)
     messages = host.context_messages(session_key, session_id) or []
     data = {"session_id": session_id, "grund": grund, "ts": _now(),
+            # the state the change leaves behind: undo only while the history is still exactly that
+            "expected_after": expected_after,
             "messages": [dict(m) for m in messages if isinstance(m, dict)]}
     name = f"{int(_epoch_ms()):015d}-{os.getpid()}.json"
     target = folder / name

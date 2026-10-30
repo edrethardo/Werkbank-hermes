@@ -44,7 +44,7 @@ def _sattr(obj, name: str) -> str:
     return str(getattr(obj, name, "") or "")
 
 
-def _plugin_summary_ratio() -> float:
+def _plugin_summary_ratio() -> float:  # fork: werkbank-chat
     """WB-1319: the share of the compressed head the summary keeps, for the plugin preview's
     "after" estimate — the compressor's own default target (``summary_target_ratio``)."""
     try:
@@ -54,6 +54,34 @@ def _plugin_summary_ratio() -> float:
         return float(default) if isinstance(default, (int, float)) else 0.20
     except Exception:
         return 0.20
+
+
+def _emit_compression_context(session_key, session_id, source, agent, after_tokens) -> None:  # fork: werkbank-chat
+    """WB-1319 (owner bug): tell the session's listeners the context after a committed manual
+    compression. The numbers otherwise travel only on a turn end (``session_events._turn_context``),
+    so the Werkbank status line kept the old length until the next turn. ``context_tokens`` is the
+    compressor's own estimate (``compress_now`` ``after_tokens``, what the /compress reply shows),
+    marked ``context_source: kompression``; the next turn end replaces it with the measured
+    number. Never raises."""
+    try:
+        from gateway import session_events
+
+        tokens = session_events._positive(after_tokens)
+        if not session_key or tokens is None:
+            return
+        payload = {"context_tokens": tokens, "context_source": "kompression"}
+        comp = getattr(agent, "context_compressor", None)
+        for name, attr in (("context_length", "context_length"), ("compression_threshold", "threshold_tokens")):
+            value = session_events._positive(getattr(comp, attr, None)) if comp is not None else None
+            if value is not None:
+                payload[name] = value
+        provider = getattr(agent, "provider", None)
+        if isinstance(provider, str) and provider:
+            payload["provider"] = provider
+        session_events.emit(session_key, session_id, session_events._source_platform(source),
+                            "session.state", None, None, payload)
+    except Exception:
+        logger.debug("compression context event failed", exc_info=True)
 
 
 def _manual_compression_reply_lines(summary: dict, compressor, focus_topic) -> list[str]:
@@ -545,8 +573,13 @@ class GatewaySessionCommandsMixin:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
-        """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
+    async def _run_manual_compression(self, source, session_entry, history: list, request,
+                                      report: Optional[dict] = None) -> str:
+        """Build a temporary agent, run the shared compress core, persist, and describe the outcome.
+
+        WB-1319: a committed compression emits ``session.state`` with the new context estimate
+        (the Werkbank status line shows it at once); ``report`` (plugin callers) receives
+        ``status``/``before_tokens``/``after_tokens``/``removed``."""
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
         from gateway.run import _platform_config_key
@@ -581,12 +614,19 @@ class GatewaySessionCommandsMixin:
             result = await self._run_in_executor_with_context(
                 lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
                                      task_id=session_entry.session_id or "default"))
+            if report is not None:
+                report["status"] = result.status
             if result.status == "nothing_to_do":
                 return t("gateway.compress.nothing_to_do")
             if result.status != "compressed":
                 return "\n".join(render_compress_result(result))
             await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
             finalize_context_engine_compression_notification(tmp_agent, committed=True)
+            _emit_compression_context(session_key, session_entry.session_id, source, tmp_agent,
+                                      result.after_tokens)
+            if report is not None:
+                report.update(before_tokens=int(result.before_tokens or 0),
+                              after_tokens=int(result.after_tokens or 0), removed=int(result.removed))
             compressor = tmp_agent.context_compressor
             summary = result.summary
         finally:
@@ -598,72 +638,77 @@ class GatewaySessionCommandsMixin:
 
     # ------------------------------------------------------------------ WB-1319: plugin compress
 
-    async def _compress_from_plugin(self, *, source, focus_topic: str = "",
+    async def _compress_from_plugin(self, *, source,  # fork: werkbank-chat focus_topic: str = "",
                                     keep_last: Optional[int] = None, preview: bool = False) -> dict:
         """Manual compression for a PLUGIN surface — the Werkbank chat's context editor (WB-1319).
 
-        The same rails the ``/compress`` slash command takes: the shared ``compress_now`` core, the
-        ``here [N]`` boundary split, persistence through ``_persist_manual_compression`` and the
-        eviction of the cached agent. The parameters come directly (``focus_topic`` = what the
-        summariser must keep, ``keep_last`` = keep the last N exchanges verbatim) instead of an
-        argument string, and the answer carries the numbers the editor shows. ``preview`` asks the
-        same core for its report and makes no change and no model call.
+        The same rails as the ``/compress`` slash command (profile scope, ``compress_now``, the
+        ``here [N]`` split, ``_persist_manual_compression``, cached-agent eviction, the
+        ``session.state`` context event); the parameters come directly instead of an argument
+        string. ``preview`` builds no agent, calls no model and writes nothing.
 
-        Returns ``{status, before_tokens, after_tokens, removed, kept, lines, grund?}``; ``status``
-        is ``preview``, ``compressed``, ``nothing``, ``too_short`` or ``unreadable``.
+        Returns ``{status, before_tokens, after_tokens, removed, kept, lines, grund?}`` with
+        ``status`` ``preview``|``compressed``|``nothing``|``too_short``|``unreadable``|``failed``;
+        a committed compression adds ``context_tokens`` (the number the status line now shows).
         """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._compress_from_plugin_inner(source, focus_topic, keep_last, preview)
+        from gateway.run import _profile_runtime_scope
+        with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+            return await self._compress_from_plugin_inner(source, focus_topic, keep_last, preview)
+
+    async def _compress_from_plugin_inner(self, source, focus_topic, keep_last, preview) -> dict:
         from agent.conversation_compression_manual import MIN_MESSAGES, CompressRequest
         from agent.model_metadata import estimate_request_tokens_rough
-        from hermes_cli.partial_compress import (
-            split_history_for_partial_compress, summarize_compress_preview)
+        from hermes_cli.partial_compress import split_history_for_partial_compress, summarize_compress_preview
 
         def _tokens(messages) -> int:
-            pairs = [{"role": m.get("role"), "content": m.get("content")} for m in messages
-                     if m.get("role") in {"user", "assistant"} and m.get("content")]
-            return int(estimate_request_tokens_rough(pairs)) if pairs else 0
+            rows = [m for m in messages if m.get("role") in {"user", "assistant", "tool"}]
+            return int(estimate_request_tokens_rough(rows)) if rows else 0
 
+        empty = {"before_tokens": 0, "after_tokens": 0, "removed": 0, "kept": 0, "lines": []}
         session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
-            return {"status": "unreadable", "grund": "Der Verlauf dieser Sitzung ist nicht lesbar.",
-                    "before_tokens": 0, "after_tokens": 0, "removed": 0, "kept": 0, "lines": []}
+            return {**empty, "status": "unreadable", "grund": "Der Verlauf dieser Sitzung ist nicht lesbar."}
         if not history or len(history) < MIN_MESSAGES:
-            return {"status": "too_short", "before_tokens": 0, "after_tokens": 0, "removed": 0,
-                    "kept": 0, "lines": [],
+            return {**empty, "status": "too_short",
                     "grund": f"Zu wenig Verlauf zum Komprimieren (mindestens {MIN_MESSAGES} Nachrichten)."}
         request = CompressRequest(preview=preview, partial=keep_last is not None,
                                   keep_last=max(1, min(int(keep_last or 2), 100)),
                                   focus_topic=focus_topic or None)
-        before_tokens = _tokens(history)
         if preview:
             head, tail = history, []
             if request.partial:
                 head, tail = split_history_for_partial_compress(history, request.keep_last)
                 if not tail:
                     head = history
+            before_tokens = _tokens(history)
             report = summarize_compress_preview(
                 [{"role": m.get("role"), "content": m.get("content")} for m in history
                  if m.get("role") in {"user", "assistant"} and m.get("content")],
                 request.partial, request.keep_last, request.focus_topic, before_tokens)
-            # the head becomes one summary of about the compressor's target ratio; the tail stays
-            ratio = _plugin_summary_ratio()
-            after_tokens = _tokens(tail) + int(_tokens(head) * ratio)
+            # an estimate: the head becomes one summary of about the compressor's target ratio
+            after_tokens = _tokens(tail) + int(_tokens(head) * _plugin_summary_ratio())
             return {"status": "preview", "before_tokens": before_tokens,
-                    "after_tokens": max(1, after_tokens), "removed": report["head_count"],
-                    "kept": report["tail_count"], "lines": list(report["lines"])}
-        reply = await self._run_manual_compression(source, session_entry, history, request)
+                    "after_tokens": max(1, min(after_tokens, before_tokens)),
+                    "removed": report["head_count"], "kept": report["tail_count"],
+                    "lines": list(report["lines"])}
+        outcome: dict = {}
         try:
-            after = await self.async_session_store.load_transcript(session_entry.session_id)
-        except TranscriptReadError:
-            after = history
-        removed = max(0, len(history) - len(after))
-        lines = [line for line in str(reply or "").splitlines() if line.strip()]
-        return {"status": "compressed" if removed else "nothing",
-                "before_tokens": before_tokens, "after_tokens": _tokens(after),
-                "removed": removed, "kept": 0 if not request.partial else min(request.keep_last, 100),
-                "lines": lines, **({} if removed else {"grund": " ".join(lines)[:300] or
-                                                       "Die Kompression hat den Verlauf nicht geändert."})}
+            reply = await self._run_manual_compression(source, session_entry, history, request, report=outcome)
+        except Exception as exc:
+            logger.warning("Plugin compress failed: %s", type(exc).__name__)
+            return {**empty, "status": "failed", "grund": "Die Kompression ist fehlgeschlagen."}
+        lines = [line for line in str(reply or "").splitlines() if line.strip()][:20]
+        if outcome.get("status") != "compressed":
+            return {**empty, "status": "nothing", "lines": lines,
+                    "grund": " ".join(lines)[:300] or "Die Kompression hat den Verlauf nicht geändert."}
+        return {"status": "compressed", "before_tokens": outcome["before_tokens"],
+                "after_tokens": outcome["after_tokens"], "context_tokens": outcome["after_tokens"],
+                "removed": outcome["removed"], "kept": request.keep_last if request.partial else 0,
+                "lines": lines}
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
