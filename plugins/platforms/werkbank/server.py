@@ -376,6 +376,11 @@ def _handler(app: WerkbankServer):
                     if app.outbox is not None:           # WB-1321: Hermes' files, tags out of the text
                         app.outbox.dress(key, body.get("messages") or [])
                     return self._json(200, body)
+                if what == ["kurz"]:                 # WB-1388: the chat list's light read
+                    body = snapshot.kurz(app.buffers, app.host, key, uploads=app.uploads, outbox=app.outbox)
+                    if body is None:
+                        return self._refuse(404, "unknown session", "Diese Sitzung ist nicht (mehr) aufgelöst.")
+                    return self._json(200, body)
                 if what == ["events"]:
                     return self._events(key, query)
                 if len(what) == 3 and what[0] == "tools" and what[2] == "output":

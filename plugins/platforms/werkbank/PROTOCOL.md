@@ -81,6 +81,13 @@ listeners that do not know the type ignore it.
   key after it moved (answer carries the current id). **Only resolved sessions are buffered**
   (allowlist, at most 64, least recently used dropped); `/v1/s/{key}/…` of any other key → `404`.
 * `GET /v1/s/{key}/snapshot` → see below.
+* `GET /v1/s/{key}/kurz` (WB-1388) → `{epoch, seq, session_key, session_id, state, running,
+  pending_approvals: n, pending_clarify: n, pending_choices: n, last_user_ts, last_assistant_ts,
+  last: {role, text, ts, attachments: bool} | null}` — the chat list's light read: the same auth as
+  the snapshot, only the newest 12 rows are read (no history is built), `last.text` is redacted by
+  the gateway's egress scrub and then cut to 200 characters. Read only (buffers are not confirmed).
+  Same `404 unknown session` as the snapshot; a plugin before WB-1388 answers `404 not found` —
+  the caller falls back to the snapshot.
 * `GET /v1/s/{key}/events?epoch=E&after=N` → `text/event-stream`. Ring buffer of 5000 events per
   session. Wrong `E`, or `N` before the oldest kept event or beyond the newest → exactly ONE
   `session.epoch`, then the stream ends. Otherwise every event with `seq > N`, then live; a

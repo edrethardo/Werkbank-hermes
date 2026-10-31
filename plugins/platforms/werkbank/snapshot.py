@@ -458,3 +458,89 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
         "subagents": pos["subagents"],
         "session": session,
     }
+
+
+KURZ_ROWS = 12            # WB-1388: newest rows the short read looks at (not the whole history)
+KURZ_TEXT = 200           # characters of the last message in the short read
+KURZ_REDACT_BYTES = 2048  # window that runs through the redaction before the cut to KURZ_TEXT
+
+
+def _ts_number(value: Any) -> Optional[float]:
+    if isinstance(value, str) and value.strip():      # a buffered event carries an ISO time
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def kurz(buffers, host, session_key: str, uploads=None, outbox=None) -> Optional[Dict[str, Any]]:
+    """WB-1388: ``GET /v1/s/{key}/kurz`` — where the chat stands, without the history.
+
+    ``{epoch, seq, session_key, session_id, state, running, pending_approvals: n, pending_clarify: n,
+    pending_choices: n, last_user_ts, last_assistant_ts, last: {role, text, ts, attachments: bool} | null}``
+
+    Only the newest ``KURZ_ROWS`` rows are read (one bounded query), the chat list needs nothing
+    more. The last message is redacted by the gateway's own egress scrub BEFORE it is cut to
+    ``KURZ_TEXT`` characters. Buffered messages and answers the SessionDB has no row for yet count
+    as in the snapshot; nothing is confirmed or dropped here (read only).
+    """
+    if buffers.get(session_key) is None:
+        return None
+    current = host.current_session_id(session_key)
+    if current:
+        buffers.watch(session_key, current, None)
+    pos = buffers.position(session_key)
+    if pos is None:
+        return None
+    session_id = pos["session_id"]
+    rows = [r for r in host.history(session_key, session_id, KURZ_ROWS) or [] if isinstance(r, dict)]
+    messages: List[Dict[str, Any]] = []
+    for row in rows:
+        messages.extend(message_items(row, pos["platform"], buffers.plugin_id))
+    _complete(messages, rows, pos, _lineage(host, session_key, session_id))   # read only: no confirm
+    running = bool(pos["turn_id"]) or bool(host.is_running(session_key))
+    last_user = last_assistant = None
+    last = None
+    for item in messages:
+        if item.get("role") not in ("user", "assistant") or item.get("kind") == "system":
+            continue
+        ts = _ts_number(item.get("ts"))
+        if ts is not None:
+            if item["role"] == "user":
+                last_user = ts if last_user is None else max(last_user, ts)
+            else:
+                last_assistant = ts if last_assistant is None else max(last_assistant, ts)
+        if str(item.get("text") or "").strip() or item.get("files"):
+            last = item
+    short = None
+    if last is not None:
+        raw = str(last.get("text") or "")
+        attachments = bool(last.get("files"))
+        if "MEDIA:" in raw:
+            attachments = True
+            raw = "\n".join(line for line in raw.splitlines() if "MEDIA:" not in line)
+        try:
+            if last["role"] == "user" and uploads is not None:
+                attachments = attachments or bool(uploads.attachments(session_key, last.get("client_message_id")))
+            if last["role"] == "assistant" and outbox is not None:
+                refs = [r for r in (last.get("message_uid"), last.get("id")) if r]
+                attachments = attachments or bool(outbox.for_refs(session_key, refs))
+        except Exception:
+            pass
+        try:
+            from . import kontext
+            text, _cut = kontext.capped(raw, KURZ_REDACT_BYTES)      # redacted first, fail closed
+        except Exception:
+            text = ""
+        short = {"role": last["role"], "text": text[:KURZ_TEXT], "ts": _ts_number(last.get("ts")),
+                 "attachments": attachments}
+    return {
+        "epoch": pos["epoch"], "seq": pos["seq"], "session_key": session_key, "session_id": session_id,
+        "state": STATE_RUNNING if running else STATE_IDLE, "running": running,
+        "pending_approvals": len(host.pending_approvals(session_key) or []),
+        "pending_clarify": len(host.pending_clarify(session_key) or []),
+        "pending_choices": len(_pending_choices(host, session_key)),
+        "last_user_ts": last_user, "last_assistant_ts": last_assistant, "last": short,
+    }
