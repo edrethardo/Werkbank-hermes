@@ -99,6 +99,21 @@ def test_kurz_reads_only_a_few_rows_and_is_fast_for_a_huge_session(tmp_path):
         srv.server.stop()
 
 
+def test_kurz_reads_wider_when_the_newest_rows_are_all_tool_rows(tmp_path):
+    host = FakeHost()
+    host.messages = [{"id": 1, "role": "user", "content": "baue das", "timestamp": 1.0},
+                     {"id": 2, "role": "assistant", "content": "mache ich", "timestamp": 2.0}]
+    host.messages += [{"id": i, "role": "tool", "content": "ausgabe", "tool_call_id": f"c{i}",
+                       "timestamp": float(i)} for i in range(3, 40)]
+    srv = _server(tmp_path, host)
+    try:
+        status, body = call(srv.port, "GET", session_path("kurz"), srv.key)
+        assert status == 200 and body["last"] is not None, body
+        assert body["last"]["ts"] == 2.0 and body["last_assistant_ts"] == 2.0
+    finally:
+        srv.server.stop()
+
+
 def test_a_buffered_message_without_a_row_counts(tmp_path):
     host = FakeHost()
     host.messages = [{"id": 1, "role": "assistant", "content": "alt", "timestamp": 5.0}]

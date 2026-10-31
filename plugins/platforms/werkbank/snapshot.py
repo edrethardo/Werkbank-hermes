@@ -461,6 +461,7 @@ def build(buffers, host, session_key: str) -> Optional[Dict[str, Any]]:
 
 
 KURZ_ROWS = 12            # WB-1388: newest rows the short read looks at (not the whole history)
+KURZ_ROWS_WEIT = 200      # second, wider read when the newest rows are all tool rows
 KURZ_TEXT = 200           # characters of the last message in the short read
 KURZ_REDACT_BYTES = 2048  # window that runs through the redaction before the cut to KURZ_TEXT
 
@@ -495,25 +496,29 @@ def kurz(buffers, host, session_key: str, uploads=None, outbox=None) -> Optional
     if pos is None:
         return None
     session_id = pos["session_id"]
-    rows = [r for r in host.history(session_key, session_id, KURZ_ROWS) or [] if isinstance(r, dict)]
-    messages: List[Dict[str, Any]] = []
-    for row in rows:
-        messages.extend(message_items(row, pos["platform"], buffers.plugin_id))
-    _complete(messages, rows, pos, _lineage(host, session_key, session_id))   # read only: no confirm
     running = bool(pos["turn_id"]) or bool(host.is_running(session_key))
-    last_user = last_assistant = None
-    last = None
-    for item in messages:
-        if item.get("role") not in ("user", "assistant") or item.get("kind") == "system":
-            continue
-        ts = _ts_number(item.get("ts"))
-        if ts is not None:
-            if item["role"] == "user":
-                last_user = ts if last_user is None else max(last_user, ts)
-            else:
-                last_assistant = ts if last_assistant is None else max(last_assistant, ts)
-        if str(item.get("text") or "").strip() or item.get("files"):
-            last = item
+    # a long tool run can fill the newest KURZ_ROWS rows; then read once more, wider
+    for limit in (KURZ_ROWS, KURZ_ROWS_WEIT):
+        rows = [r for r in host.history(session_key, session_id, limit) or [] if isinstance(r, dict)]
+        messages: List[Dict[str, Any]] = []
+        for row in rows:
+            messages.extend(message_items(row, pos["platform"], buffers.plugin_id))
+        _complete(messages, rows, pos, _lineage(host, session_key, session_id))   # read only: no confirm
+        last_user = last_assistant = None
+        last = None
+        for item in messages:
+            if item.get("role") not in ("user", "assistant") or item.get("kind") == "system":
+                continue
+            ts = _ts_number(item.get("ts"))
+            if ts is not None:
+                if item["role"] == "user":
+                    last_user = ts if last_user is None else max(last_user, ts)
+                else:
+                    last_assistant = ts if last_assistant is None else max(last_assistant, ts)
+            if str(item.get("text") or "").strip() or item.get("files"):
+                last = item
+        if last is not None or len(rows) < limit:
+            break
     short = None
     if last is not None:
         raw = str(last.get("text") or "")
