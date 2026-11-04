@@ -76,8 +76,10 @@ def plugin_home(ctx: Any) -> Path:
 
 
 def _snapshot_root(home: Path) -> Path:
-    """WB-1319: where the context editor keeps its snapshots (0600 files, 0700 directories)."""
-    return Path(home) / "plugin-data" / "werkbank" / "kontext"
+    """WB-1319: where the context editor keeps its snapshots (0600 files, 0700 directories).
+    WB-1426: the core's store, shared with the gateway ``/clear``."""
+    from gateway.context_rewrite import snapshot_root
+    return snapshot_root(home)
 
 
 def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[int] = None) -> Optional[Instance]:

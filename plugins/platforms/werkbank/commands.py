@@ -42,8 +42,9 @@ def catalog() -> List[Dict[str, str]]:
         for cmd in registry.COMMAND_REGISTRY:
             if not registry._is_gateway_available(cmd, gates):
                 continue
+            # WB-1426: the messaging text (``/clear`` here empties the context, not the screen)
             out.append({"name": cmd.name, "args": str(cmd.args_hint or ""),
-                        "description": str(cmd.describe() or "")})
+                        "description": str(cmd.describe(gateway=True) or "")})
         known = {c["name"] for c in out}
         for name, description, args in registry._iter_plugin_command_entries():
             if name not in known:

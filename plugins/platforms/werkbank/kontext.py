@@ -37,12 +37,14 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import os
 import re
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# WB-1426: lock, fingerprint, write, snapshots and undo live in the core so the gateway's /clear
+# (Telegram, Werkbank chat) takes the SAME way — one lock per session_key, one snapshot store
+from gateway import context_rewrite as _core
 
 logger = logging.getLogger("plugins.platforms.werkbank")
 
@@ -51,26 +53,18 @@ MAX_INSTRUCTION = 1000        # the focus topic (`/compress <focus>`) is one lin
 MAX_TEXT = 100_000            # a rewritten message
 MAX_OPS = 100                 # operations in one request
 COMPRESS_TIMEOUT_S = 360.0    # one manual compression (a summariser call) may take minutes
-SNAPSHOT_KEEP = 5
+SNAPSHOT_KEEP = _core.SNAPSHOT_KEEP
 UNDO_HINT = ("Die Änderung bricht den Prompt-Cache: der nächste Zug schickt den geänderten Verlauf "
              "neu und ist deshalb teurer.")
 ROLES = ("user", "assistant", "tool")
 
 LOCK_WAIT_S = 10.0            # an edit waits this long for another change of the same session
-WRITE_STALE = "stale"         # context_write's grund when the re-read no longer matches the base
+WRITE_STALE = _core.WRITE_STALE   # context_write's grund when the re-read no longer matches the base
 
 # one lock per session_key: read → check → write of edit/remove/shorten, undo and compression is
-# one step, so two requests of the same session can never both read the old state (lost update)
-_LOCKS: Dict[str, threading.Lock] = {}
-_LOCKS_GUARD = threading.Lock()
-
-
-def _session_lock(session_key: str) -> threading.Lock:
-    with _LOCKS_GUARD:
-        lock = _LOCKS.get(session_key)
-        if lock is None:
-            lock = _LOCKS[session_key] = threading.Lock()
-        return lock
+# one step, so two requests of the same session can never both read the old state (lost update).
+# The core owns the lock (WB-1426): a /clear of the same session waits for it too.
+_session_lock = _core.session_lock
 
 
 @contextmanager
@@ -100,14 +94,9 @@ def _write(host: Any, session_key: str, session_id: Optional[str],
 _CONTROL = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060]")
 
 
-class KontextFehler(Exception):
-    """A refusal the board may read: HTTP ``status``, a machine ``error`` and a German ``grund``."""
-
-    def __init__(self, status: int, error: str, grund: str) -> None:
-        super().__init__(grund)
-        self.status = status
-        self.error = error
-        self.grund = grund
+# A refusal the board may read: HTTP ``status``, a machine ``error`` and a German ``grund`` — the
+# core's class, so a refusal of the shared way (lock busy, snapshot, undo) needs no translation.
+KontextFehler = _core.ContextRewriteError
 
 
 # ── small shared helpers ──────────────────────────────────────────────────────────────────────
@@ -143,23 +132,7 @@ def estimate(text: Any) -> int:
         return max(1, len(str(text or "")) // 4)
 
 
-def text_of(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                parts.append(part["text"])
-            elif isinstance(part, str):
-                parts.append(part)
-        return "\n".join(parts)
-    try:
-        return json.dumps(content, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(content)
+text_of = _core.text_of
 
 
 def one_line(text: str, limit: int = 160) -> str:
@@ -183,20 +156,8 @@ def _call_id(call: Dict[str, Any]) -> Optional[str]:
     return ident if isinstance(ident, str) and ident else None
 
 
-def fingerprint(messages: List[Dict[str, Any]]) -> str:
-    """What the model sees of a transcript (role, text, tool identity) as one hash — bookkeeping
-    keys (row ids, timestamps, markers) left out, so a re-read compares equal to what was written."""
-    import hashlib
-
-    parts = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        calls = sorted(cid for cid in (_call_id(c) for c in _calls(msg)) if cid)
-        parts.append([str(msg.get("role") or ""), text_of(msg.get("content")), calls,
-                      str(msg.get("tool_call_id") or "")])
-    raw = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+# What the model sees of a transcript as one hash (the core's: /clear compares the same way).
+fingerprint = _core.fingerprint
 
 
 def incomplete_pairs(messages: List[Dict[str, Any]]) -> List[str]:
@@ -562,33 +523,12 @@ def _undo(host: Any, buffers: Any, snap_root: Path, session_key: str) -> Dict[st
     if not gate_ok:
         raise KontextFehler(409, "locked", gate_grund or "Der Kontext ist gerade schreibgeschützt.")
     session_id = position.get("session_id")
-    newest = _newest_snapshot(snap_root, session_id)
-    if newest is None:
-        raise KontextFehler(409, "no snapshot", "Es gibt keinen Schnappschuss zum Zurücknehmen.")
-    try:
-        data = json.loads(newest.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raise KontextFehler(500, "snapshot unreadable",
-                            "Der Schnappschuss ist nicht mehr lesbar.") from None
-    messages = data.get("messages") if isinstance(data, dict) else None
-    if not isinstance(messages, list) or not messages:
-        raise KontextFehler(500, "snapshot unreadable", "Der Schnappschuss enthält keinen Verlauf.")
-    expected = data.get("expected_after")
-    current = host.context_messages(session_key, session_id) or []
-    current_fp = fingerprint(current)
-    if not isinstance(expected, str) or current_fp != expected:
-        # a turn (or another edit) came after: restoring would drop it without the owner seeing it
-        raise KontextFehler(409, "moved on",
-                            "Seit dieser Änderung ist der Verlauf weitergegangen — „Rückgängig“ "
-                            "würde die neueren Nachrichten verwerfen. Bitte von Hand bearbeiten.")
-    _write(host, session_key, session_id, [dict(m) for m in messages if isinstance(m, dict)],
-           current_fp)
-    try:
-        newest.unlink()
-    except OSError:
-        logger.info("werkbank: snapshot not removed after undo")
-    logger.info("werkbank: context restored from a snapshot (%d messages)", len(messages))
-    return {"ok": True, "restored": len(messages), "undo": counts(snap_root, session_id),
+    # the core's undo rule (WB-1426): newest snapshot, only while the history is what it left
+    restored = _core.restore_newest(
+        snap_root, session_id, lambda: host.context_messages(session_key, session_id) or [],
+        lambda messages, current_fp: _write(host, session_key, session_id, messages, current_fp))
+    logger.info("werkbank: context restored from a snapshot (%d messages)", restored)
+    return {"ok": True, "restored": restored, "undo": counts(snap_root, session_id),
             "hinweis": UNDO_HINT}
 
 
@@ -658,70 +598,14 @@ def _compress(host: Any, buffers: Any, session_key: str, focus: str, keep: Optio
 
 # ── snapshots ────────────────────────────────────────────────────────────────────────────────
 
-def _session_dir(snap_root: Path, session_id: Optional[str]) -> Optional[Path]:
-    if not isinstance(session_id, str) or not session_id or "/" in session_id or "\\" in session_id:
-        return None
-    return Path(snap_root) / session_id
-
-
-def _snapshots(snap_root: Optional[Path], session_id: Optional[str]) -> List[Path]:
-    folder = _session_dir(snap_root, session_id) if snap_root is not None else None
-    if folder is None or not folder.is_dir():
-        return []
-    return sorted((p for p in folder.iterdir() if p.suffix == ".json" and p.is_file()),
-                  key=lambda p: p.name)
-
-
-def _newest_snapshot(snap_root: Optional[Path], session_id: Optional[str]) -> Optional[Path]:
-    found = _snapshots(snap_root, session_id)
-    return found[-1] if found else None
+# The snapshot store is the core's (WB-1426): a /clear snapshot of the same session counts here too.
+_snapshots = _core.snapshots
+_newest_snapshot = _core.newest_snapshot
+_discard = _core.discard
 
 
 def _write_snapshot(snap_root: Path, session_id: Optional[str], grund: str, host: Any,
                     session_key: str, expected_after: str = "") -> Path:
     """Store the state BEFORE the change: the whole active transcript, 0600, newest five kept."""
-    folder = _session_dir(snap_root, session_id)
-    if folder is None:
-        raise KontextFehler(409, "unknown session", "Diese Sitzung hat keine gültige Kennung.")
-    folder.mkdir(parents=True, exist_ok=True)
-    os.chmod(folder, 0o700)
     messages = host.context_messages(session_key, session_id) or []
-    data = {"session_id": session_id, "grund": grund, "ts": _now(),
-            # the state the change leaves behind: undo only while the history is still exactly that
-            "expected_after": expected_after,
-            "messages": [dict(m) for m in messages if isinstance(m, dict)]}
-    name = f"{int(_epoch_ms()):015d}-{os.getpid()}.json"
-    target = folder / name
-    tmp = folder / (name + ".part")
-    payload = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-        os.replace(tmp, target)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-    for old in _snapshots(snap_root, session_id)[:-SNAPSHOT_KEEP]:
-        _discard(old)
-    return target
-
-
-def _discard(path: Path) -> None:
-    try:
-        Path(path).unlink()
-    except OSError:
-        logger.info("werkbank: snapshot not removed")
-
-
-def _now() -> str:
-    import datetime
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def _epoch_ms() -> float:
-    import time
-    return time.time() * 1000
+    return _core.write_snapshot(snap_root, session_id, grund, messages, expected_after=expected_after)

@@ -307,18 +307,8 @@ class GatewayHost:
         return {}
 
     def _db(self, session_key: str) -> Any:
-        owner = self.owner()
-        store = getattr(owner, "session_store", None)
-        for_key = getattr(store, "_db_for_key", None)
-        db = None
-        if callable(for_key):
-            try:
-                db = for_key(session_key)
-            except Exception:
-                db = None
-        if db is None:
-            db = getattr(owner, "_session_db", None)
-        return getattr(db, "_db", db)
+        from gateway.context_rewrite import session_db     # WB-1426: the /clear lookup too
+        return session_db(self.owner(), session_key)
 
     def history(self, session_key: str, session_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
         db = self._db(session_key)
@@ -465,30 +455,16 @@ class GatewayHost:
 
         ``expected`` is the fingerprint (``kontext.fingerprint``) of the transcript the change was
         made on. ``replace_messages`` has no compare-and-swap, so the transcript is read again right
-        before the write; a mismatch answers ``(False, kontext.WRITE_STALE)`` and writes nothing."""
-        db = self._db(session_key)
-        write = getattr(db, "replace_messages", None)
-        if not session_id or not callable(write):
-            return False, "Diese Sitzung hat keinen schreibbaren Verlauf."
-        if expected is not None:
-            from . import kontext as kontext_mod
-            if kontext_mod.fingerprint(self.context_messages(session_key, session_id)) != expected:
-                return False, kontext_mod.WRITE_STALE
-        try:
-            write(session_id, messages, archive_dropped=True, reject_active_turn_lease=True)
-        except Exception as exc:
-            from hermes_state_errors import SessionTurnLeaseLostError
-            if isinstance(exc, SessionTurnLeaseLostError):
-                return False, "Ein Zug hält gerade den Verlauf — der Kontext ist schreibgeschützt."
-            logger.info("werkbank: context write refused (%s)", type(exc).__name__)
-            return False, "Die Datenbank hat die Änderung abgelehnt."
+        before the write; a mismatch answers ``(False, kontext.WRITE_STALE)`` and writes nothing.
+        WB-1426: the write itself is the core's (``gateway.context_rewrite.write_messages``), the
+        same one the gateway ``/clear`` uses."""
+        from gateway import context_rewrite
+
         evict = getattr(self.owner(), "_evict_cached_agent", None)
-        if callable(evict):
-            try:
-                evict(session_key)
-            except Exception:
-                logger.info("werkbank: cached agent not evicted after a context edit")
-        return True, ""
+        return context_rewrite.write_messages(
+            self._db(session_key), session_id, messages, expected=expected,
+            read=lambda: self.context_messages(session_key, session_id),
+            evict=(lambda: evict(session_key)) if callable(evict) else None)
 
     def foreign_writer(self, session_key: str) -> str:
         """A writer that is not this gateway, if the core reports one (else ""). The core named here

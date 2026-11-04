@@ -4670,7 +4670,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             config_overrides = _resolve_config_gates()
             for cmd_def in COMMAND_REGISTRY:
                 if _is_gateway_available(cmd_def, config_overrides):
-                    _auto_register(cmd_def.name, cmd_def.description, cmd_def.args_hint)
+                    _auto_register(cmd_def.name, cmd_def.gateway_description or cmd_def.description,  # fork: werkbank-chat
+                                   cmd_def.args_hint)
             logger.debug("Discord auto-registered %d commands from COMMAND_REGISTRY", len(already_registered))
         except Exception as e:
             logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)

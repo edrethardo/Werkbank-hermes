@@ -1316,6 +1316,10 @@ class TurnRunner:
         ctx.tools_holder[0] = getattr(agent, "tools", None)  # transcript logging
         from gateway import session_events  # fork: werkbank-chat
         session_events.wire_agent(getattr(self, "_session_turn", None), agent)  # fork: werkbank-chat
+        # fork: werkbank-chat — WB-1426: after a gateway /clear the empty history reuses the stored prompt
+        from gateway.context_rewrite import restore_stored_prompt  # fork: werkbank-chat
+        agent._restore_stored_system_prompt = restore_stored_prompt(  # fork: werkbank-chat
+            getattr(runner, "session_store", None), ctx.session_key, getattr(agent, "session_id", None))  # fork: werkbank-chat
 
     # ── blocking prompts from the agent thread (approval / clarify) ─────────────────────────
 

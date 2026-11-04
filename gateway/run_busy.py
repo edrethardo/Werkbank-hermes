@@ -950,6 +950,7 @@ class GatewayBusySessionMixin:
         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
         "loop", "refine", "review", "voice",
+        "clear",  # fork: werkbank-chat — WB-1426: empty THIS session's context (CLI /clear differs)
     )
 
     def _command_handler_table(self, names) -> Dict[str, Any]:
@@ -981,7 +982,8 @@ class GatewayBusySessionMixin:
 
     # busy_handler key (hermes_cli/commands.py CommandDef) → mid-run variant ``_busy_<key>_command``.
     _BUSY_SPECIAL_HANDLERS: Dict[str, str] = {
-        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
+        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop",
+                                          "clear")  # fork: werkbank-chat — WB-1426 /clear mid-run
     }
 
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):

@@ -750,7 +750,11 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stored_prompt = None
     stored_state = "missing"
     session_row = None
-    if conversation_history and agent._session_db:
+    # fork: werkbank-chat — WB-1426: a gateway /clear emptied THIS session's history but kept its
+    # session row; the stored prompt is still the conversation's prompt (prompt cache, project
+    # text), so the empty history is a continuation, not a first turn. Only an explicit True.
+    cleared_session = getattr(agent, "_restore_stored_system_prompt", False) is True  # fork: werkbank-chat
+    if (conversation_history or cleared_session) and agent._session_db:  # fork: werkbank-chat
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:

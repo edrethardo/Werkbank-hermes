@@ -513,6 +513,91 @@ class GatewaySessionCommandsMixin:
         return t("gateway.undo.removed", turns=result["turns_undone"],
                  count=result["rewound_count"], preview=preview)
 
+    # ------------------------------------------------------------------ WB-1426: /clear
+
+    def _context_snapshot_home(self, source) -> "os.PathLike":  # fork: werkbank-chat
+        """The profile home whose snapshot store serves *source* (the Werkbank editor's, WB-1319)."""
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            with contextlib.suppress(Exception):
+                home = self._resolve_profile_home_for_source(source)
+                if home:
+                    return home
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+
+    @staticmethod
+    def _expire_pending_prompts(session_key: str) -> int:  # fork: werkbank-chat
+        """Open approvals / clarify / slash confirmations of the session die with its context."""
+        expired = 0
+        with contextlib.suppress(Exception):
+            from tools import approval
+            expired += len(approval.list_gateway_approvals(session_key) or [])
+            approval.clear_session(session_key)
+        with contextlib.suppress(Exception):
+            from tools import clarify_gateway
+            expired += int(clarify_gateway.clear_session(session_key) or 0)
+        with contextlib.suppress(Exception):
+            from tools import slash_confirm
+            if slash_confirm.get_pending(session_key):
+                expired += 1
+            slash_confirm.clear(session_key)
+        return expired
+
+    async def _handle_clear_command(self, event: MessageEvent) -> str:  # fork: werkbank-chat
+        """``/clear`` (gateway): empty the context of THIS session — same session id, so admin
+        binding, Telegram topic and chat list stay (unlike /new). The conversation rows are archived
+        (``active = 0``) after a snapshot, through the Werkbank context editor's way
+        (``gateway.context_rewrite``: lock per session_key, DB turn-lease fence); the cached agent is
+        evicted and the next turn reuses the stored system prompt. ``/clear undo`` restores the
+        snapshot until the next turn. The CLI/TUI ``/clear`` (screen + new session) is not this."""
+        from gateway import context_rewrite as cr
+
+        source = event.source
+        args = (event.get_command_args() or "").strip().lower()
+        if args not in ("", "undo"):
+            return cr.CLEAR_USAGE
+        session_key = self._session_key_for_source(source)
+        if (getattr(self, "_running_agents", None) or {}).get(session_key):
+            return cr.CLEAR_BUSY
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_id = session_entry.session_id
+        db = cr.session_db(self, session_key)
+        root = cr.snapshot_root(self._context_snapshot_home(source))
+        agent = self._cached_agent_for(session_key, lockless_fallback=True)
+        try:
+            if args == "undo":
+                restored = await asyncio.to_thread(cr.undo_clear, db, session_key, session_id, root)
+            else:
+                outcome = await asyncio.to_thread(cr.clear_history, db, session_key, session_id, root)
+        except cr.ContextRewriteError as exc:
+            if exc.grund == cr.LEASE_REFUSED:
+                return exc.grund + " Erst /stop, dann /clear."
+            return exc.grund
+        # the next turn starts from what is written: no cached agent, no stale prompt-token count
+        self._evict_cached_agent(session_key)
+        session_entry.last_prompt_tokens = 0
+        prompt = ""
+        with contextlib.suppress(Exception):
+            prompt = (db.get_session(session_id) or {}).get("system_prompt") or ""
+        if args == "undo":
+            messages = await asyncio.to_thread(cr.read_messages, db, session_id)
+            _emit_compression_context(session_key, session_id, source, agent,
+                                      cr.estimate_tokens(prompt, messages))
+            return cr.CLEAR_UNDONE.format(n=restored)
+        # same session, empty history: the next turn reuses the stored prompt (prompt cache)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(self.session_store.set_session_metadata, session_key,
+                                    cr.CLEARED_MARKER, session_id)
+        expired = self._expire_pending_prompts(session_key)
+        _emit_compression_context(session_key, session_id, source, agent, cr.estimate_tokens(prompt))
+        reply = cr.CLEAR_DONE.format(n=outcome["archived"])
+        return reply + ("\n" + cr.CLEAR_EXPIRED if expired else "")
+
+    async def _busy_clear_command(self, event, quick_key, source) -> str:  # fork: werkbank-chat
+        """``/clear`` while a turn runs: refused — the turn would write into the emptied context."""
+        from gateway import context_rewrite as cr
+        return cr.CLEAR_BUSY
+
     # --------------------------------------------------------------------- /compress
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:

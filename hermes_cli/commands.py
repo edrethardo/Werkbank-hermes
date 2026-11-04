@@ -71,9 +71,16 @@ class CommandDef:
     # relevant review actions with CLI-hub mutations (e.g. /skills install),
     # so offering the command doesn't widen the whole family.
     desktop_subcommands: tuple[str, ...] | None = None
+    # fork: werkbank-chat — WB-1426: what the command does on a MESSAGING surface when that differs
+    # from the terminal (``/clear``: screen + new session in the CLI, context of THIS session in
+    # the gateway). ``None`` = the same as ``description``.
+    gateway_description: str | None = None
 
-    def describe(self) -> str:
-        """Localized description (``slash.<name>.description``); ``description`` is the English source."""
+    def describe(self, gateway: bool = False) -> str:  # fork: werkbank-chat — WB-1426 `gateway`
+        """Localized description (``slash.<name>.description``); ``description`` is the English source.
+        ``gateway=True``: the messaging text (``gateway_description``) when the command has one."""
+        if gateway and self.gateway_description:
+            return _localized(f"slash.{self.name}.gateway_description", self.gateway_description)
         return _localized(f"slash.{self.name}.description", self.description)
 
 
@@ -90,7 +97,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
-               cli_only=True, desktop="terminal"),
+               desktop="terminal",
+               # fork: werkbank-chat — WB-1426: gateway handler (gateway/slash_commands_session.py);
+               # the CLI/TUI keep their own /clear (cli.py _SLASH_DISPATCH → _cmd_clear)
+               gateway_description="Empty this chat's context (same session, history archived; "
+                                   "/clear undo restores it)",
+               busy_handler="clear"),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
                cli_only=True, desktop="terminal"),
     CommandDef("history", "Show conversation history", "Session",
@@ -545,7 +557,7 @@ def gateway_help_lines(allowed: Optional[Iterable[str]] = None) -> list[str]:
         alias_parts = [f"`/{a}`" for a in cmd.aliases
                        if not (a.replace("-", "_") == cmd.name.replace("-", "_") and a != cmd.name)]
         alias_note = t("slash.shared.alias_note", aliases=", ".join(alias_parts)) if alias_parts else ""
-        lines.append(f"`/{cmd.name}{args}` -- {cmd.describe()}{alias_note}")
+        lines.append(f"`/{cmd.name}{args}` -- {cmd.describe(gateway=True)}{alias_note}")
     return lines
 
 

@@ -245,6 +245,30 @@ redaction (`_capped`), at most 8 KB per entry in the list.
   `501` without a snapshot folder or without the core hook. The board allows them only to the
   owner with a real click in the board page (`quelle: board`).
 
+### `/clear` in the chat (WB-1426, core `gateway/context_rewrite.py`)
+
+`/clear` typed in the Werkbank chat (`as_command`) or in Telegram empties the context of the SAME
+session: the session id, admin binding, Telegram topic and chat list stay (unlike `/new`). Lock per
+`session_key`, fingerprint re-read, `replace_messages(archive_dropped=True,
+reject_active_turn_lease=True)`, snapshot store and undo rule are the editor's — they moved into the
+core module, `kontext.py`/`host.context_write` call it, so an editor change and a `/clear` of one
+session serialize and see each other's snapshots (`undo` count, „Rückgängig“ takes a clear back too).
+
+* Only user/assistant/tool rows are archived; the session row (system prompt, model, profile, cwd,
+  title) is untouched. The session metadata `context_cleared = <session_id>` makes the next turn
+  reuse the STORED system prompt although its history is empty (`agent._restore_stored_system_prompt`
+  → `_restore_or_build_system_prompt`), so the prompt cache keeps matching.
+* The cached agent is evicted; `session.state` follows like after `/compress` (`context_source:
+  kompression`, `context_tokens` ≈ the stored system prompt); open approvals/clarify/slash confirms
+  of the session expire with a note.
+* A running turn: refused mid-run (`busy_handler: clear`, „erst /stop“); a turn lease of another
+  process refuses the write (nothing written, no snapshot).
+* `/clear undo`: the newest snapshot, only when it is a `/clear` one (`grund: clear`) and the history
+  is still what the clear left — after the next turn it is refused.
+* The CLI/TUI `/clear` (screen + new session) is unchanged; the registry entry gained a
+  `gateway_description` for messaging menus (Telegram, Discord, Slack via `/hermes clear`, this
+  plugin's command catalog).
+
 ## Files Hermes sends (WB-1321, `outbox.py`, `medien.py`)
 
 Why: this plugin has no messaging adapter. The gateway hands a reply's `MEDIA:<path>` files only to

@@ -91,7 +91,7 @@ def telegram_bot_commands(*, include_plugins: bool = True) -> list[tuple[str, st
     """(command_name, description) pairs for Telegram setMyCommands: sanitized canonical names
     only (no aliases). Built-ins needing arguments are included (their handlers show usage when
     selected bare); plugin commands needing arguments are excluded (may lack a no-arg fallback)."""
-    pairs = [(cmd.name, cmd.describe()) for cmd in _gateway_available_commands()]
+    pairs = [(cmd.name, cmd.describe(gateway=True)) for cmd in _gateway_available_commands()]
     if include_plugins:
         pairs += [(n, d) for n, d, hint in _iter_plugin_command_entries()
                   if not _requires_argument(hint)]
@@ -383,7 +383,8 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 # parity test reads this set. Aliases are never pinned ahead of canonicals.
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
-    "refine", "review", "pause", "whoami", "platform", "insights", "login", "initiate-setup"})
+    "refine", "review", "pause", "whoami", "platform", "insights", "login", "initiate-setup",
+    "clear"})  # fork: werkbank-chat — WB-1426 gateway /clear (Telegram/Werkbank first; Slack: /hermes clear)
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -397,8 +398,8 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     standalone slash, deduped and clamped to the 50-command cap; Slack built-ins and
     _SLACK_VIA_HERMES_ONLY are skipped. ``/hermes`` is always first for anything dropped."""
     available = _gateway_available_commands()
-    wanted = [(cmd.name, cmd.describe(), cmd.args_hint or "") for cmd in available]
-    wanted += [(alias, t("slash.shared.slack_alias_for", name=cmd.name, description=cmd.describe()),
+    wanted = [(cmd.name, cmd.describe(gateway=True), cmd.args_hint or "") for cmd in available]
+    wanted += [(alias, t("slash.shared.slack_alias_for", name=cmd.name, description=cmd.describe(gateway=True)),
                 cmd.args_hint or "") for cmd in available for alias in cmd.aliases]
     wanted += [(name, desc, hint or "") for name, desc, hint in _iter_plugin_command_entries()]
 
