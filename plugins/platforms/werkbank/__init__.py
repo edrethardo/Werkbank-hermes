@@ -47,11 +47,12 @@ def runtime() -> types.ModuleType:
 class Instance:
     """A running server and the plugin contexts that hold it: it stops when the LAST one unloads."""
 
-    def __init__(self, server: Any, buffers: Any, host: Any, home_key: str) -> None:
+    def __init__(self, server: Any, buffers: Any, host: Any, home_key: str, ansichten: Any = None) -> None:
         self.server = server
         self.buffers = buffers
         self.host = host
         self.home_key = home_key
+        self.ansichten = ansichten           # WB-1471: ansichten.Ablage (the tool finds its session here)
         self.contexts: List[Any] = []        # attach order; the newest feeds the buffers and serves the host
 
 
@@ -84,7 +85,7 @@ def _snapshot_root(home: Path) -> Path:
 
 def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[int] = None) -> Optional[Instance]:
     """Key file, buffers, server. ``None`` (logged, no text) when the key or the port is not usable."""
-    from . import buffer, keyfile, medien, outbox, server, uploads
+    from . import ansichten, buffer, keyfile, medien, outbox, server, uploads
     from .host import GatewayHost
 
     try:
@@ -96,20 +97,22 @@ def _launch(ctx: Any, home: Path, settings, *, host: Any = None, port: Optional[
     buffers = buffer.Buffers(plugin_id=getattr(ctx, "plugin_id", "platforms/werkbank"),
                              watermark=getattr(host, "row_watermark", None))
     mirror = bool(settings.mirror_to_telegram)
+    ablage = ansichten.Ablage(home)                                         # WB-1471
     try:
         srv = server.WerkbankServer(key, buffers, host, settings.port if port is None else port,
                                     mirror_enabled=lambda: mirror,
                                     mirror_name=getattr(settings, "mirror_name", ""),
                                     uploads=uploads.Uploads(home),            # WB-1174
                                     outbox=outbox.Outbox(home, werkstatt=medien.Werkstatt()),  # WB-1321
-                                    snapshots=_snapshot_root(home)).start()   # WB-1319
+                                    snapshots=_snapshot_root(home),           # WB-1319
+                                    ansichten=ablage).start()                 # WB-1471
     except OSError as exc:
         logger.warning("werkbank: cannot listen on 127.0.0.1:%s (%s)", settings.port, type(exc).__name__)
         return None
     logger.info("werkbank: listening on 127.0.0.1:%s (client_message_id=%s, interrupt=%s, mirror=%s)",
                 srv.port, getattr(host, "supports_client_message_id", None),
                 getattr(host, "supports_interrupt", None), mirror)
-    return Instance(srv, buffers, host, str(Path(home).resolve()))
+    return Instance(srv, buffers, host, str(Path(home).resolve()), ansichten=ablage)
 
 
 def _serve_host_from(inst: Instance, ctx: Any) -> None:
@@ -132,6 +135,10 @@ def attach(inst: Instance, ctx: Any) -> None:
 
     ctx.register_hook(HOOK, on_gateway_session_event)
     ctx.on_unload(functools.partial(release, inst, ctx))
+    # WB-1471: the tool `ansicht_zeigen` — only where this server runs, gated per session
+    from . import ansichten
+    if callable(getattr(ctx, "register_tool", None)):
+        ansichten.registriere(ctx)
 
 
 def release(inst: Instance, ctx: Any) -> None:

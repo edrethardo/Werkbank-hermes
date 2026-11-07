@@ -139,7 +139,7 @@ class WerkbankServer:
                  max_streams: int = MAX_STREAMS,
                  max_connections: int = MAX_CONNECTIONS, max_authenticated: int = MAX_AUTHENTICATED,
                  header_deadline: float = HEADER_DEADLINE_S, uploads: Any = None, outbox: Any = None,
-                 snapshots: Any = None) -> None:
+                 snapshots: Any = None, ansichten: Any = None) -> None:  # fork: WB-1471 ansichten
         if not key or any(c.isspace() for c in key):
             raise ValueError("unusable key")
         self._wanted = ("Bearer " + key).encode("utf-8")
@@ -158,6 +158,7 @@ class WerkbankServer:
         if outbox is not None and getattr(buffers, "outbox", None) is None:
             buffers.outbox = outbox
         self.snapshots = snapshots          # WB-1319: the context editor's snapshot folder, None = off
+        self.ansichten = ansichten          # WB-1471: ansichten.Ablage — chat views, attached sessions
         self.open_streams = 0
         self._streams_lock = threading.Lock()
         # WB-1321 Härtung: byte transfers of outbox files (originals, versions, HLS) have their own
@@ -356,7 +357,8 @@ def _handler(app: WerkbankServer):
             query = urllib.parse.parse_qs(split.query)
             parts = split.path.split("/")[1:]
             if split.path == "/v1/resolve":
-                return self._resolve((query.get("session_id") or [""])[0])
+                return self._resolve((query.get("session_id") or [""])[0],
+                                     (query.get("projekt") or [None])[0])     # WB-1471
             if split.path == "/v1/commands":             # WB-1256: the board's completion list
                 return self._json(200, {"commands": commands_mod.catalog()})
             if len(parts) >= 4 and parts[:2] == ["v1", "s"]:
@@ -375,6 +377,12 @@ def _handler(app: WerkbankServer):
                                 message["attachments"] = found
                     if app.outbox is not None:           # WB-1321: Hermes' files, tags out of the text
                         app.outbox.dress(key, body.get("messages") or [])
+                    if app.ansichten is not None:        # WB-1471: the views at their tool rows
+                        try:
+                            app.ansichten.einkleiden(key, body.setdefault("messages", []),
+                                                     snapshot._lineage(app.host, key, body.get("session_id")))
+                        except Exception:
+                            logger.warning("werkbank: chat views not added to the snapshot", exc_info=True)
                     return self._json(200, body)
                 if what == ["kurz"]:                 # WB-1388: the chat list's light read
                     body = snapshot.kurz(app.buffers, app.host, key, uploads=app.uploads, outbox=app.outbox)
@@ -470,7 +478,7 @@ def _handler(app: WerkbankServer):
                     self.wfile.write(chunk)
                     left -= len(chunk)
 
-        def _resolve(self, session_id: str):
+        def _resolve(self, session_id: str, projekt: Optional[str] = None):
             if not ID_RE.fullmatch(session_id or ""):
                 return self._refuse(400, "bad session_id", "Ungültige session_id.")
             try:
@@ -487,6 +495,11 @@ def _handler(app: WerkbankServer):
             if info is None:
                 return self._refuse(404, "unknown session", "Das Gateway kennt diese Sitzung nicht.")
             app.buffers.watch(info["session_key"], info.get("session_id"), info.get("platform"))
+            if app.ansichten is not None:        # WB-1471: the board attached it (+ its project folder)
+                try:
+                    app.ansichten.merke(info["session_key"], projekt)
+                except OSError:
+                    logger.warning("werkbank: attached session not remembered (disk)")
             self._json(200, {"session_key": info["session_key"], "session_id": info.get("session_id"),
                              "platform": info.get("platform"), "live": bool(info.get("live"))})
 
