@@ -109,6 +109,19 @@ def test_a_symlinked_directory_is_not_followed(projekt, box, tmp_path):  # noqa:
     assert box.for_refs(KEY_SESSION, ["ansicht"]) == []                # nothing was copied
 
 
+def test_a_swap_between_check_and_copy_is_caught(projekt, box, tmp_path, monkeypatch):  # noqa: F811
+    """The outbox opens the path again: a directory swapped for a symlink in between would copy
+    ANOTHER file — the copy's source key (real path, size, mtime) must be the checked file's."""
+    echt = box.ingest
+
+    def getauscht(session_key, media, refs):
+        return echt(session_key, [(str(tmp_path / "geheim" / "x.csv"), False)], refs)
+
+    monkeypatch.setattr(box, "ingest", getauscht)
+    assert fehler_von({"art": "tabelle", "quelle": "daten/tab.csv"}, aufl(projekt, box)) == [
+        "quelle: „tab.csv“ hat sich während der Prüfung geändert; noch einmal aufrufen"]
+
+
 def test_no_project_folder_no_project_files(box):  # noqa: F811
     fehler = fehler_von({"art": "tabelle", "quelle": "daten/tab.csv"}, aufl(None, box))
     assert fehler[0].startswith("quelle: „daten/tab.csv“ — diese Sitzung hat keinen Projektordner")
