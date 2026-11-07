@@ -25,11 +25,11 @@ from plugins.platforms.werkbank import ansichten, outbox as outbox_mod
 # -- the block contract ----------------------------------------------------------------------------
 def test_blocks_are_found_by_file_name():
     mods = ansichten.bausteine()
-    assert list(mods) == ["gruppe", "tabelle"]
+    assert list(mods) == ["gruppe", "modell3d", "tabelle"]
     for art, mod in mods.items():
         assert mod.ART == art and callable(mod.pruefen) and isinstance(mod.KURZ, str) and mod.KURZ
-    assert ansichten.arten(in_gruppe=True) == ["tabelle"]
-    assert ansichten.schema()["parameters"]["properties"]["art"]["enum"] == ["gruppe", "tabelle"]
+    assert ansichten.arten(in_gruppe=True) == ["tabelle"]                # modell3d: IN_GRUPPE = False
+    assert ansichten.schema()["parameters"]["properties"]["art"]["enum"] == ["gruppe", "modell3d", "tabelle"]
 
 
 def test_a_new_block_is_a_new_file_only(tmp_path, monkeypatch):
@@ -45,7 +45,7 @@ def test_a_new_block_is_a_new_file_only(tmp_path, monkeypatch):
     monkeypatch.setattr(ansichten, "__path__", list(ansichten.__path__) + [str(tmp_path)])
     monkeypatch.setattr(ansichten, "_BAUSTEINE", None)
     try:
-        assert list(ansichten.bausteine()) == ["gruppe", "probe", "tabelle"]     # kaputt: ART ≠ name
+        assert list(ansichten.bausteine()) == ["gruppe", "modell3d", "probe", "tabelle"]     # kaputt: ART ≠ name
         view, fehler = ansichten.pruefen({"art": "probe", "titel": "P", "daten": {"wert": 3}})
         assert fehler == [] and view == {"v": 1, "art": "probe", "titel": "P", "wert": 3}
         assert fehler_von({"art": "probe", "daten": {"wert": "x"}}) == ["daten.wert: erwartet Zahl, gefunden Text „x“"]
@@ -58,7 +58,7 @@ def test_a_new_block_is_a_new_file_only(tmp_path, monkeypatch):
 
 # -- the frame -------------------------------------------------------------------------------------
 def test_unknown_art_names_the_choices():
-    assert fehler_von({"art": "grafik"}) == ["art: erwartet gruppe oder tabelle, gefunden Text „grafik“"]
+    assert fehler_von({"art": "grafik"}) == ["art: erwartet gruppe oder modell3d oder tabelle, gefunden Text „grafik“"]
 
 
 def test_unknown_fields_are_refused_with_the_allowed_ones():
