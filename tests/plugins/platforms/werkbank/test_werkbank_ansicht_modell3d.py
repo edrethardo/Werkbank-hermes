@@ -79,6 +79,7 @@ def test_a_source_is_required_and_data_is_not_allowed(modelle, box):  # noqa: F8
 def test_other_file_types_are_refused_with_the_allowed_ones(modelle, box, pfad):  # noqa: F811
     fehler = fehler_von({"art": "modell3d", "quelle": pfad}, aufl(modelle, box))
     assert len(fehler) == 1 and fehler[0].startswith("quelle: ") and ".glb, .obj, .ply" in fehler[0]
+    assert not box._items                      # refused BEFORE a copy went into the outbox
 
 
 def test_a_gltf_with_outside_files_is_not_offered_only_glb(modelle, box):  # noqa: F811
