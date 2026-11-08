@@ -107,15 +107,18 @@ def test_only_in_the_project_chat_the_board_opened(chat):
     # a session the board attached READ-ONLY (no project folder) gets no tool either
     chat.ablage.merke("agent:main:telegram:dm:7:7", None)
     ohne = json.loads(rootfreigabe.ausfuehren({"befehl": "id", "begruendung": "x"}, inst=chat.inst,
-                                              session_key="agent:main:telegram:dm:7:7", reg=chat.reg))
-    assert ohne["ok"] is False and chat.reg.sitzung("agent:main:telegram:dm:7:7") == []
+                                              session_key="agent:main:telegram:dm:7:7", reg=chat.reg,
+                                              emit=chat.emit, takt=0.01, unterbrochen=lambda: True))
+    assert ohne["ok"] is False and "Projekt-Chat" in ohne["error"]
+    assert chat.reg.sitzung("agent:main:telegram:dm:7:7") == [] and chat.events == []
 
 
 def test_never_in_a_subagent_or_cron(chat, monkeypatch):
     for name in ("_delegiert", "_cron"):
         monkeypatch.setattr(rootfreigabe, name, lambda: True)
         out = json.loads(rootfreigabe.ausfuehren({"befehl": "id", "begruendung": "x"}, inst=chat.inst,
-                                                 session_key=KEY_SESSION, reg=chat.reg))
+                                                 session_key=KEY_SESSION, reg=chat.reg, emit=chat.emit,
+                                                 takt=0.01, unterbrochen=lambda: True))
         assert out["ok"] is False and "Subagenten" in out["error"]
         monkeypatch.setattr(rootfreigabe, name, lambda: False)
     assert chat.reg.sitzung(KEY_SESSION) == []
