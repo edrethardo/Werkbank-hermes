@@ -425,7 +425,7 @@ def test_a_started_plugin_holds_the_store_and_registers_the_tool(tmp_path):
     srv = plugin.start(ctx, tmp_path, settings, host=FakeHost(), port=0)
     try:
         assert srv is not None and isinstance(srv.ansichten, ansichten.Ablage)
-        assert seen == ["ansicht_zeigen"]
+        assert seen == ["ansicht_zeigen", "root_befehl_anfordern"]      # WB-1486: the root request too
         status, _ = call(srv.port, "GET", f"/v1/resolve?session_id={SID}&projekt={tmp_path}",
                          srv._wanted.decode()[len("Bearer "):])
         assert status == 200 and srv.ansichten.projekt(KEY_SESSION) == str(tmp_path)

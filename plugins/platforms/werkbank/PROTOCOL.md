@@ -312,6 +312,34 @@ script from the agent; every interaction stays in the browser.
 * `GET /v1/s/{key}/ansicht/{id}` (same auth): `{ansicht}` — one stored view of THIS session (the
   board's „nachladen“); 400 bad id, 404 unknown.
 
+## Root requests (WB-1486, `rootfreigabe.py`, tool `root_befehl_anfordern`)
+
+The agent asks the owner to run ONE shell command as root; the BOARD runs it (sudo with the owner's
+password, typed into the card). This side never sees a password and runs nothing.
+
+* Tool `root_befehl_anfordern({befehl, begruendung})`, toolset `werkbank`. `check_fn` and handler:
+  only a session the board attached WITH its project folder (the admin chat; a read-only session
+  never), never in a `delegate_task` child (fail closed), never in a cron run. One open request per
+  session. `befehl` ≤ 8000 characters, no control characters but newline and tab.
+* Request `{antrag_id: rb_<24 hex>, befehl, sha256, begruendung, projekt, erstellt, frist (= erstellt +
+  900 s), status, fehlversuche, max_fehlversuche: 3, tool_call_id, ergebnis?}`, held in this process
+  only. Events (id = `antrag_id`, payload = that object): `root.request` (open; again after a wrong
+  password), `root.running`, `root.resolved` (`ausgefuehrt` with `ergebnis {exit_code, ausgabe,
+  dauer_s, abgeschnitten, zeitlimit}`, `abgelehnt`, `gesperrt`), `root.expired` (`abgelaufen`,
+  `abgebrochen`).
+* The tool waits like clarify (1 s slices, activity heartbeat, `/stop` cancels an open request) up to
+  `frist`, after `start` up to 35 minutes more. Answer: `{ok: true, exit_code, dauer_s, ausgabe,
+  hinweis[, abgeschnitten, zeitlimit]}` — every output line quoted with `| ` (data, never a line of
+  its own) — or `{ok: false, status, error}`.
+* `GET /v1/s/{key}/root/{id}` — the request of THIS session (404 otherwise).
+* `POST /v1/s/{key}/root/{id} {aktion}` — the board's report, decided under one lock, once:
+  `start {sha256}` (only while open, before `frist`, sha256 equal — else 409), `ablehnen` (only while
+  open), then only while running: `fehlversuch {fehlversuche: 1|2}` (open again), `gesperrt`,
+  `ergebnis {exit_code, ausgabe ≤ 70 000 chars, dauer_s, abgeschnitten?, zeitlimit?}`. Every later
+  report: 409.
+* Snapshot: `pending_root` = every request of the session this process holds (open ones and the
+  last 20 results, 24 h); `kurz`: `pending_root` = number of open ones.
+
 ## Files Hermes sends (WB-1321, `outbox.py`, `medien.py`)
 
 Why: this plugin has no messaging adapter. The gateway hands a reply's `MEDIA:<path>` files only to

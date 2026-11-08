@@ -139,6 +139,8 @@ def attach(inst: Instance, ctx: Any) -> None:
     from . import ansichten
     if callable(getattr(ctx, "register_tool", None)):
         ansichten.registriere(ctx)
+        from . import rootfreigabe      # WB-1486: `root_befehl_anfordern`, the project chat only
+        rootfreigabe.registriere(ctx)
 
 
 def release(inst: Instance, ctx: Any) -> None:

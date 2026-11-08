@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Optional
 
 from . import approvals, kontext, snapshot
 from . import ansichten as ansichten_mod  # fork: WB-1471 (GET …/ansicht/{id})
+from . import rootfreigabe as rootfreigabe_mod  # fork: WB-1486 (…/root/{id})
 from . import commands as commands_mod
 from . import mirror as mirror_mod
 from . import outbox as outbox_mod
@@ -384,12 +385,19 @@ def _handler(app: WerkbankServer):
                                                      snapshot._lineage(app.host, key, body.get("session_id")))
                         except Exception:
                             logger.warning("werkbank: chat views not added to the snapshot", exc_info=True)
+                    body["pending_root"] = rootfreigabe_mod.register().sitzung(key)   # fork: WB-1486
                     return self._json(200, body)
                 if what == ["kurz"]:                 # WB-1388: the chat list's light read
                     body = snapshot.kurz(app.buffers, app.host, key, uploads=app.uploads, outbox=app.outbox)
                     if body is None:
                         return self._refuse(404, "unknown session", "Diese Sitzung ist nicht (mehr) aufgelöst.")
+                    body["pending_root"] = rootfreigabe_mod.register().offen_zahl(key)   # fork: WB-1486
                     return self._json(200, body)
+                if len(what) == 2 and what[0] == "root":         # fork: WB-1486: one root request
+                    antrag = rootfreigabe_mod.register().get(key, urllib.parse.unquote(what[1]))
+                    if antrag is None:
+                        return self._refuse(404, "unknown request", "Diesen Root-Antrag gibt es in dieser Sitzung nicht (mehr).")
+                    return self._json(200, antrag.oeffentlich())
                 if what == ["events"]:
                     return self._events(key, query)
                 if len(what) == 3 and what[0] == "tools" and what[2] == "output":
@@ -720,6 +728,11 @@ def _handler(app: WerkbankServer):
                     return self._context_compress(key, body)
             if len(what) == 2 and what[0] in ("approvals", "clarify"):
                 return self._answer(key, what[0], urllib.parse.unquote(what[1]), body)
+            if len(what) == 2 and what[0] == "root":        # fork: WB-1486: the board's report
+                status, payload = rootfreigabe_mod.register().antworten(
+                    key, urllib.parse.unquote(what[1]), body, rootfreigabe_mod._core_emit(app))
+                logger.info("werkbank: root request report from the board (status=%s)", status)
+                return self._json(status, payload)
             if len(what) == 2 and what[0] == "choices":    # WB-1256: a card a command opened
                 status, payload = commands_mod.answer_choice(key, urllib.parse.unquote(what[1]), body)
                 if status == 200:
