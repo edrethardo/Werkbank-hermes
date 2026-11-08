@@ -320,7 +320,11 @@ password, typed into the card). This side never sees a password and runs nothing
 * Tool `root_befehl_anfordern({befehl, begruendung})`, toolset `werkbank`. `check_fn` and handler:
   only a session the board attached WITH its project folder (the admin chat; a read-only session
   never), never in a `delegate_task` child (fail closed), never in a cron run. One open request per
-  session. `befehl` ≤ 8000 characters, no control characters but newline and tab.
+  session. `befehl` ≤ 8000 characters. Trojan Source: `befehl` and `begruendung` are REFUSED (never
+  cleaned) when they contain a character of category Cc (C0, DEL, C1 `\x80`–`\x9f`, U+0085) other
+  than tab and newline, Cf (U+061C, U+200B–U+200F, U+202A–U+202E, U+2060–U+2069, U+FEFF, U+00AD …),
+  Zl/Zp (U+2028, U+2029) or Cs; the error names the code points. Multi-line commands stay allowed
+  (the card numbers every line and marks non-ASCII characters with their code points).
 * Request `{antrag_id: rb_<24 hex>, befehl, sha256, begruendung, projekt, erstellt, frist (= erstellt +
   900 s), status, fehlversuche, max_fehlversuche: 3, tool_call_id, ergebnis?}`, held in this process
   only. Events (id = `antrag_id`, payload = that object): `root.request` (open; again after a wrong
@@ -333,10 +337,17 @@ password, typed into the card). This side never sees a password and runs nothing
   its own) — or `{ok: false, status, error}`.
 * `GET /v1/s/{key}/root/{id}` — the request of THIS session (404 otherwise).
 * `POST /v1/s/{key}/root/{id} {aktion}` — the board's report, decided under one lock, once:
-  `start {sha256}` (only while open, before `frist`, sha256 equal — else 409), `ablehnen` (only while
-  open), then only while running: `fehlversuch {fehlversuche: 1|2}` (open again), `gesperrt`,
-  `ergebnis {exit_code, ausgabe ≤ 70 000 chars, dauer_s, abgeschnitten?, zeitlimit?}`. Every later
-  report: 409.
+  `start {sha256}` (only while open, before `frist`, sha256 equal — else 409) answers `{ok, status,
+  melde_token}`: a fresh random token, only in this answer (Hermes keeps its sha256, never in a card,
+  event or snapshot). `ablehnen` (only while open, nothing ran, no token). Then only while running and
+  only with `melde_token` of that start (else 403): `fehlversuch` (Hermes counts itself — a board
+  number is ignored —, open again, locked at 3), `gesperrt`, `ergebnis {exit_code, ausgabe ≤ 70 000
+  chars, dauer_s, abgeschnitten?, zeitlimit?}`; the token is spent with its report. The agent's
+  answer to a token-bearing report says `gemeldet: "vom Board gemeldet"`. Every later report: 409.
+* The board runs the command as `timeout -k 10 <limit> /bin/sh -c <befehl> </dev/null` under sudo
+  (the time limit is enforced on the root side; stdin is empty, so the command never reads the
+  password). Background processes the command starts itself (`&`, `nohup`, `setsid`) outlive the
+  limit — the card says so.
 * Snapshot: `pending_root` = every request of the session this process holds (open ones and the
   last 20 results, 24 h); `kurz`: `pending_root` = number of open ones.
 

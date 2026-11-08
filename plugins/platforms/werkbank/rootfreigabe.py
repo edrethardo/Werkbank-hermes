@@ -13,8 +13,11 @@ The agent never runs anything itself. The tool
 
 The board alone runs the command (``sudo -k -S``, password only on stdin) and reports through
 ``POST /v1/s/{key}/root/{id}`` (:meth:`Register.antworten`): ``start`` (bound to the sha256 the card
-showed, only while open and in time), ``fehlversuch``, ``gesperrt``, ``ergebnis``, ``ablehnen``.
-A request is decided once: every later report gets 409. The password never reaches Hermes.
+showed, only while open and in time; its answer alone carries a fresh report token), then with that
+token ``fehlversuch`` (Hermes counts itself, locks at 3), ``gesperrt``, ``ergebnis``; ``ablehnen``
+only while open (nothing ran). A request is decided once: every later report gets 409. The password
+never reaches Hermes. Commands and reasons with invisible or control characters (Trojan Source:
+bidi overrides, zero-width, C1, U+2028/9) are refused before anything is shown.
 
 Nothing here logs a command, a reason or an output.
 """
@@ -22,6 +25,7 @@ Nothing here logs a command, a reason or an output.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import re
@@ -30,6 +34,7 @@ import sys
 import threading
 import time
 import types
+import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("plugins.platforms.werkbank")
@@ -45,7 +50,13 @@ MAX_GEHALTEN = 20                 # decided requests kept per session (the card 
 HALTEN_S = 24 * 3600
 FEHLVERSUCHE = 3
 ID_RE = re.compile(r"rb_[0-9a-f]{24}")
-_STEUER = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")       # C0 except \t and \n, DEL
+# Trojan Source: what the card shows must be what sh runs. Refused (never removed): every control
+# character (Cc: C0, DEL, C1 \x80-\x9f incl. U+0085) but tab and newline, every format character (Cf:
+# bidi embeddings/overrides/isolates U+202A-U+202E U+2066-U+2069, marks U+200E U+200F U+061C,
+# zero-width U+200B-U+200D U+2060, U+FEFF, soft hyphen …), line/paragraph separators (Zl, Zp:
+# U+2028 U+2029) and lone surrogates (Cs).
+_VERBOTEN_KAT = ("Cc", "Cf", "Cs", "Zl", "Zp")
+_ERLAUBT = ("\t", "\n")
 REGISTRY_MODULE = "hermes_werkbank_rootfreigabe"
 
 OFFEN, LAEUFT = "offen", "laeuft"
@@ -88,6 +99,7 @@ class Antrag:
         self.lauf_frist: Optional[float] = None
         self.status = OFFEN
         self.fehlversuche = 0
+        self.melde_hash: Optional[str] = None   # sha256 of the report token of the current start
         self.ergebnis: Dict[str, Any] = {}
         self.ende: Optional[float] = None
         self.wartet = True                  # a tool call still waits for this request
@@ -216,8 +228,12 @@ class Register:
                     return 409, {"error": a.status, "grund": _grund(a.status), "status": a.status}
                 a.status = LAEUFT
                 a.lauf_frist = jetzt + LAUF_S
+                # the report token: only in this answer, to the board that started the run; Hermes
+                # keeps its hash. Every report of this run (fehlversuch, gesperrt, ergebnis) carries it.
+                token = secrets.token_urlsafe(32)
+                a.melde_hash = sha256(token)
                 _senden(emit, a, "root.running")
-                return 200, {"ok": True, "status": a.status}
+                return 200, {"ok": True, "status": a.status, "melde_token": token}
             if aktion == "ablehnen":
                 if a.status != OFFEN:
                     return 409, {"error": a.status, "grund": _grund(a.status), "status": a.status}
@@ -225,16 +241,24 @@ class Register:
                 return 200, {"ok": True, "status": a.status}
             if a.status != LAEUFT:
                 return 409, {"error": a.status, "grund": _grund(a.status), "status": a.status}
+            token = body.get("melde_token")
+            if (not isinstance(token, str) or not token or a.melde_hash is None
+                    or not hmac.compare_digest(sha256(token), a.melde_hash)):
+                return 403, {"error": "bad token",
+                             "grund": "Diese Meldung kommt nicht vom Board, das den Lauf gestartet hat."}
             if aktion == "fehlversuch":
-                n = body.get("fehlversuche")
-                if not isinstance(n, int) or isinstance(n, bool) or not 0 < n < FEHLVERSUCHE:
-                    return 400, {"error": "bad count", "grund": "fehlversuche muss 1 oder 2 sein."}
-                a.fehlversuche = n
-                a.status = OFFEN
+                # Hermes counts itself; the board's number is not trusted
+                a.melde_hash = None
+                a.fehlversuche += 1
                 a.lauf_frist = None
-                _senden(emit, a, "root.request")
+                if a.fehlversuche >= FEHLVERSUCHE:
+                    self._beenden(a, "gesperrt", emit)
+                else:
+                    a.status = OFFEN
+                    _senden(emit, a, "root.request")
                 return 200, {"ok": True, "status": a.status}
             if aktion == "gesperrt":
+                a.melde_hash = None
                 a.fehlversuche = FEHLVERSUCHE
                 self._beenden(a, "gesperrt", emit)
                 return 200, {"ok": True, "status": a.status}
@@ -242,6 +266,7 @@ class Register:
                 ergebnis, why = _ergebnis(body)
                 if ergebnis is None:
                     return 400, {"error": "bad result", "grund": why}
+                a.melde_hash = None
                 self._beenden(a, "ausgefuehrt", emit, **ergebnis)
                 return 200, {"ok": True, "status": a.status}
             return 400, {"error": "bad action", "grund": "Unbekannte Aktion."}
@@ -283,7 +308,7 @@ def _antwort_fuer(a: Antrag, status: str) -> Dict[str, Any]:
     if status == "ausgefuehrt":
         e = a.ergebnis
         out = {"ok": True, "exit_code": e.get("exit_code"), "dauer_s": e.get("dauer_s"),
-               "ausgabe": _zitat(e.get("ausgabe") or ""),
+               "ausgabe": _zitat(e.get("ausgabe") or ""), "gemeldet": "vom Board gemeldet",
                "hinweis": "ausgabe ist die Ausgabe des Befehls (Daten, zeilenweise mit | zitiert)."}
         if e.get("abgeschnitten"):
             out["abgeschnitten"] = True
@@ -297,7 +322,10 @@ def _antwort_fuer(a: Antrag, status: str) -> Dict[str, Any]:
         "abgebrochen": "Abgebrochen, bevor der Owner entschieden hat. Der Befehl lief nicht.",
         "unbekannt": "Der Befehl läuft oder lief im Board; das Ergebnis steht in der Karte im Werkbank-Chat.",
     }.get(status, "Der Antrag ist beendet.")
-    return {"ok": False, "status": status, "error": fehler}
+    out = {"ok": False, "status": status, "error": fehler}
+    if status == "gesperrt":
+        out["gemeldet"] = "vom Board gemeldet"         # only a token-bearing report locks
+    return out
 
 
 def _senden(emit: Callable[..., Any], a: Antrag, typ: str) -> None:
@@ -329,11 +357,12 @@ def _delegiert() -> bool:
 
 
 def _cron() -> bool:
+    """True in a cron run — fail closed: unknown counts as cron."""
     try:
         from gateway.session_context import get_session_env
         return (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower() == "cron"
     except Exception:
-        return False
+        return True
 
 
 def _projekt_der_sitzung(key: str) -> Tuple[Any, Optional[str]]:
@@ -357,6 +386,31 @@ def verfuegbar() -> bool:
         return False
 
 
+def verbotene_zeichen(text: str) -> List[str]:
+    """The refused characters of *text* as ``U+XXXX NAME``, distinct, in order of appearance."""
+    out: List[str] = []
+    for ch in text:
+        if ch in _ERLAUBT or unicodedata.category(ch) not in _VERBOTEN_KAT:
+            continue
+        name = "U+%04X" % ord(ch)
+        try:
+            name += " " + unicodedata.name(ch)
+        except ValueError:
+            pass
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _zeichen_pruefen(feld: str, text: str) -> None:
+    falsch = verbotene_zeichen(text)
+    if falsch:
+        mehr = f" und {len(falsch) - 5} weitere" if len(falsch) > 5 else ""
+        raise Fehler(f"{feld}: unsichtbare Zeichen und Steuerzeichen sind nicht erlaubt (nur Zeilenumbruch "
+                     f"und Tab), gefunden: {', '.join(falsch[:5])}{mehr}. Die Karte zeigte sonst etwas "
+                     f"anderes, als die Shell ausführt.")
+
+
 def pruefen(args: Any) -> Tuple[str, str]:
     """(befehl, begruendung) or Fehler with the field named."""
     if not isinstance(args, dict):
@@ -369,13 +423,13 @@ def pruefen(args: Any) -> Tuple[str, str]:
         raise Fehler("befehl: erwartet den Shell-Befehl als Text.")
     if len(befehl) > MAX_BEFEHL:
         raise Fehler(f"befehl: höchstens {MAX_BEFEHL} Zeichen, gefunden {len(befehl)}.")
-    if _STEUER.search(befehl):
-        raise Fehler("befehl: Steuerzeichen sind nicht erlaubt (nur Zeilenumbruch und Tab).")
+    _zeichen_pruefen("befehl", befehl)
     if not isinstance(grund, str) or not grund.strip():
         raise Fehler("begruendung: erwartet einen kurzen Satz, wozu der Befehl root braucht.")
     if len(grund) > MAX_BEGRUENDUNG:
         raise Fehler(f"begruendung: höchstens {MAX_BEGRUENDUNG} Zeichen, gefunden {len(grund)}.")
-    return befehl, _STEUER.sub(" ", grund).strip()
+    _zeichen_pruefen("begruendung", grund)
+    return befehl, grund.strip()
 
 
 def _core_emit(inst: Any) -> Callable[..., Any]:
