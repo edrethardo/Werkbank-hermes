@@ -9,7 +9,7 @@ Pflicht:
 | Name | Typ | Bedeutung |
 |---|---|---|
 | `ART` | `str` | = Dateiname ohne `.py`; der Wert von `art` im Aufruf |
-| `KURZ` | `str` | ein Satz für die Werkzeugbeschreibung (Schritte 2–5: je ≤ 20 Tokens — heute ≈ 211 von 300; alle zusammen ≤ 300, Test `test_the_description_is_short`) |
+| `KURZ` | `str` | ein Satz für die Werkzeugbeschreibung (Schritte 2–5: je ≤ 20 Tokens; alle sechs zusammen knapp unter 300, darum ohne `art=`-Vorsatz; Test `test_the_description_is_short`) |
 | `pruefen(args, feld, k) -> dict` | Funktion | prüft `args` (`{art, titel?, daten?, quelle?, optionen?}`), gibt die Felder der geprüften Ansicht zurück (ohne `v`, `id`, `art`, `titel` — die setzt der Rahmen) |
 
 Optional: `IN_GRUPPE = True` (Standard; `False` = darf nicht in einem Tab einer `gruppe` stehen).

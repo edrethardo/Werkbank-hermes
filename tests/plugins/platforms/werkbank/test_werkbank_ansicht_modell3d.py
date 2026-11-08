@@ -100,7 +100,8 @@ def test_not_inside_a_group_and_in_the_tool_description(modelle, box):  # noqa: 
     assert "modell3d" in ansichten.arten() and "modell3d" not in ansichten.arten(in_gruppe=True)
     fehler = fehler_von({"art": "gruppe", "daten": {"tabs": [
         {"titel": "m", "ansicht": {"art": "modell3d", "quelle": "modelle/stuhl.glb"}}]}}, aufl(modelle, box))
-    assert fehler == ["daten.tabs[0].ansicht.art: in einer gruppe stehen nur Bausteine (tabelle), keine modell3d"]
+    im_tab = ", ".join(ansichten.arten(in_gruppe=True))
+    assert fehler == [f"daten.tabs[0].ansicht.art: in einer gruppe stehen nur Bausteine ({im_tab}), keine modell3d"]
     assert "modell3d" in ansichten.beschreibung()
 
 

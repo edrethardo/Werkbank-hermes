@@ -41,13 +41,14 @@ def aufruf(*streams, **extra):
 
 
 def test_the_block_is_found_but_stays_out_of_a_group():
-    # the board's gruppe lists its blocks itself; a hidden WebGPU player in a tab would also run for nothing
+    # WB-1471 Review: IN_GRUPPE = False on purpose — a hidden tab keeps the WebGPU player running
     assert "faltwerk" in ansichten.arten()
     assert "faltwerk" not in ansichten.arten(in_gruppe=True)
     assert ansichten.bausteine()["faltwerk"].KURZ.startswith("faltwerk")
     inner = aufruf(stream())
     fehler = fehler_von({"art": "gruppe", "daten": {"tabs": [{"titel": "a", "ansicht": inner}]}})
-    assert fehler == ["daten.tabs[0].ansicht.art: in einer gruppe stehen nur Bausteine (tabelle), keine faltwerk"]
+    im_tab = ", ".join(ansichten.arten(in_gruppe=True))
+    assert fehler == [f"daten.tabs[0].ansicht.art: in einer gruppe stehen nur Bausteine ({im_tab}), keine faltwerk"]
 
 
 def test_a_stream_resolves_to_chat_files(szene, box):

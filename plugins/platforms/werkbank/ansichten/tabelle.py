@@ -17,7 +17,7 @@ from . import Fehler, Kontext, MAX_QUELLE, erwartet, iso_datum, link, nur_felder
 
 ART = "tabelle"
 IN_GRUPPE = True
-KURZ = ("art=tabelle: daten={spalten:[{id,titel?,typ?}], zeilen:[[...]] oder [{id:wert}]}, "
+KURZ = ("tabelle: daten={spalten:[{id,titel?,typ?}], zeilen:[[...]] oder [{id:wert}]}, "
         "typ text|zahl|datum|link|status|bild; link: http(s)-URL oder {text,url}; statt zeilen "
         "quelle (CSV/JSON); optionen={sortiere:{spalte,absteigend?}, ausgeblendet:[id]}; ≤ 500 Zeilen.")
 

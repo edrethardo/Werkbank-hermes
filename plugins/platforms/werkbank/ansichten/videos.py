@@ -14,7 +14,7 @@ from . import Fehler, Kontext, erwartet, nur_felder, titel
 
 ART = "videos"
 IN_GRUPPE = True
-KURZ = "art=videos: daten={videos:[{quelle,titel?}]} 1–9; optionen={vergleich?:true bei 2, synchron?, schleife?}."
+KURZ = "videos: daten={videos:[{quelle,titel?}]} 1–9; optionen={vergleich?:true bei 2, synchron?, schleife?}."
 
 MAX_VIDEOS = 9
 ENDUNGEN = (".mp4", ".m4v", ".mov", ".webm")

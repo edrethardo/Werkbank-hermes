@@ -11,7 +11,7 @@ from . import Fehler, Kontext, erwartet, nur_felder, titel
 
 ART = "gruppe"
 IN_GRUPPE = False
-KURZ = "art=gruppe: daten={tabs:[{titel, ansicht:{art,...}}]}, höchstens 8 Tabs, keine gruppe in einer gruppe."
+KURZ = "gruppe: daten={tabs:[{titel,ansicht:{art,…}}]} ≤ 8, keine gruppe darin."
 
 MAX_TABS = 8
 

@@ -17,7 +17,7 @@ from . import Fehler, Kontext, OUTBOX_RE, UPLOAD_RE, erwartet, nur_felder
 
 ART = "modell3d"
 IN_GRUPPE = False
-KURZ = "art=modell3d: quelle=Datei .glb/.obj/.ply (auch Punktwolke); optionen={hintergrund,licht,punktgroesse,drehen}."
+KURZ = "modell3d: quelle=.glb/.obj/.ply (auch Punktwolke); optionen={hintergrund,licht,punktgroesse,drehen}."
 
 FORMATE = {".glb": "glb", ".obj": "obj", ".ply": "ply"}
 HINTERGRUENDE = ("dunkel", "hell", "grau")

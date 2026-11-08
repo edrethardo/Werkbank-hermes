@@ -75,8 +75,8 @@ BILD_ENDUNGEN = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 DATEN_ENDUNGEN = {".csv": "csv", ".json": "json"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
-BESCHREIBUNG_ANFANG = ("Zeigt eine interaktive Ansicht in deiner Antwort im Werkbank-Chat (Handy und PC); "
-                       "die Bedienung bleibt im Browser.")
+BESCHREIBUNG_ANFANG = ("Zeigt eine interaktive Ansicht in deiner Antwort im Werkbank-Chat; "
+                       "die Bedienung bleibt im Browser. art=…:")
 BESCHREIBUNG_ENDE = ("Verweise (quelle, Bilder): Chat-Datei fx_.../up_..., Artefakt /api/project-outbox/... "
                      "oder Pfad im Projektordner. Höchstens 200 KB. Antwort {ok,id}; ein Fehler nennt Feld, "
                      "erwartet und gefunden.")

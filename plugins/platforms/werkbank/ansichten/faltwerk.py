@@ -15,7 +15,8 @@ from typing import Any, Dict, List, Optional
 from . import Fehler, Kontext, erwartet, nur_felder, titel
 
 ART = "faltwerk"
-IN_GRUPPE = False       # the board's gruppe lists its blocks by name; a player in a hidden tab would run for nothing
+IN_GRUPPE = False       # WB-1471 Review neu entschieden: nicht im Tab — die gruppe versteckt Tabs nur (der
+                        # WebGPU-Player liefe weiter, bis 128 MB Abschnitte je Tab), ohne GPU nicht prüfbar
 KURZ = "faltwerk: daten={streams:[{titel?,szene,abschnitte}]} ≤ 4."
 
 MAX_STREAMS = 4
