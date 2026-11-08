@@ -288,14 +288,17 @@ script from the agent; every interaction stays in the browser.
   {sortiere: {spalte, absteigend?}, ausgeblendet: [id]}`. `gruppe` — `daten: {tabs: [{titel, ansicht}]}`,
   a tab holds a block, never a group.
 * Limits: the call ≤ 200 KB as JSON, ≤ 500 rows, ≤ 50 columns, ≤ 8 tabs, a text cell ≤ 2000
-  characters, ≤ 50 distinct images, a data file the plugin reads ≤ 2 MB. Links only `http(s)://`.
+  characters, ≤ 50 distinct images, a data file the plugin reads ≤ 2 MB, an image from the project
+  folder ≤ 10 MB and all of them ≤ 50 MB per view (both from `st_size` before the copy), the checked
+  view as stored ≤ 512 KB. Links only `http(s)://`.
 * References (`quelle`, `bild` cells) resolve only to `fx_…` (a file of THIS session's outbox), `up_…`
   (an attachment of THIS session), `/api/project-outbox/<projekt>/<name>` (a board artefact, full URL
   allowed; the board's owner route answers for it) or a path in the session's project folder (from
   `resolve?projekt=`): opened component by component with `O_NOFOLLOW` below the folder (no `..`,
-  no symlink anywhere on the way, a regular file), then COPIED into the outbox (ref `ansicht`, never
-  an attachment of an answer) and checked to be that same file (source key of real path, size,
-  mtime). The browser fetches every file over the board's existing protected file routes.
+  no symlink anywhere on the way, a regular file), then COPIED into the outbox FROM THAT OPEN
+  DESCRIPTOR (`Outbox.ingest_fd`, ref `ansicht`, never an attachment of an answer) and checked to be
+  that same file (source key of real path, size, mtime; a wrong new copy is removed again). The board
+  names `projekt` only for a writing (admin) target. The browser fetches every file over the board's existing protected file routes.
 * Errors: `{"error": "Ansicht nicht gezeigt. <feld>: erwartet <x>, gefunden <y>; … Korrigiere die
   Felder und rufe ansicht_zeigen erneut auf.", "fehler": [≤ 5]}` — nothing is stored or sent.
 * Valid: the view (`{v: 1, id, art, titel, …}`, references replaced by `{datei|anhang|artefakt, name,
@@ -304,6 +307,10 @@ script from the agent; every interaction stays in the browser.
 * Snapshot: a tool row of `ansicht_zeigen` whose answer is `{ok: true, id}` gets `ansicht` (the stored
   view) — the board draws it right after that tool row in its answer. A view of this process whose
   rows are not written yet is placed by its row mark as a `role: tool` item with `from_buffer: true`.
+  Byte budget: views newest first up to 4 MB per snapshot; every older one only as
+  `{id, art, titel, nachladen: true}`.
+* `GET /v1/s/{key}/ansicht/{id}` (same auth): `{ansicht}` — one stored view of THIS session (the
+  board's „nachladen“); 400 bad id, 404 unknown.
 
 ## Files Hermes sends (WB-1321, `outbox.py`, `medien.py`)
 

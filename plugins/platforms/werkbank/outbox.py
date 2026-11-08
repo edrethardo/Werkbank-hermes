@@ -395,39 +395,69 @@ class Outbox:
         if fd is None:                                  # FIFO, device, directory: nothing to send
             return None, False
         with os.fdopen(fd, "rb") as source:
-            real = self._fd_path(source.fileno())
-            # a directory symlink swapped after the gateway's check: the descriptor's REAL path
-            # must pass the same delivery check again (denylist: ~/.ssh, ~/.hermes/.env, /etc …)
-            if not real or not _deliverable(real, session_key):
-                logger.info("werkbank: outbox source refused after open (delivery policy)")
-                return None, False
-            st = os.fstat(source.fileno())
-            src_key = hashlib.sha256(f"{real}\0{st.st_size}\0{st.st_mtime_ns}".encode()).hexdigest()
-            with self._lock:
-                self._load(digest)
-                same = next((m for m in self._items.values()
-                             if m.get("digest") == digest and m.get("src") == src_key), None)
-                if same is not None:
-                    self._add_refs(same, refs)
-                    return self.public(same), False
-            head = source.read(4096)
-            kind, media_type, download_only = sniff(head, name)
-            shown = uploads_mod.clean_name(name, _ext(name))
-            if st.st_size > self.max_file:
-                return {"id": None, "name": shown, "size": st.st_size, "kind": kind, "type": media_type,
-                        "fassungen": {}, "fehlt": "zu_gross", "grenze": self.max_file}, False
-            fid = "fx_" + secrets.token_hex(16)
-            folder = self._folder(digest, fid)
-            try:
-                _secure_dir(self.root)
-                _secure_dir(self.root / digest)
-                folder.mkdir(mode=0o700)
-                size = self._copy(source, head, folder / "original")
-            except (OSError, ValueError) as exc:
-                logger.info("werkbank: outbox copy failed (%s)", type(exc).__name__)
-                return {"id": None, "name": shown, "size": st.st_size, "kind": kind, "type": media_type,
-                        "fassungen": {}, "fehlt": "zu_gross" if isinstance(exc, ValueError) else "nicht_lesbar",
-                        "grenze": self.max_file}, False
+            return self._ingest_open(session_key, digest, source, name, is_voice, refs, order)
+
+    def ingest_fd(self, session_key: str, fd: int, name: str, refs: Iterable[Any]) -> Optional[Dict[str, Any]]:
+        """WB-1471 Review (fork): copy from a descriptor the CALLER opened and checked (a chat
+        view's project file) — the bytes are exactly the checked file's, no second open by path.
+        *fd* stays the caller's (a dup is read). Same delivery check, size limit and dedup as
+        :meth:`ingest`. Returns the public entry (``id`` None + ``fehlt`` on failure) or None."""
+        refs = [str(r) for r in refs if isinstance(r, (str, int)) and not isinstance(r, bool) and str(r)]
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(os.dup(fd), "rb") as source:
+            source.seek(0)
+            entry, new = self._ingest_open(session_key, _digest(session_key), source, os.path.basename(name),
+                                           False, refs, 0)
+        if new:
+            self.prune()
+        return {**entry, "neu": new} if entry is not None else None
+
+    def entfernen(self, session_key: str, fid: str) -> bool:
+        """WB-1471 Review (fork): take back ONE entry of this session (a copy that turned out wrong)."""
+        digest = _digest(session_key)
+        with self._lock:
+            self._load(digest)
+            meta = self._items.get(fid)
+            if meta is None or meta.get("digest") != digest:
+                return False
+            self._remove(meta)
+        return True
+
+    def _ingest_open(self, session_key, digest, source, name, is_voice, refs, order) -> Tuple[Optional[Dict[str, Any]], bool]:
+        real = self._fd_path(source.fileno())
+        # a directory symlink swapped after the gateway's check: the descriptor's REAL path
+        # must pass the same delivery check again (denylist: ~/.ssh, ~/.hermes/.env, /etc …)
+        if not real or not _deliverable(real, session_key):
+            logger.info("werkbank: outbox source refused after open (delivery policy)")
+            return None, False
+        st = os.fstat(source.fileno())
+        src_key = hashlib.sha256(f"{real}\0{st.st_size}\0{st.st_mtime_ns}".encode()).hexdigest()
+        with self._lock:
+            self._load(digest)
+            same = next((m for m in self._items.values()
+                         if m.get("digest") == digest and m.get("src") == src_key), None)
+            if same is not None:
+                self._add_refs(same, refs)
+                return self.public(same), False
+        head = source.read(4096)
+        kind, media_type, download_only = sniff(head, name)
+        shown = uploads_mod.clean_name(name, _ext(name))
+        if st.st_size > self.max_file:
+            return {"id": None, "name": shown, "size": st.st_size, "kind": kind, "type": media_type,
+                    "fassungen": {}, "fehlt": "zu_gross", "grenze": self.max_file}, False
+        fid = "fx_" + secrets.token_hex(16)
+        folder = self._folder(digest, fid)
+        try:
+            _secure_dir(self.root)
+            _secure_dir(self.root / digest)
+            folder.mkdir(mode=0o700)
+            size = self._copy(source, head, folder / "original")
+        except (OSError, ValueError) as exc:
+            logger.info("werkbank: outbox copy failed (%s)", type(exc).__name__)
+            return {"id": None, "name": shown, "size": st.st_size, "kind": kind, "type": media_type,
+                    "fassungen": {}, "fehlt": "zu_gross" if isinstance(exc, ValueError) else "nicht_lesbar",
+                    "grenze": self.max_file}, False
         meta = {"id": fid, "digest": digest, "src": src_key, "name": shown, "type": media_type, "size": size,
                 "kind": kind, "nur_download": download_only, "voice": bool(is_voice and kind == AUDIO) or None,
                 "abspielbar": kind in (BILD, AUDIO) or (kind == VIDEO and media_type == "video/mp4"),

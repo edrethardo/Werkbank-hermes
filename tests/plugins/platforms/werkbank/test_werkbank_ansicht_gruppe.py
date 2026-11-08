@@ -29,7 +29,8 @@ def test_at_most_8_tabs():
 def test_a_group_holds_blocks_never_a_group():
     inner = {"art": "gruppe", "daten": {"tabs": [{"titel": "x", "ansicht": tabelle()}]}}
     fehler = fehler_von({"art": "gruppe", "daten": {"tabs": [{"titel": "a", "ansicht": inner}]}})
-    assert fehler == ["daten.tabs[0].ansicht.art: in einer gruppe stehen nur Bausteine (tabelle), keine gruppe"]
+    im_tab = ", ".join(ansichten.arten(in_gruppe=True))            # derived: every block that allows it
+    assert fehler == [f"daten.tabs[0].ansicht.art: in einer gruppe stehen nur Bausteine ({im_tab}), keine gruppe"]
 
 
 def test_a_tab_needs_a_title_and_a_group_no_source():

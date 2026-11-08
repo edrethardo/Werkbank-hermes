@@ -12,24 +12,37 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from ansichten_testkit import aufl, box, fehler_von, projekt, tabelle  # noqa: F401 (fixtures)
+from ansichten_testkit import PNG, aufl, box, fehler_von, projekt, tabelle  # noqa: F401 (fixtures)
 from werkbank_testkit import FakeHost, KEY_SESSION, SID, call, core_event, events_path, running_server, session_path, sse
 
 from plugins.platforms.werkbank import ansichten, outbox as outbox_mod
 
 
+NIE = "zzkeinbaustein"                        # a name no block will ever have
+
+
+def _aus_dateien():
+    """The blocks as the FILES name them (no fixed list: every new block is only a new file)."""
+    folder = Path(ansichten.__file__).parent
+    return sorted(p.stem for p in folder.glob("*.py") if ansichten.ART_RE.fullmatch(p.stem))
+
+
 # -- the block contract ----------------------------------------------------------------------------
 def test_blocks_are_found_by_file_name():
     mods = ansichten.bausteine()
-    assert list(mods) == ["gruppe", "tabelle"]
+    namen = _aus_dateien()
+    assert list(mods) == namen and {"gruppe", "tabelle"} <= set(namen) and NIE not in namen
     for art, mod in mods.items():
         assert mod.ART == art and callable(mod.pruefen) and isinstance(mod.KURZ, str) and mod.KURZ
-    assert ansichten.arten(in_gruppe=True) == ["tabelle"]
-    assert ansichten.schema()["parameters"]["properties"]["art"]["enum"] == ["gruppe", "tabelle"]
+    im_tab = ansichten.arten(in_gruppe=True)
+    assert im_tab == [a for a in namen if getattr(mods[a], "IN_GRUPPE", True)]
+    assert "tabelle" in im_tab and "gruppe" not in im_tab
+    assert ansichten.schema()["parameters"]["properties"]["art"]["enum"] == namen
 
 
 def test_a_new_block_is_a_new_file_only(tmp_path, monkeypatch):
@@ -45,7 +58,7 @@ def test_a_new_block_is_a_new_file_only(tmp_path, monkeypatch):
     monkeypatch.setattr(ansichten, "__path__", list(ansichten.__path__) + [str(tmp_path)])
     monkeypatch.setattr(ansichten, "_BAUSTEINE", None)
     try:
-        assert list(ansichten.bausteine()) == ["gruppe", "probe", "tabelle"]     # kaputt: ART ≠ name
+        assert list(ansichten.bausteine()) == sorted(_aus_dateien() + ["probe"])     # kaputt: ART ≠ name
         view, fehler = ansichten.pruefen({"art": "probe", "titel": "P", "daten": {"wert": 3}})
         assert fehler == [] and view == {"v": 1, "art": "probe", "titel": "P", "wert": 3}
         assert fehler_von({"art": "probe", "daten": {"wert": "x"}}) == ["daten.wert: erwartet Zahl, gefunden Text „x“"]
@@ -58,7 +71,7 @@ def test_a_new_block_is_a_new_file_only(tmp_path, monkeypatch):
 
 # -- the frame -------------------------------------------------------------------------------------
 def test_unknown_art_names_the_choices():
-    assert fehler_von({"art": "grafik"}) == ["art: erwartet gruppe oder tabelle, gefunden Text „grafik“"]
+    assert fehler_von({"art": NIE}) == [f"art: erwartet {' oder '.join(_aus_dateien())}, gefunden Text „{NIE}“"]
 
 
 def test_unknown_fields_are_refused_with_the_allowed_ones():
@@ -109,17 +122,67 @@ def test_a_symlinked_directory_is_not_followed(projekt, box, tmp_path):  # noqa:
     assert box.for_refs(KEY_SESSION, ["ansicht"]) == []                # nothing was copied
 
 
-def test_a_swap_between_check_and_copy_is_caught(projekt, box, tmp_path, monkeypatch):  # noqa: F811
-    """The outbox opens the path again: a directory swapped for a symlink in between would copy
-    ANOTHER file — the copy's source key (real path, size, mtime) must be the checked file's."""
-    echt = box.ingest
+def test_the_copy_comes_from_the_checked_descriptor(projekt, box, tmp_path, monkeypatch):  # noqa: F811
+    """The folder is swapped right after the checked open (renamed away, a symlink to another folder
+    in its place): the outbox copies from the OPEN descriptor, so the copy holds the checked bytes,
+    never the file a second open by path would find."""
+    echt = ansichten._open_below
+    geprueft = (projekt / "daten" / "tab.csv").read_bytes()
+    (tmp_path / "geheim" / "tab.csv").write_text("fremd\n1\n", encoding="utf-8")
 
-    def getauscht(session_key, media, refs):
-        return echt(session_key, [(str(tmp_path / "geheim" / "x.csv"), False)], refs)
+    def tauschen(root, parts, feld, text):
+        fd = echt(root, parts, feld, text)
+        os.rename(projekt / "daten", projekt / "daten_alt")
+        os.symlink(tmp_path / "geheim", projekt / "daten")
+        return fd
 
-    monkeypatch.setattr(box, "ingest", getauscht)
+    monkeypatch.setattr(ansichten, "_open_below", tauschen)
+    view, fehler = ansichten.pruefen({"art": "tabelle", "quelle": "daten/tab.csv"}, aufl(projekt, box))
+    assert fehler == []
+    found = box.path(KEY_SESSION, view["quelle"]["datei"], "original")
+    assert found[0].read_bytes() == geprueft and geprueft != (projekt / "daten" / "tab.csv").read_bytes()
+
+
+def test_a_wrong_copy_is_taken_back(projekt, box, tmp_path, monkeypatch):  # noqa: F811
+    """Should the outbox still name another source (defence in depth), the entry is removed again
+    and the agent hears why — no stray copy stays in the chat's files."""
+    echt = box.ingest_fd
+
+    def falsch(session_key, fd, name, refs):
+        other = os.open(str(tmp_path / "geheim" / "x.csv"), os.O_RDONLY)
+        try:
+            return echt(session_key, other, name, refs)
+        finally:
+            os.close(other)
+
+    monkeypatch.setattr(box, "ingest_fd", falsch)
     assert fehler_von({"art": "tabelle", "quelle": "daten/tab.csv"}, aufl(projekt, box)) == [
         "quelle: „tab.csv“ hat sich während der Prüfung geändert; noch einmal aufrufen"]
+    assert box.for_refs(KEY_SESSION, ["ansicht"]) == []
+
+
+def test_project_images_are_capped_per_file_and_per_view(projekt, box, monkeypatch):  # noqa: F811
+    """Images from the project folder: at most MAX_BILD_BYTES each and MAX_BILDER_BYTES per view,
+    measured BEFORE anything is copied (st_size of the open file)."""
+    for i in range(3):
+        (projekt / f"b{i}.png").write_bytes(PNG + bytes([i]) * 100)       # 308 bytes each
+    (projekt / "gross.png").write_bytes(PNG + b"x" * 400)
+    monkeypatch.setattr(ansichten.Aufloeser, "MAX_BILD_BYTES", 500)
+    monkeypatch.setattr(ansichten.Aufloeser, "MAX_BILDER_BYTES", 700)
+    a = aufl(projekt, box)
+    with pytest.raises(ansichten.Fehler) as exc:
+        a.bild("gross.png", "zeilen[0][1]")
+    assert str(exc.value) == "zeilen[0][1]: „gross.png“ ist 608 Bytes groß, erlaubt je Bild 500 Bytes"
+    a.bild("b0.png", "f0")
+    a.bild("b1.png", "f1")
+    with pytest.raises(ansichten.Fehler) as exc:
+        a.bild("b2.png", "f2")
+    assert str(exc.value) == "f2: Bilder aus dem Projektordner zusammen höchstens 700 Bytes je Ansicht"
+    assert len(box.for_refs(KEY_SESSION, ["ansicht"])) == 2              # neither refused one was copied
+    assert ansichten.Aufloeser.MAX_BILD_BYTES == 500
+    monkeypatch.undo()
+    assert ansichten.Aufloeser.MAX_BILD_BYTES == 10 * 1024 * 1024
+    assert ansichten.Aufloeser.MAX_BILDER_BYTES == 50 * 1024 * 1024
 
 
 def test_no_project_folder_no_project_files(box):  # noqa: F811
@@ -240,6 +303,55 @@ def test_a_reload_during_the_turn_shows_the_view_from_the_store(chat):
     assert [m["role"] for m in messages] == ["user", "tool"]
     assert messages[1]["from_buffer"] is True and messages[1]["tool_call_id"] == "call_8"
     assert messages[1]["ansicht"]["id"] == answer["id"]
+
+
+def _drei_ansichten(chat):
+    ids, rows = [], []
+    for i in range(3):
+        answer = json.loads(ansichten.ausfuehren(tabelle(titel=f"T{i}"), inst=chat.inst, session_key=KEY_SESSION,
+                                                 tool_call_id=f"call_{i}", emit=_emit_into(chat)))
+        ids.append(answer["id"])
+        rows += [{"id": 10 * i + 1, "role": "assistant", "content": "", "timestamp": 10.0 * i + 1,
+                  "tool_calls": [{"id": f"call_{i}", "function": {"name": "ansicht_zeigen"}}]},
+                 {"id": 10 * i + 2, "role": "tool", "content": json.dumps(answer), "tool_call_id": f"call_{i}",
+                  "tool_name": "ansicht_zeigen", "timestamp": 10.0 * i + 2}]
+    chat.host.messages = rows
+    return ids
+
+
+def test_older_views_over_the_byte_budget_come_as_a_stub(chat, monkeypatch):
+    """The snapshot carries views newest first up to SNAPSHOT_BUDGET bytes; older ones only as
+    {id, art, titel, nachladen: true} — the board fetches those by id."""
+    ids = _drei_ansichten(chat)
+    eine = len(json.dumps(chat.ablage.lade(KEY_SESSION, ids[2])["ansicht"], ensure_ascii=False).encode())
+    monkeypatch.setattr(ansichten, "SNAPSHOT_BUDGET", int(eine * 1.5))
+    views = [m["ansicht"] for m in _snapshot(chat) if m.get("ansicht")]
+    assert [v["id"] for v in views] == ids
+    assert views[0] == {"id": ids[0], "art": "tabelle", "titel": "T0", "nachladen": True}
+    assert views[1] == {"id": ids[1], "art": "tabelle", "titel": "T1", "nachladen": True}
+    assert views[2]["zeilen"] and "nachladen" not in views[2]
+    monkeypatch.setattr(ansichten, "SNAPSHOT_BUDGET", 4 * 1024 * 1024)
+    assert all("nachladen" not in m["ansicht"] for m in _snapshot(chat) if m.get("ansicht"))
+
+
+def test_one_view_by_id_with_the_same_auth(chat):
+    ids = _drei_ansichten(chat)
+    status, body = call(chat.port, "GET", session_path("ansicht", ids[0]), chat.key)
+    assert status == 200 and body["ansicht"] == chat.ablage.lade(KEY_SESSION, ids[0])["ansicht"]
+    assert call(chat.port, "GET", session_path("ansicht", "av_" + "0" * 24), chat.key)[0] == 404
+    assert call(chat.port, "GET", session_path("ansicht", "x"), chat.key)[0] == 400
+    assert call(chat.port, "GET", session_path("ansicht", ids[0]), "falscher-schluessel")[0] == 401
+
+
+def test_the_stored_view_is_measured_against_its_limit(chat, monkeypatch):
+    """The CHECKED view (references resolved, rows normalised) is what is stored and sent: it is
+    measured too, not only the call."""
+    monkeypatch.setattr(ansichten, "MAX_GESPEICHERT_BYTES", 100)
+    answer = json.loads(ansichten.ausfuehren(tabelle(), inst=chat.inst, session_key=KEY_SESSION,
+                                             tool_call_id="c", emit=_emit_into(chat)))
+    assert answer["error"].startswith("Ansicht nicht gezeigt. Ansicht: geprüft ")
+    assert ", erlaubt 100 Bytes — " in answer["error"]
+    assert list(chat.ablage.root.glob("*/av_*.json")) == []
 
 
 def test_a_failed_tool_row_shows_no_view(chat):

@@ -62,6 +62,8 @@ MAX_FEHLER = 5                              # messages named in one answer
 MAX_GESPEICHERT = 500                       # views kept per session (oldest go first)
 MAX_SITZUNGEN = 256                         # attached sessions remembered
 MAX_OFFEN = 20                              # views a snapshot places from the store before their row
+MAX_GESPEICHERT_BYTES = 512 * 1024          # bytes of ONE checked view as stored and sent (JSON)
+SNAPSHOT_BUDGET = 4 * 1024 * 1024           # bytes of views in one snapshot; older ones as a stub
 
 ID_RE = re.compile(r"av_[0-9a-f]{24}")
 ART_RE = re.compile(r"[a-z][a-z0-9]{1,30}")
@@ -150,6 +152,8 @@ class Aufloeser:
     """Resolves the references of ONE call for ONE session (outbox, uploads, project folder)."""
 
     MAX_BILDER = 50                         # distinct image references of one view
+    MAX_BILD_BYTES = 10 * 1024 * 1024       # one image from the project folder (before the copy)
+    MAX_BILDER_BYTES = 50 * 1024 * 1024     # images from the project folder of one view together
 
     def __init__(self, session_key: str, projekt: Optional[str], outbox: Any = None, uploads: Any = None) -> None:
         self.session_key = session_key
@@ -157,6 +161,7 @@ class Aufloeser:
         self.outbox = outbox
         self.uploads = uploads
         self.bilder: Dict[str, Dict[str, Any]] = {}
+        self.bild_bytes = 0                 # project images of this view, copied so far
 
     def bild(self, value: Any, feld: str) -> Dict[str, Any]:
         """An image reference (one copy per distinct reference, at most ``MAX_BILDER``)."""
@@ -238,6 +243,8 @@ class Aufloeser:
         if not parts or any(p == ".." for p in parts):
             raise Fehler(f"{feld}: „{text[:200]}“ liegt nicht im Projektordner {root} (kein „..“)")
         self._endung(parts[-1], feld, bild=bild, daten=daten)
+        if self.outbox is None:
+            raise Fehler(f"{feld}: die Dateiablage des Chats ist nicht eingerichtet")
         fd = _open_below(root, parts, feld, text)
         try:
             st = os.fstat(fd)
@@ -249,24 +256,43 @@ class Aufloeser:
                                  f"{MAX_QUELLE // 1024} KB")
                 with os.fdopen(os.dup(fd), "rb") as handle:
                     data = handle.read(MAX_QUELLE + 1)
+            if bild:                        # caps BEFORE the copy: the size of the open file
+                if st.st_size > self.MAX_BILD_BYTES:
+                    raise Fehler(f"{feld}: „{parts[-1]}“ ist {_menge(st.st_size)} groß, erlaubt je Bild "
+                                 f"{_menge(self.MAX_BILD_BYTES)}")
+                if self.bild_bytes + st.st_size > self.MAX_BILDER_BYTES:
+                    raise Fehler(f"{feld}: Bilder aus dem Projektordner zusammen höchstens "
+                                 f"{_menge(self.MAX_BILDER_BYTES)} je Ansicht")
+            # the copy comes from THIS descriptor (no second open by path: a swap in between
+            # cannot put another file into the chat)
+            entry = self.outbox.ingest_fd(self.session_key, fd, parts[-1], ["ansicht"])
         finally:
             os.close(fd)
-        if self.outbox is None:
-            raise Fehler(f"{feld}: die Dateiablage des Chats ist nicht eingerichtet")
-        entries = self.outbox.ingest(self.session_key, [(os.path.join(root, *parts), False)], ["ansicht"])
-        entry = entries[0] if entries else None
         if not entry or not entry.get("id"):
             raise Fehler(f"{feld}: „{parts[-1]}“ ließ sich nicht übernehmen "
                          f"({(entry or {}).get('fehlt') or 'Hermes liefert diese Datei nicht aus'})")
-        # the copy must be THIS file: the outbox opened the path again — a directory swapped for a
-        # symlink in between names another real path (and so another source key)
+        # defence in depth: the copy's source key must be the checked file's; a wrong NEW copy
+        # is taken back again
         meta = self.outbox.get(self.session_key, entry["id"]) or {}
         want = hashlib.sha256(f"{real}\0{st.st_size}\0{st.st_mtime_ns}".encode()).hexdigest() if real else None
         if want is None or meta.get("src") != want:
+            if entry.get("neu"):
+                self.outbox.entfernen(self.session_key, entry["id"])
             raise Fehler(f"{feld}: „{parts[-1]}“ hat sich während der Prüfung geändert; noch einmal aufrufen")
         if bild and entry.get("kind") != "bild":
             raise Fehler(f"{feld}: „{parts[-1]}“ ist kein Bild")
+        if bild:
+            self.bild_bytes += st.st_size
         return {"datei": entry["id"], "name": entry.get("name"), "typ": entry.get("type")}, data
+
+
+def _menge(n: int) -> str:
+    """A byte count in words (Bytes, KB, MB)."""
+    if n < 1024:
+        return f"{n} Bytes"
+    if n < 1024 * 1024:
+        return f"{n // 1024} KB"
+    return f"{n // (1024 * 1024)} MB"
 
 
 def _open_below(root: str, parts: List[str], feld: str, text: str) -> int:
@@ -397,7 +423,13 @@ def pruefen(args: Any, aufl: Optional[Aufloeser] = None) -> Tuple[Optional[Dict[
         return None, fehler + [str(exc)]
     if fehler:
         return None, fehler
-    return {"v": 1, **view}, []
+    view = {"v": 1, **view}
+    # the CHECKED view is what is stored and sent (references resolved, rows normalised)
+    stored = len(json.dumps(view, ensure_ascii=False).encode("utf-8"))
+    if stored > MAX_GESPEICHERT_BYTES:
+        return None, [f"Ansicht: geprüft {_menge(stored)}, erlaubt {_menge(MAX_GESPEICHERT_BYTES)} — weniger "
+                      "Zeilen oder Bilder, große Tabellen als quelle (CSV- oder JSON-Datei)"]
+    return view, []
 
 
 def fehlertext(fehler: List[str]) -> str:
@@ -578,6 +610,24 @@ class Ablage:
                                  "ts": None, "origin": None, "tool_call_id": entry.get("tool_call_id"),
                                  "tool_name": TOOL_NAME, "is_error": False, "truncated": False,
                                  "from_buffer": True, "ansicht": entry["ansicht"]})
+        _budget(messages)
+
+
+def _budget(messages: List[Dict[str, Any]]) -> None:
+    """Newest views first up to ``SNAPSHOT_BUDGET`` bytes; every older one only as
+    ``{id, art, titel, nachladen: true}`` — the board fetches it by id (``GET …/ansicht/{id}``)."""
+    used = 0
+    for item in reversed(messages):
+        view = item.get("ansicht")
+        if not isinstance(view, dict):
+            continue
+        size = len(json.dumps(view, ensure_ascii=False).encode("utf-8"))
+        if used + size <= SNAPSHOT_BUDGET:
+            used += size
+            continue
+        used = SNAPSHOT_BUDGET + 1                  # once over: every older view is a stub too
+        item["ansicht"] = {"id": view.get("id"), "art": view.get("art"), "titel": view.get("titel") or "",
+                           "nachladen": True}
 
 
 # -- the tool --------------------------------------------------------------------------------------

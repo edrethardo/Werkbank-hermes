@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
 from . import approvals, kontext, snapshot
+from . import ansichten as ansichten_mod  # fork: WB-1471 (GET …/ansicht/{id})
 from . import commands as commands_mod
 from . import mirror as mirror_mod
 from . import outbox as outbox_mod
@@ -393,6 +394,8 @@ def _handler(app: WerkbankServer):
                     return self._events(key, query)
                 if len(what) == 3 and what[0] == "tools" and what[2] == "output":
                     return self._tool_output(key, urllib.parse.unquote(what[1]))
+                if len(what) == 2 and what[0] == "ansicht":      # WB-1471: one view (nachladen)
+                    return self._ansicht(key, urllib.parse.unquote(what[1]))
                 if len(what) == 2 and what[0] == "uploads":
                     return self._upload_file(key, urllib.parse.unquote(what[1]))
                 if len(what) in (2, 3) and what[0] == "files":          # WB-1321
@@ -405,6 +408,18 @@ def _handler(app: WerkbankServer):
                 if len(what) == 3 and what[:2] == ["context", "text"]:
                     return self._context_text(key, what[2])
             self._refuse(404, "not found", "Unbekannter Pfad.")
+
+        def _ansicht(self, key: str, vid: str):
+            """WB-1471 Review: ``GET /v1/s/{key}/ansicht/{id}`` — one stored view of THIS session
+            (the snapshot sends older ones over its byte budget only as a stub)."""
+            if app.ansichten is None:
+                return self._refuse(501, "no views", "Chat-Ansichten sind nicht eingerichtet.")
+            if not ansichten_mod.ID_RE.fullmatch(vid or ""):
+                return self._refuse(400, "bad view id", "Ungültige Ansicht-ID.")
+            entry = app.ansichten.lade(key, vid)
+            if entry is None:
+                return self._refuse(404, "unknown view", "Diese Ansicht gibt es (nicht mehr).")
+            return self._json(200, {"ansicht": entry["ansicht"]})
 
         def _outbox_file(self, key: str, fid: str, variant: Optional[str], hls_name: Optional[str] = None):
             """WB-1321: a file Hermes sent in THIS session — its metadata, or the bytes of one variant
