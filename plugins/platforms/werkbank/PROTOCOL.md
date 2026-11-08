@@ -348,6 +348,19 @@ password, typed into the card). This side never sees a password and runs nothing
   (the time limit is enforced on the root side; stdin is empty, so the command never reads the
   password). Background processes the command starts itself (`&`, `nohup`, `setsid`) outlive the
   limit — the card says so.
+* Refused characters (command and reason; refused, never silently removed): ONE rule on Hermes
+  (`rootfreigabe.verbotene_zeichen`), board (`root_freigabe._VERBOTEN`) and card (`hermes_view.js`
+  `HV_ROOT_UNSICHTBAR`): categories Cc (except tab, newline), Cf, Cs, Co, Cn, Zl, Zp, Zs except
+  U+0020, PLUS the Unicode Default_Ignorable_Code_Point list as fixed ranges (U+00AD, U+034F,
+  U+061C, U+115F–1160, U+17B4–17B5, U+180B–180F, U+200B–200F, U+202A–202E, U+2060–206F, U+3164,
+  U+FE00–FE0F, U+FEFF, U+FFA0, U+FFF0–FFF8, U+1BCA0–1BCA3, U+1D173–1D17A, U+E0000–E0FFF); many are
+  Lo/Mn, so the category alone would let them through.
+* Known limits: (1) background processes outlive the time limit (see above). (2) With NOPASSWD
+  sudoers root can read what is left of the pipe/the command text; the password protection holds only
+  when sudo asks for the password. (3) An agent under the same Unix user is not a process boundary.
+* Rollout order: board BEFORE Hermes. A new Hermes sends the start/report calls an old board does not
+  know; the board already refuses invisible characters itself, so an old Hermes behind a new board
+  stays safe.
 * Snapshot: `pending_root` = every request of the session this process holds (open ones and the
   last 20 results, 24 h); `kurz`: `pending_root` = number of open ones.
 

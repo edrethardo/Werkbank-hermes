@@ -55,8 +55,27 @@ ID_RE = re.compile(r"rb_[0-9a-f]{24}")
 # bidi embeddings/overrides/isolates U+202A-U+202E U+2066-U+2069, marks U+200E U+200F U+061C,
 # zero-width U+200B-U+200D U+2060, U+FEFF, soft hyphen …), line/paragraph separators (Zl, Zp:
 # U+2028 U+2029) and lone surrogates (Cs).
-_VERBOTEN_KAT = ("Cc", "Cf", "Cs", "Zl", "Zp")
+_VERBOTEN_KAT = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 _ERLAUBT = ("\t", "\n")
+# Unicode Default_Ignorable_Code_Point (DerivedCoreProperties), fixed list: many of these are Lo/Mn
+# (U+3164 Hangul filler, U+034F, U+FE0F, U+E0101), so the category alone lets them through.
+# Same rule as the board's root_freigabe._VERBOTEN and hermes_view.js HV_ROOT_UNSICHTBAR.
+_DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160), (0x17B4, 0x17B5),
+    (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0x3164, 0x3164),
+    (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF),
+)
+
+
+def _verboten(ch: str) -> bool:
+    if ch in _ERLAUBT:
+        return False
+    cat = unicodedata.category(ch)
+    if cat in _VERBOTEN_KAT or (cat == "Zs" and ch != " "):
+        return True
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE)
 REGISTRY_MODULE = "hermes_werkbank_rootfreigabe"
 
 OFFEN, LAEUFT = "offen", "laeuft"
@@ -390,7 +409,7 @@ def verbotene_zeichen(text: str) -> List[str]:
     """The refused characters of *text* as ``U+XXXX NAME``, distinct, in order of appearance."""
     out: List[str] = []
     for ch in text:
-        if ch in _ERLAUBT or unicodedata.category(ch) not in _VERBOTEN_KAT:
+        if not _verboten(ch):
             continue
         name = "U+%04X" % ord(ch)
         try:

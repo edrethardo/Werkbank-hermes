@@ -192,7 +192,10 @@ def test_the_call_is_checked(chat, args, teil):
 @pytest.mark.parametrize("feld", ["befehl", "begruendung"])
 @pytest.mark.parametrize("zeichen", ["\u202e", "\u2066", "\u2069", "\u200b", "\u200f", "\u061c", "\ufeff",
                                      "\u2060", "\u00ad", "\u0085", "\u2028", "\u2029", "\x9b", "\x80", "\r",
-                                     "\x1b", "\x7f"])
+                                     "\x1b", "\x7f",
+                                     # without Cf: Default_Ignorable (Lo/Mn), Zs other than space, Co, Cn
+                                     "\u3164", "\u115f", "\uffa0", "\u034f", "\u180b", "\ufe0f", "\U000e0101",
+                                     "\u17b4", "\u00a0", "\u2000", "\u200a", "\u3000", "\ue000", "\u0378"])
 def test_trojan_source_characters_are_refused(chat, feld, zeichen):
     args = {"befehl": "ls /root", "begruendung": "Zeigen, was dort liegt."}
     args[feld] = args[feld][:3] + zeichen + args[feld][3:]
